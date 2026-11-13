@@ -96,3 +96,6 @@ target_link_libraries(generate_qwen PRIVATE caudal_flags)
 
 add_executable(stencil_3d bench/stencil_3d.cpp)
 target_link_libraries(stencil_3d PRIVATE caudal_flags)
+
+add_executable(probe3_ceiling bench/probe3_ceiling.cpp)
+target_link_libraries(probe3_ceiling PRIVATE caudal_flags)
