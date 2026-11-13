@@ -65,6 +65,31 @@ Lectura del dato:
 `M*(int4) = 55` ⇒ en este equipo el ridge es **inalcanzable**: no existe lote
 que lo haga compute-bound. La única palanca es leer menos bytes.
 
+## Medición · Día 1 — `probe1_gemv` (2026-11-13)
+
+Forma: N=65536, K=3584 (234.9 M params) · buffer int4 112 MiB · AVX2.
+
+| Config | GB/s | % del techo 1-hilo |
+|---|---|---|
+| stream (1 hilo) | 13.7 | — |
+| **int4 M=1, 1 hilo** | **11.4** | **83.4 %** |
+| int4 M=1, 8 hilos | **21.2** | — |
+
+- **Gate 10.8 GB/s: PASA** (11.4), con 83.4 % de eficiencia sobre el techo
+  single-thread. El costo de desempacar 4 bits en AVX2 es **~17 %**.
+- El agregado a 8 hilos (21.2 GB/s) **supera los 18.0 de `probe0`** ⇒
+  `probe0` subestimó: sus 512 MiB con páginas de 4 KiB (THP al 37 %) pagaban
+  TLB. El DRAM real es **≥ 21 GB/s**.
+- **ASTILLA: el lote no compra ancho de banda.** M=1→8 baja el GB/s
+  (11.4 → 3.5) pero sube el cómputo (22.8 → 56.2 GMAC/s, 2.5×). Se compra
+  COMPUTO, no bytes. Con 8 hilos ya se está limitado por memoria en M=1.
+- **ASTILLA: esta máquina no puede resolver un margen del 2 %.** El mismo
+  binario dio M=1 entre 9.0 y 11.6 GB/s según el estado de potencia. Con
+  `passes=30` la corrida es estable (min=max en 3 corridas), pero entre
+  corridas el reloj deriva. Toda validación fina necesita reloj estable.
+
+`tok/s` proyectado para Qwen2.5-7B int4: **21.2 / 4.28 ≈ 4.9 tok/s**.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
