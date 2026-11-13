@@ -228,6 +228,49 @@ en producción— estamos al **87 % del techo de memoria**.
 128 bajarían el pliegue, ~5 % a cambio de calidad), y no vale otro ciclo de
 formato.
 
+## Día 4 — pesos reales (Qwen2.5-0.5B-Instruct)
+
+`tools/pack_qwen.py`: lector de `safetensors` a mano (8 B + JSON), cuantización
+int4/g64 vectorizada con numpy, sin `safetensors` ni `transformers`.
+
+```
+168 tensores lineales · 357.8 M params · 3.5 s
+weights.bin 178.9 MB + scales.bin 11.2 MB = 190.1 MB
+4.250 bits/param exactos
+error de cuantización: medio 11.78 %  max 17.40 %  (Frobenius relativo)
+```
+
+Todos los K son múltiplos de 64 (896 = 14x64, 4864 = 76x64): el layout congelado
+aplica sin excepciones.
+
+**El kernel corrió sobre pesos REALES:**
+
+```
+./test_pack_roundtrip /tmp/opencode/real_layer 896 4864 2
+  kernel vs ref C++    : 5.722e-06   (tolerancia 5.7e-03)
+  ref C++ vs ref Python: 1.192e-06
+  12/12 PASS
+```
+
+1000x de margen. Los pesos reales atraviesan el formato congelado sin que el
+kernel se entere de dónde vinieron.
+
+### Proyección corregida
+
+`494 M params` (lineales + lm_head atado) × 4.25 bits = **262 MB por token**.
+A los 21.2 GB/s medidos: **~81 tok/s** para el 0.5B.
+
+⚠️ Corrección de un número que di antes: dije "45 tok/s para el 1.5B". Estaba
+mal — mezclé GMAC/s con el tamaño en bytes. Lo correcto, dividiendo por
+parámetros: **0.5B → 81 tok/s · 1.5B → 26 tok/s · 7B → 5.2 tok/s**.
+
+### Caveat sobre el 11.78 %
+
+Es la norma de Frobenius relativa del residuo de cuantización, no una medida de
+calidad del modelo. Para int4/g64 es el valor esperado (~11 % es
+`amax/(7·√12)` sobre gaussianas). Si degrada la perplejidad **no está medido**, y
+medirlo requiere el forward completo.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
