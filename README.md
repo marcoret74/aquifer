@@ -567,6 +567,47 @@ cobra. En un barrido, el prefetcher ya hace el trabajo.
 **Conclusión: no construyas un sustrato de memoria espacial para barridos. Si lo
 construyes, es para pointer-chasing, no para stencils.**
 
+## Día 10 — fusión de GEMVs y SiLU paralelo (2026-11-13)
+
+Dos cambios en `tools/generate_qwen.cpp`:
+
+1. **GEMV fusionado.** Q/K/V comparten `h`; Gate/Up comparten `h2`. Ahora un
+   solo `pool.run` por grupo, con **`x` cuantizado y permutado UNA vez** (antes
+   una por tensor) y reparto de hilos sobre el total de filas de todos los jobs
+   juntos — así `k_proj` (256 filas) no deja hilos ociosos.
+   197 llamadas → 113.
+2. **SiLU·Up paralelo.** Los 250k `exp()` por token salen del hilo principal.
+
+### Resultado
+
+| | antes | después |
+|---|---|---|
+| decode | 57,2 ms/token | **48,2 ms/token** |
+| tok/s | 17,5 | **20,7 – 21,0** |
+| GB/s efectivos | 15,2 | **18,0** |
+| % del techo (24,4) | 62 % | **74 %** |
+
+**+18 %**, y el texto es **idéntico token por token** al de antes (60/60), así
+que la fusión no alteró la aritmética.
+
+Óptimo sigue en **4 hilos** (3→19,2 · 4→20,0-21,0 · 5→15,8 · 6→17,4 · 8→18,7):
+el presupuesto de 15 W pesa más que el paralelismo a partir de 5.
+
+Yo había proyectado **~23 tok/s**. Se quedó en 21. La diferencia estaba en
+sobreestimar cuánto del tiempo era atribuible a las partes seriales: los
+`exp()` y las barreras eran reales pero chicos.
+
+### Corrección: el lever de RAM estaba muerto
+
+`dmidecode` mostró **dual-channel asimétrico**: 8 GB en ChannelA + 4 GB en
+ChannelB, ambos DDR4-2400. Es **Flex Mode**: los primeros 8 GB se entrelazan
+entre canales y los 4 restantes quedan en A. Con un working set de 868 MB ya
+corríamos en la zona dual.
+
+Lo empírico ya lo decía: 24,4 GB/s medidos > 19,2 GB/s del teórico
+single-channel. **Un segundo SODIMM no habría duplicado nada.** Yo lo recomendé
+dos veces; el número lo refutaba desde `probe2`.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

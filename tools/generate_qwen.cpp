@@ -177,37 +177,55 @@ void rmsnorm(const float* x, const float* w, float* out, std::size_t n, float ep
     for (std::size_t i = 0; i < n; ++i) out[i] = x[i] * r * w[i];
 }
 
-void gemv_mt(Pool& pool, const Lin& L, const float* x, float* y) {
-    std::vector<std::int8_t> xq(L.K), xqp(L.K);
+// --- GEMV FUSIONADO ----------------------------------------------------------
+// Varios tensores que comparten el mismo vector de entrada. La cuantizacion y
+// la permutacion de x se hacen UNA vez (antes eran una por tensor) y el reparto
+// entre hilos se hace sobre el total de filas de todos los jobs juntos, asi
+// las matrices chicas (k_proj: 256 filas) no dejan hilos ociosos.
+struct Job { const Lin* L; float* y; };
+
+void gemv_fused(Pool& pool, const std::vector<Job>& jobs, const float* x) {
+    const std::size_t K = jobs[0].L->K, G = jobs[0].L->G, grp = K / G;
+    std::vector<std::int8_t> xq(K), xqp(K);
     float amax = 0.0f;
-    for (std::size_t i = 0; i < L.K; ++i) amax = std::max(amax, std::fabs(x[i]));
+    for (std::size_t i = 0; i < K; ++i) amax = std::max(amax, std::fabs(x[i]));
     const float sx = (amax > 0.0f ? amax / 127.0f : 1.0f);
-    for (std::size_t i = 0; i < L.K; ++i) {
+    for (std::size_t i = 0; i < K; ++i) {
         const float q = std::clamp(std::round(x[i] / sx), -127.0f, 127.0f);
         xq[i] = static_cast<std::int8_t>(q);
     }
-    // La permutación es por BLOQUE de 64 valores, no por grupo de escala.
-    for (std::size_t bb = 0; bb < L.K / 64; ++bb)
+    for (std::size_t bb = 0; bb < K / 64; ++bb)
         for (std::size_t i = 0; i < 64; ++i)
             xqp[bb * 64 + i] = xq[bb * 64 + caudal::kPerm[i]];
 
-    const std::size_t grp = L.K / L.G;
-    caudal::Shape s0; s0.N = 0; s0.K = L.K; s0.group = grp;
-    std::vector<std::int32_t> xg(L.G);
+    caudal::Shape s0; s0.N = 0; s0.K = K; s0.group = grp;
+    std::vector<std::int32_t> xg(G);
     caudal::compute_x_gsum(s0, xq.data(), xg.data());
+
+    std::size_t total = 0;
+    for (const auto& j : jobs) total += j.L->N;
 
     const unsigned T = pool.size();
     pool.run([&](unsigned tid) {
-        const std::size_t n0 = std::size_t(tid) * L.N / T;
-        const std::size_t n1 = std::size_t(tid + 1) * L.N / T;
-        if (n1 <= n0) return;
-        caudal::Shape s; s.N = n1 - n0; s.K = L.K; s.group = grp;
-        if (grp == 32)
-            caudal::gemv_int4_g32(s, L.packed + n0 * L.row_bytes, L.scale + n0 * L.G,
-                                  xg.data(), xqp.data(), sx, y + n0);
-        else
-            caudal::gemv_int4(s, L.packed + n0 * L.row_bytes, L.scale + n0 * L.G,
-                              xg.data(), xqp.data(), sx, y + n0);
+        const std::size_t a = std::size_t(tid) * total / T;
+        const std::size_t b = std::size_t(tid + 1) * total / T;
+        std::size_t off = 0;
+        for (const auto& j : jobs) {
+            const std::size_t lo = off, hi = off + j.L->N;
+            if (b <= lo) break;
+            const std::size_t n0 = (a > lo ? a : lo) - lo;
+            const std::size_t n1 = (b < hi ? b : hi) - lo;
+            if (n1 > n0) {
+                caudal::Shape s; s.N = n1 - n0; s.K = K; s.group = grp;
+                const std::uint8_t* pk = j.L->packed + n0 * j.L->row_bytes;
+                const _Float16* sc = j.L->scale + n0 * G;
+                if (grp == 32)
+                    caudal::gemv_int4_g32(s, pk, sc, xg.data(), xqp.data(), sx, j.y + n0);
+                else
+                    caudal::gemv_int4(s, pk, sc, xg.data(), xqp.data(), sx, j.y + n0);
+            }
+            off = hi;
+        }
     });
 }
 
@@ -319,9 +337,11 @@ int main(int argc, char** argv) {
             const std::string p = "model.layers." + std::to_string(L) + ".";
             rmsnorm(x.data(), c.aux_of(p + "input_layernorm.weight"), h.data(), cfg.H, cfg.eps);
 
-            gemv_mt(pool, c.lin.at(p + "self_attn.q_proj.weight"), h.data(), q.data());
-            gemv_mt(pool, c.lin.at(p + "self_attn.k_proj.weight"), h.data(), kt.data());
-            gemv_mt(pool, c.lin.at(p + "self_attn.v_proj.weight"), h.data(), vt.data());
+            // Q/K/V comparten h: un solo GEMV fusionado, x cuantizado una vez.
+            const Job jq{&c.lin.at(p + "self_attn.q_proj.weight"), q.data()};
+            const Job jk{&c.lin.at(p + "self_attn.k_proj.weight"), kt.data()};
+            const Job jv{&c.lin.at(p + "self_attn.v_proj.weight"), vt.data()};
+            gemv_fused(pool, {jq, jk, jv}, h.data());
             add_bias(q.data(), c.aux_of(p + "self_attn.q_proj.bias"), cfg.NH * cfg.DH);
             add_bias(kt.data(), c.aux_of(p + "self_attn.k_proj.bias"), cfg.NKV * cfg.DH);
             add_bias(vt.data(), c.aux_of(p + "self_attn.v_proj.bias"), cfg.NKV * cfg.DH);
@@ -363,20 +383,32 @@ int main(int argc, char** argv) {
                 }
             }
 
-            gemv_mt(pool, c.lin.at(p + "self_attn.o_proj.weight"), o.data(), tmp.data());
+            { const Job jo{&c.lin.at(p + "self_attn.o_proj.weight"), tmp.data()};
+              gemv_fused(pool, {jo}, o.data()); }
             for (std::size_t i = 0; i < cfg.H; ++i) x[i] += tmp[i];
 
             rmsnorm(x.data(), c.aux_of(p + "post_attention_layernorm.weight"), h.data(), cfg.H, cfg.eps);
-            gemv_mt(pool, c.lin.at(p + "mlp.gate_proj.weight"), h.data(), gate.data());
-            gemv_mt(pool, c.lin.at(p + "mlp.up_proj.weight"), h.data(), up.data());
-            for (std::size_t i = 0; i < cfg.INTER; ++i)
-                gate[i] = (gate[i] / (1.0f + std::exp(-gate[i]))) * up[i];
-            gemv_mt(pool, c.lin.at(p + "mlp.down_proj.weight"), gate.data(), tmp.data());
+            // Gate/Up comparten h2: fusionados. SiLU*Up paralelo (250k exp/token).
+            { const Job jg{&c.lin.at(p + "mlp.gate_proj.weight"), gate.data()};
+              const Job ju{&c.lin.at(p + "mlp.up_proj.weight"), up.data()};
+              gemv_fused(pool, {jg, ju}, h.data()); }
+            {
+                const unsigned T2 = pool.size();
+                pool.run([&](unsigned tid) {
+                    const std::size_t a = std::size_t(tid) * cfg.INTER / T2;
+                    const std::size_t b = std::size_t(tid + 1) * cfg.INTER / T2;
+                    for (std::size_t i = a; i < b; ++i)
+                        gate[i] = (gate[i] / (1.0f + std::exp(-gate[i]))) * up[i];
+                });
+            }
+            { const Job jd{&c.lin.at(p + "mlp.down_proj.weight"), tmp.data()};
+              gemv_fused(pool, {jd}, gate.data()); }
             for (std::size_t i = 0; i < cfg.H; ++i) x[i] += tmp[i];
         }
 
         rmsnorm(x.data(), c.aux_of("model.norm.weight"), h.data(), cfg.H, cfg.eps);
-        gemv_mt(pool, c.lin.at("model.embed_tokens.weight"), h.data(), logits.data());
+        { const Job jh{&c.lin.at("model.embed_tokens.weight"), logits.data()};
+          gemv_fused(pool, {jh}, h.data()); }
         std::size_t best = 0;
         for (std::size_t i = 1; i < cfg.V; ++i) if (logits[i] > logits[best]) best = i;
         return int(best);
