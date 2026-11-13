@@ -286,6 +286,27 @@ void rope_one(float* v, std::size_t pos, const Cfg& c) {
 // offsets para que y[m*N + n] funcione con el kernel, que escribe y[m*N+n]
 // (el kernel usa s.N como stride de M, por eso se le pasa el bloque completo).
 
+// --- Prompt-lookup drafter ---------------------------------------------------
+// Busca el sufijo mas largo del contexto que ya aparecio antes y propone los
+// tokens que le siguieron. Coste ~0 (memcmp sobre el historico), sin modelo.
+// Es la unica forma de batching con UN SOLO usuario: los k tokens propuestos se
+// verifican en UNA pasada (M=k) y se acepta el prefijo correcto.
+std::vector<int> prompt_lookup(const std::vector<int>& ctx, int k) {
+    const int N = int(ctx.size());
+    for (int n = std::min(8, N - 1); n >= 2; --n) {
+        for (int p = N - n - 1; p >= 0; --p) {
+            bool eq = true;
+            for (int i = 0; i < n; ++i)
+                if (ctx[p + i] != ctx[N - n + i]) { eq = false; break; }
+            if (!eq) continue;
+            std::vector<int> prop;
+            for (int i = 0; i < k && p + n + i < N; ++i) prop.push_back(ctx[p + n + i]);
+            if (!prop.empty()) return prop;
+        }
+    }
+    return {};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -295,7 +316,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     const std::string A = argv[1];
-    int ngen = 32, ctx = 512;
+    int ngen = 32, ctx = 512, spec = 0;
     unsigned reqT = 0;
     std::vector<std::vector<int>> prompts;
     for (int i = 2; i < argc; ++i) {
@@ -304,6 +325,7 @@ int main(int argc, char** argv) {
         if (a == "--n") ngen = std::atoi(next().c_str());
         else if (a == "--threads") reqT = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
+        else if (a == "--spec") spec = std::atoi(next().c_str());
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
@@ -393,12 +415,15 @@ int main(int argc, char** argv) {
                 NS * double(kv.per_seq) / (1024 * 1024),
                 double(kv.per_seq) / (1024 * 1024));
 
-    const unsigned M = std::min(NS, kMaxM);
-    std::vector<float> x(M * cfg.H), h(M * cfg.H), tmp(M * cfg.H);
-    std::vector<float> q(M * cfg.NH * cfg.DH), kt(M * cfg.NKV * cfg.DH), vt(M * cfg.NKV * cfg.DH);
-    std::vector<float> att(cfg.NH * std::size_t(ctx)), o(M * cfg.H);
-    std::vector<float> gate(M * cfg.INTER), up(M * cfg.INTER);
-    std::vector<float> logits(M * cfg.V);
+    (void)NS;
+    // Dimensionados para el MAXIMO de filas: el paso especulativo usa M=k
+    // aunque haya una sola secuencia (era el segfault).
+    const unsigned MB = kMaxM;
+    std::vector<float> x(MB * cfg.H), h(MB * cfg.H), tmp(MB * cfg.H);
+    std::vector<float> q(MB * cfg.NH * cfg.DH), kt(MB * cfg.NKV * cfg.DH), vt(MB * cfg.NKV * cfg.DH);
+    std::vector<float> att(cfg.NH * std::size_t(ctx)), o(MB * cfg.H);
+    std::vector<float> gate(MB * cfg.INTER), up(MB * cfg.INTER);
+    std::vector<float> logits(MB * cfg.V);
 
     // Un paso para M secuencias en posiciones propias.
     auto step = [&](const std::vector<unsigned>& seq,
@@ -553,6 +578,60 @@ int main(int argc, char** argv) {
     for (unsigned s = 0; s < NS; ++s) {
         std::printf("SEQ%u ", s);
         for (int v : gen[s]) std::printf("%d ", v);
+        std::printf("\n");
+    }
+
+    // --- modo especulativo (una sola secuencia) -----------------------------
+    if (spec > 0 && NS == 1) {
+        std::vector<int> ctx = prompts[0];
+        std::size_t p = ctx.size() - 1;
+        auto L = [&](unsigned m) { return logits.data() + std::size_t(m) * cfg.V; };
+        auto argmax = [&](const float* lg) {
+            std::size_t b = 0;
+            for (std::size_t j = 1; j < cfg.V; ++j) if (lg[j] > lg[b]) b = j;
+            return int(b);
+        };
+        const double ts0 = now_ms();
+        int emitted = 0, steps = 0, accepted = 0, proposed = 0;
+        std::vector<int> out;
+        while (emitted < ngen) {
+            const int y = argmax(L(0));
+            auto prop = prompt_lookup(ctx, spec);
+            if (prop.empty() || prop[0] != y) {
+                // sin propuesta util: un token normal
+                ctx.push_back(y); out.push_back(y); ++emitted; ++p;
+                (void)step({0u}, {y}, {p});
+                ++steps;
+                continue;
+            }
+            ++steps;
+            proposed += int(prop.size());
+            std::vector<std::size_t> ps;
+            for (std::size_t i = 0; i < prop.size(); ++i) ps.push_back(p + 1 + i);
+            (void)step(std::vector<unsigned>(prop.size(), 0u), prop, ps);
+            // L(i) son los logits en la posicion p+1+i, y predicen el token de
+            // p+2+i. Entonces prop[j] (en p+1+j) lo predice L(j-1), NO L(j).
+            unsigned a = 1;
+            for (std::size_t j = 1; j < prop.size(); ++j) {
+                if (a != j) break;
+                if (argmax(logits.data() + (j - 1) * cfg.V) == prop[j]) ++a; else break;
+            }
+            for (unsigned j = 0; j < a; ++j) { ctx.push_back(prop[j]); out.push_back(prop[j]); ++emitted; }
+            accepted += int(a);
+            p += a;
+            // dejar L(0) apuntando a la posicion p: es logits[a]
+            std::memcpy(logits.data(), logits.data() + std::size_t(a) * cfg.V,
+                        cfg.V * sizeof(float));
+            if (emitted >= ngen) break;
+        }
+        const double ts1 = now_ms();
+        std::printf("\n--- especulativo (k=%d) ---\n", spec);
+        std::printf("pasos %d | tokens %d | propuestos %d | aceptados %d (%.0f%%)\n",
+                    steps, emitted, proposed, accepted, 100.0 * accepted / std::max(proposed, 1));
+        std::printf("%.1f ms/token -> %.1f tok/s\n", (ts1 - ts0) / emitted,
+                    1000.0 * emitted / (ts1 - ts0));
+        std::printf("SPEC ");
+        for (int v : out) std::printf("%d ", v);
         std::printf("\n");
     }
     std::printf("\n");
