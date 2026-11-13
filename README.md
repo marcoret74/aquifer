@@ -98,6 +98,64 @@ semántica es exactamente el error que ya nos mordió con `L.G = K/64`.
 Se conserva **el layout de dos arrays** (22,2 tok/s) y el código soporta ambos
 formatos por si algún día se re-mide con otro relleno.
 
+## Día 14 — un segundo modelo entra sin tocar C++ (2026-11-13)
+
+`deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`, int4 g32, layout de dos arrays,
+mismo packer y mismos kernels. **Cero líneas de C++ modificadas.**
+
+### Lo único que hubo que cambiar fue una plantilla
+
+R1 **no usa ChatML de Qwen**. Su plantilla es DeepSeek:
+
+```
+<｜begin▁of▁sentence｜><｜User｜>{pregunta}<｜Assistant｜><think〉\n
+```
+
+Con `<|im_start|>user\n…` el modelo **repetía el prompt y emitía
+`<｜Assistant｜>` en bucle** — parece "atención rota", pero es un modelo que
+nunca vio ese formato. Con la plantilla correcta razona en español, abre y
+cierra `</think>`.
+
+Los ids tampoco coinciden con Qwen2.5: aquí **151645 = `<｜Assistant｜>`**, no
+`<|im_end|>`. Asumir los ids de un tokenizer hermano es un error de una línea
+que se lee como un bug del motor.
+
+### El oráculo descartó el kernel antes de tocar código
+
+Con `tools/probe_r1_logits.py` (PyTorch, fp32, **sin cuantizar**) el token
+siguiente a "La capital de Francia es" es `' '` + `' Franc'` — **el mismo que
+produce el C++ en int4**. Si el kernel leyera mal los pesos, no coincidirían.
+
+De paso: `oracle_qwen.Qwen.forward` calculaba los logits con `embed_tokens`
+atado. R1 declara `tie_word_embeddings=False` y trae `lm_head` propio, así que
+el oráculo estaba mal para este modelo (el C++ ya lo resuelve por `index.txt`).
+
+### Rendimiento (mismo binario, mismas 4 hilos, 15 W)
+
+| | 1 secuencia | 4 secuencias |
+|---|---|---|
+| R1-Distill-1.5B | 23,3 tok/s | **39,9–43,1** tok/s |
+| Qwen2.5-1.5B | 22,6 tok/s | 28,6–37,5 tok/s |
+
+Batching ≈ ×1,8–1,9 el agregado; ~10 tok/s por secuencia en lote.
+
+> ⚠️ **La comparación entre modelos no está limpia.** Governor en `powersave`
+> y deriva térmica: en la misma sesión Qwen2.5 cayó de 37,5 a 28,6 (−24 %) y
+> R1 de 43,1 a 39,9 (−7 %). La diferencia de ~12 tok/s es del orden de la
+> deriva, **no** un resultado. Lo válido es el par intra-corrida (1 vs 4).
+
+### Los límites del festejo
+
+R1-Distill-Qwen **es la misma arquitectura** que Qwen2.5
+(`Qwen2ForCausalLM`, 1536/28/12/2/8960). Lo demostrado es que un segundo juego
+de pesos con diferencias reales (`lm_head` no atado, `rope_theta` 1e4 en vez de
+1e6) entra sin tocar el motor. Lo **no** demostrado es generalidad de
+arquitectura: eso pide Llama-3.2-1B (sin bias en q/k/v, otro `head_dim`) o un
+MoE. Anotado, no corrido.
+
+Y la calidad: la traza de "7 × 8" se va por las ramas. El motor está firme; la
+prosa de un 1,5 B en int4, todavía no.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

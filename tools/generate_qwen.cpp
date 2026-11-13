@@ -526,7 +526,10 @@ int main(int argc, char** argv) {
         for (unsigned i = 0; i < m; ++i)
             rmsnorm(x.data() + i * cfg.H, c.aux_of("model.norm.weight"),
                     h.data() + i * cfg.H, cfg.H, cfg.eps);
-          const Job jh{&c.lin.at("model.embed_tokens.weight"), logits.data()};
+          // lm_head puede tener nombre propio (tie_word_embeddings=False).
+          const std::string lmn = c.lin.count("lm_head.weight") ? "lm_head.weight"
+                                                              : "model.embed_tokens.weight";
+          const Job jh{&c.lin.at(lmn), logits.data()};
           gemv_group_M(pool, {jh}, m, h.data(), cfg.H);
 
 

@@ -147,6 +147,9 @@ def main():
     ap.add_argument('--layout-out', default=None)
     ap.add_argument('--layout-tokens', type=int, default=2,
                     help='cuantos x sinteticos para el set de 5 archivos')
+    ap.add_argument('--layout', default='split', choices=['split', 'inter'],
+                    help='split = weights.bin+scales.bin (MEDIDO mas rapido: 22.2 '
+                         'tok/s); inter = w.bin con filas [pesos][escalas] (18.0)')
     ap.add_argument('--group', type=int, default=64, choices=[16, 32, 64],
                     help='valores por escala (64 = 4.25 bits, 32 = 4.75 bits)')
     args = ap.parse_args()
@@ -195,35 +198,47 @@ def main():
     # ── Layout INTERCALADO: cada fila = [pesos K/2][escalas G*2] ────────────
     # Medido en probe3_ceiling: 98.7 % del techo continuo contra 90.4 % del
     # layout de dos arrays separados. El prefetcher sigue UN stream por hilo.
-    w_path = os.path.join(args.out, 'w.bin')
-    with open(w_path, 'wb') as fw:
+    splitted = (args.layout == 'split')
+    w_path = os.path.join(args.out, 'weights.bin' if splitted else 'w.bin')
+    s_path = os.path.join(args.out, 'scales.bin')
+    fw = open(w_path, 'wb')
+    fs = open(s_path, 'wb') if splitted else None
+    try:
         for name, (N, K) in todo:
             w = st.tensor_f32(name)
             packed, scales, err = quantize(w, GROUP)
             total_params += N * K
 
             rb, sbb = K // 2, (K // GROUP) * 2
-            # El stride DEBE ser múltiplo de 64: si no, cada carga de 32 B
-            # puede cruzar línea y el kernel pierde ~10 % (medido: 19.1 vs 21.0
-            # tok/s con stride sin alinear). El relleno cuesta ~1-2 % de bytes.
-            stride = (rb + sbb + 63) & ~63
-            rows = np.empty((N, stride), dtype=np.uint8)
-            rows[:, :rb] = packed
-            rows[:, rb:rb + sbb] = scales.view(np.uint8).reshape(N, sbb)
-
-            o = align(fw.tell())
-            fw.write(b'\0' * (o - fw.tell()))
-            fw.write(rows.tobytes())
-
-            index[name] = {'N': int(N), 'K': int(K), 'groups': int(K // GROUP),
-                           'base_off': o, 'stride': stride,
-                           'packed_bytes': int(packed.size),
-                           'scale_bytes': int(scales.size * 2),
-                           'quant_err': round(err, 6)}
+            if splitted:
+                ow = align(fw.tell()); fw.write(b'\0' * (ow - fw.tell()))
+                fw.write(packed.tobytes())
+                os_ = align(fs.tell()); fs.write(b'\0' * (os_ - fs.tell()))
+                fs.write(scales.tobytes())
+                index[name] = {'N': int(N), 'K': int(K), 'groups': int(K // GROUP),
+                               'base_off': ow, 'stride': 0, 'scale_off': os_,
+                               'packed_bytes': int(packed.size),
+                               'scale_bytes': int(scales.size * 2),
+                               'quant_err': round(err, 6)}
+            else:
+                stride = (rb + sbb + 63) & ~63
+                rows = np.empty((N, stride), dtype=np.uint8)
+                rows[:, :rb] = packed
+                rows[:, rb:rb + sbb] = scales.view(np.uint8).reshape(N, sbb)
+                o = align(fw.tell()); fw.write(b'\0' * (o - fw.tell()))
+                fw.write(rows.tobytes())
+                index[name] = {'N': int(N), 'K': int(K), 'groups': int(K // GROUP),
+                               'base_off': o, 'stride': stride,
+                               'packed_bytes': int(packed.size),
+                               'scale_bytes': int(scales.size * 2),
+                               'quant_err': round(err, 6)}
             print(f'{name:<44}{N:>6}{K:>6}{total_bits:>7.2f}{100*err:>9.3f}')
+    finally:
+        fw.close()
+        if fs: fs.close()
 
     errs = [v['quant_err'] for v in index.values()]
-    wsize = os.path.getsize(w_path)
+    wsize = os.path.getsize(w_path) + (os.path.getsize(s_path) if splitted else 0)
     manifest = {
         'model': os.path.basename(args.model.rstrip('/')),
         'config': cfg,
@@ -244,7 +259,7 @@ def main():
 
     print('-' * 74)
     print(f'params            : {total_params/1e6:.1f} M')
-    print(f'w.bin             : {manifest["w_bytes"]/1e6:.1f} MB (intercalado)')
+    print(f'artefacto         : {manifest["w_bytes"]/1e6:.1f} MB  layout={manifest["layout"]}')
     print(f'bits/param real   : {manifest["effective_bits"]:.3f}')
     print(f'error cuant. medio: {100*manifest["quant_err_mean"]:.3f} %   '
           f'max: {100*manifest["quant_err_max"]:.3f} %')
@@ -255,8 +270,12 @@ def main():
     # aux.bin   : todos los tensores 1-D (normas y biases) en float32
     lines = []
     for name, m in index.items():
-        lines.append(f'LINEAR {name} {m["N"]} {m["K"]} {m["base_off"]} '
-                     f'{m["stride"]} {m["groups"]}')
+        if splitted:
+            lines.append(f'LINEAR {name} {m["N"]} {m["K"]} {m["base_off"]} '
+                         f'{m["packed_bytes"]} {m["scale_off"]} {m["scale_bytes"]}')
+        else:
+            lines.append(f'LINEAR {name} {m["N"]} {m["K"]} {m["base_off"]} '
+                         f'{m["stride"]} {m["groups"]}')
 
     aux_names = [n for n in sorted(st.names()) if len(st.info(n)[1]) == 1]
     aux_off = 0
