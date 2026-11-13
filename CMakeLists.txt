@@ -90,3 +90,6 @@ endif()
 
 add_executable(forward_qwen tools/forward_qwen.cpp)
 target_link_libraries(forward_qwen PRIVATE caudal_flags)
+
+add_executable(generate_qwen tools/generate_qwen.cpp)
+target_link_libraries(generate_qwen PRIVATE caudal_flags)

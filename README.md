@@ -338,6 +338,60 @@ bits: para este tamaño habría que ir a grupo 32 o 5-6 bits (el 7B tolera 4).
 3. **`x` debe ir pre-permutado por `kPerm`** antes de entrar al kernel. Sin
    eso el producto punto empareja índices distintos y da 100 % de error.
 
+## Día 6 — KV cache en anillo + multihilo (2026-11-13)
+
+`tools/generate_qwen.cpp`. Tres piezas nuevas, sobre el forward ya validado a 1e-6.
+
+### El anillo de A1, por fin en producción
+
+El KV de cada capa vive en un `memfd` mapeado **dos veces consecutivas** (96 MB
+para 4096 tokens × 24 capas). Escribir en `base + t*stride` y leer la ventana
+`[0, n)` es siempre contiguo: **ninguna rama de wraparound** en el bucle de
+atención. Es exactamente la propiedad que `test_doublemap` validó.
+
+### Multihilo: la mitad del problema era el contador
+
+| hilos | ms/token | tok/s |
+|---|---|---|
+| 1 | 34,5 | 29,0 |
+| 2 | 20,9 | 47,8 |
+| **4** | **18,6** | **53,8** |
+| 6 | 19,7 | 50,8 |
+| 8 | 22,2 | 45,0 |
+
+Dos hallazgos, ambos contraintuitivos:
+
+1. **`std::barrier` (futex) es demasiado caro aquí.** Se invoca 168 veces por
+   token; a ~10 µs por encuentro son milisegundos. Reemplazado por un
+   **spin-barrier**.
+2. **El hilo principal debe trabajar.** Con T workers + 1 principal ocioso
+   (9 hilos en 8 núcleos) el spin-barrier **se estrangula**: 1106 ms/token.
+   El principal entra como worker 0 y quedan exactamente T hilos.
+3. **Más hilos no es mejor**: 8 rinde peor que 4 por el límite de potencia del
+   chip (mismo patrón que `probe0`/`probe2`). El óptimo acá es **4**.
+
+### Resultado
+
+```
+prefill  : 226.7 ms (13 tokens)
+1er token: 17.5 ms
+decode   : 19.11 ms/token  ->  52.3 tok/s
+```
+
+> "Hola! Como soy una inteligencia artificial, no tengo un "mejor" o "mejor"
+> como ser humano. Soy una herramienta diseñada para ayudar a los usuarios a
+> entender, responder y comunicarse. ¿Cómo puedo ayudarte hoy?"
+
+Párrafo completo, coherente, y termina en `<|im_end|>` — el stop token correcto.
+**29 → 53,8 tok/s** (1,86× sobre un hilo).
+
+### Lo que el 81 tok/s no era
+
+La proyección de 81 tok/s venía de `probe2` (39,9 GMAC/s a 8 hilos, una sola
+matriz grande). Este workload llega a 26,6 GMAC/s porque: (a) 169 GEMV chicos
+en vez de uno grande, (b) throttling de potencia, (c) secciones seriales
+(RMSNorm, atención, SiLU). **El número honesto es 52-54 tok/s.**
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
