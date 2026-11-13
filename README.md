@@ -155,7 +155,36 @@ término `-128·Σcode·sx·sw` en los 8 carriles, y la suma horizontal lo multi
 por 8. Ahora se resta una sola vez en el dominio entero, en el carril 0
 (`_mm256_sub_epi32`), lo que además elimina una instrucción de punto flotante.
 
-### Deuda declarada
+### El número honesto (layout real, grupo 64)
+
+`bench/probe2_group.cpp` · N=65536 K=3584 · 4.75 bits/param (packed + fp16 + int32).
+
+| métrica | 1 hilo | 8 hilos | gate | veredicto |
+|---|---|---|---|---|
+| GB/s (sólo packed) | **8.4** | 18.6 | 10.8 | ❌ **NO PASA** |
+| GB/s (bytes reales) | 9.9 | 22.0 | — | |
+| GMAC/s | **16.7** | **37.1** | 21.6 | ❌ 77 % |
+
+**El gate no se sostiene con el layout de producción.** 8.4 GB/s vs 10.8 = 78 %;
+en GMAC/s, 16.7 vs 21.6 = 77 %. El 11.6 GB/s de `probe1` era optimista, tal como
+estaba declarado en la deuda.
+
+Descomposición de la pérdida single-thread (23.1 → 16.7 GMAC/s, −27.7 %):
+
+| causa | costo |
+|---|---|
+| +18.75 % de bytes (`w_codesum` int32 + `w_scale` fp16 = +0.75 bits/param) | −15.8 % |
+| 3 instrucciones por grupo (vpsubd + vcvtdq2ps + vfmadd) | −11.9 % |
+
+**Pero el número de producto casi no se movió**, porque en agregado la máquina
+vuelve a estar limitada por memoria:
+
+```
+probe1 (escalas por fila)  : 42.4 GMAC/s -> 5.58 tok/s (7B)
+producción (grupo 64)       : 37.1 GMAC/s -> 4.88 tok/s (7B)   [-12.5 %]
+```
+
+
 
 `gemv_int4.hpp` usa **escalas por grupo de 64** (el layout real). `probe1_gemv.cpp`
 usa **escalas por fila** (más baratas). Por lo tanto **el 11.6 GB/s del gate es

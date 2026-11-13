@@ -43,6 +43,9 @@ target_link_libraries(probe0_bw PRIVATE caudal_flags)
 add_executable(probe1_gemv bench/probe1_gemv.cpp)
 target_link_libraries(probe1_gemv PRIVATE caudal_flags)
 
+add_executable(probe2_group bench/probe2_group.cpp)
+target_link_libraries(probe2_group PRIVATE caudal_flags)
+
 # --- Tests (aserciones: van a ctest) ------------------------------------------
 enable_testing()
 
