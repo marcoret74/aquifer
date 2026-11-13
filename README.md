@@ -120,16 +120,59 @@ Notas de implementación:
 - El RSS aparenta 2× `cap` (cuenta la misma página una vez por mapeo); el DRAM
   real es `cap`, y eso lo prueba el aliasing.
 
+## Día 3 — packer sintético + end-to-end (2026-11-13)
+
+`tools/pack_synth.py` (stdlib puro, sin red) + `include/caudal/gemv_int4.hpp` +
+`tests/test_pack_roundtrip.cpp`.
+
+```
+N=256 K=512   -> kernel vs ref: 5.15e-05   (tol 7.3e-02)
+N=64  K=3584  -> kernel vs ref: 1.45e-04   (tol 2.0e-01)
+ref C++ vs ref Python: 7.6e-06 / 1.5e-05
+```
+
+**10/10 aserciones.** Lo que queda demostrado, en orden de fuerza:
+
+1. El **packer es correcto**: su referencia independiente (float64, calculada desde
+   los mismos códigos) coincide con la referencia C++ a 1e-5, con K=512 y K=3584.
+2. El **kernel es correcto**: discrepa de la referencia escalar en ~1e-4, tres
+   órdenes por debajo de la tolerancia.
+3. El **pre-permutado de x funciona**: se eliminaron los 2 `vperm2i128` del bucle
+   y el resultado sigue siendo exacto.
+4. El **ABI está enlazado**: `row_bytes` (1792 para K=3584) es múltiplo de 16 B,
+   así que el offset de fila es un `caudal::NodeIdx` válido.
+
+### Dos bugs que sólo el end-to-end podía encontrar
+
+🔴 **LUT del nibble rotada 8 posiciones.** El complemento a 2 es `n<8 ? n : n-16`,
+pero la tabla mapeaba `nibble 0 -> -8` en vez de `nibble 0 -> 0`. **El mismo error
+estaba en `probe1_gemv.cpp`**: el probe midió velocidad con valores basura. El
+conteo de instrucciones es idéntico, así que el 11.6 GB/s sigue siendo válido
+como *performance* — pero nunca probó corrección. Corregido en ambos.
+
+🔴 **Sesgo del zero-point aplicado 8 veces.** `_mm256_set1_ps(...)` metía el
+término `-128·Σcode·sx·sw` en los 8 carriles, y la suma horizontal lo multiplicaba
+por 8. Ahora se resta una sola vez en el dominio entero, en el carril 0
+(`_mm256_sub_epi32`), lo que además elimina una instrucción de punto flotante.
+
+### Deuda declarada
+
+`gemv_int4.hpp` usa **escalas por grupo de 64** (el layout real). `probe1_gemv.cpp`
+usa **escalas por fila** (más baratas). Por lo tanto **el 11.6 GB/s del gate es
+optimista**: el kernel de producción paga un `vpsubd` + `vcvtdpi2ps` + `vfmadd`
+por grupo. Hay que re-medir con el layout real.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
 |---|---|---|
-| 1 | `include/caudal/layout.hpp` — ABI congelado | `static_assert` |
-| 2 | `bench/probe0_bw.cpp` — `BW_ef` | número medido |
-| 3 | `bench/probe1_gemv.cpp` — int4, 3 layouts | ≥ 60 % de `BW_ef` |
-| 4 | `tests/test_doublemap.cpp` — memfd doble mapeo | los mapas aliasan |
-| 5 | `tools/pack_qwen.py` — safetensors → A0 | `|Δlogit| < 1e-2` |
-| 6 | arena | THP efectivo |
+| 1 | `include/caudal/layout.hpp` — ABI congelado | `static_assert` ✅ |
+| 2 | `bench/probe0_bw.cpp` — `BW_ef` | número medido ✅ 21 GB/s |
+| 3 | `bench/probe1_gemv.cpp` — int4 AVX2 | ≥ 60 % de `BW_ef` ✅ 79 % |
+| 4 | `tests/test_doublemap.cpp` — memfd doble mapeo | los mapas aliasan ✅ |
+| 5 | `tools/pack_synth.py` + `gemv_int4.hpp` | round-trip ✅ 1e-4 |
+| 6 | `tools/pack_qwen.py` — safetensors reales | `|Δlogit| < 1e-2` |
+| 7 | arena A0/A1 sobre el artefacto | THP + anillo juntos |
 
 El 3 es el go/no-go: si el kernel int4 no alcanza el 60 % del ancho de banda,
 todo lo demás cambia de número y hay que arreglarlo antes de escribir una línea

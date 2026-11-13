@@ -40,6 +40,9 @@ target_link_libraries(caudal_flags INTERFACE Threads::Threads)
 add_executable(probe0_bw bench/probe0_bw.cpp)
 target_link_libraries(probe0_bw PRIVATE caudal_flags)
 
+add_executable(probe1_gemv bench/probe1_gemv.cpp)
+target_link_libraries(probe1_gemv PRIVATE caudal_flags)
+
 # --- Tests (aserciones: van a ctest) ------------------------------------------
 enable_testing()
 
@@ -47,7 +50,37 @@ add_executable(test_doublemap tests/test_doublemap.cpp)
 target_link_libraries(test_doublemap PRIVATE caudal_flags)
 add_test(NAME doublemap COMMAND test_doublemap 64)
 
-# Placeholder de la Fase 1:
-#   bench/probe1_gemv.cpp   -> tres layouts x M=1,8   (hecho)
-#   tools/pack_qwen.py      -> safetensors -> layout A0 (pendiente)
+add_executable(test_pack_roundtrip tests/test_pack_roundtrip.cpp)
+target_link_libraries(test_pack_roundtrip PRIVATE caudal_flags)
+
+find_package(Python3 COMPONENTS Interpreter)
+
+if(Python3_Interpreter_FOUND)
+    # El artefacto sintético se genera antes del test, vía fixtures de CTest.
+    add_test(NAME gen_artefacto
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/pack_synth.py
+                     --out ${CMAKE_CURRENT_BINARY_DIR}/artefacto)
+    set_tests_properties(gen_artefacto PROPERTIES FIXTURES_SETUP artefacto)
+
+    add_test(NAME pack_roundtrip
+             COMMAND test_pack_roundtrip ${CMAKE_CURRENT_BINARY_DIR}/artefacto 256 512 4)
+    set_tests_properties(pack_roundtrip PROPERTIES FIXTURES_REQUIRED artefacto)
+
+    add_test(NAME gen_artefacto_k3584
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/pack_synth.py
+                     --N 64 --K 3584 --M 2
+                     --out ${CMAKE_CURRENT_BINARY_DIR}/artefacto_k3584)
+    set_tests_properties(gen_artefacto_k3584 PROPERTIES FIXTURES_SETUP artefacto_k3584)
+
+    add_test(NAME pack_roundtrip_k3584
+             COMMAND test_pack_roundtrip ${CMAKE_CURRENT_BINARY_DIR}/artefacto_k3584 64 3584 2)
+    set_tests_properties(pack_roundtrip_k3584 PROPERTIES FIXTURES_REQUIRED artefacto_k3584)
+else()
+    message(STATUS "Python3 no encontrado: los tests del packer quedan deshabilitados")
+endif()
+
+# Pendiente Fase 1: tools/pack_qwen.py (safetensors -> layout A0 real)
+
 
