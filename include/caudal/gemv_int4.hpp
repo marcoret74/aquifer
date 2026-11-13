@@ -258,6 +258,88 @@ inline void gemv_int4_g32(const Shape& s,
 }
 #endif
 
+
+// -----------------------------------------------------------------------------
+//  Kernel M genérico (batching / verificación especulativa).
+// -----------------------------------------------------------------------------
+//  El desempacado se hace UNA vez por bloque de 64 valores y alimenta M
+//  acumuladores: los bytes de peso por token se parten en M. Medido en
+//  probe4_batch sobre el artefacto real del 1.5B (4 hilos):
+//
+//      M    ms/pasada   t(M)/t(1)   DRAM real
+//      1      45.89       1.00      19.5 GB/s
+//      2      53.13       1.16      16.8
+//      4      80.34       1.75      11.1
+//      8     143.53       3.13       6.2
+//
+//  La DRAM real CAE con M: se deja de ser memory-bound y se pasa a compute-bound.
+//  Techo de cómputo leído del coste marginal: ~63 tok/s.
+//
+//  xperm: M*K int8 pre-permutados;  xgsum: M*G;  xscale: M;  y: M*N.
+#if defined(__AVX2__)
+template <unsigned M>
+inline void gemv_int4_g32_M(const Shape& s,
+                            const std::uint8_t* __restrict w,
+                            const _Float16* __restrict wscale,
+                            const std::int32_t* __restrict xgsum,
+                            const std::int8_t* __restrict xperm,
+                            const float* __restrict xscale,
+                            float* __restrict y,
+                            std::size_t ystride) {
+    const __m256i m0f = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const std::size_t G = s.groups(), rb = s.row_bytes();
+    const std::size_t blocks = s.K / 64;
+
+    for (std::size_t n = 0; n < s.N; ++n) {
+        const std::uint8_t* row = w + n * s.row_stride();
+        const _Float16* sc = wscale ? wscale + n * G
+                                    : reinterpret_cast<const _Float16*>(row + rb);
+        __m256 facc[M];
+#pragma GCC unroll 8
+        for (unsigned m = 0; m < M; ++m) facc[m] = _mm256_setzero_ps();
+
+        for (std::size_t bb = 0; bb < blocks; ++bb) {
+            const __m256i v = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(row + bb * 32));
+            const __m256i lo = _mm256_and_si256(v, m0f);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
+            const __m256i a = _mm256_unpacklo_epi8(lo, hi);
+            const __m256i b = _mm256_unpackhi_epi8(lo, hi);
+            const std::size_t g0 = 2 * bb, g1 = 2 * bb + 1;
+
+#pragma GCC unroll 8
+            for (unsigned m = 0; m < M; ++m) {
+                const std::int8_t* xm = xperm + std::size_t(m) * s.K + bb * 64;
+                const __m256i x0 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(xm));
+                const __m256i x1 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(xm + 32));
+                __m256i acc = _mm256_madd_epi16(_mm256_maddubs_epi16(a, x0), ones16);
+                acc = _mm256_add_epi32(
+                    acc, _mm256_madd_epi16(_mm256_maddubs_epi16(b, x1), ones16));
+                acc = _mm256_sub_epi32(acc, _mm256_setr_epi32(
+                    8 * xgsum[std::size_t(m) * G + g0], 0, 0, 0,
+                    8 * xgsum[std::size_t(m) * G + g1], 0, 0, 0));
+                const __m256 sv = _mm256_set_m128(
+                    _mm_set1_ps(static_cast<float>(sc[g1]) * xscale[m]),
+                    _mm_set1_ps(static_cast<float>(sc[g0]) * xscale[m]));
+                facc[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv, facc[m]);
+            }
+        }
+#pragma GCC unroll 8
+        for (unsigned m = 0; m < M; ++m) {
+            __m128 l = _mm256_castps256_ps128(facc[m]);
+            __m128 h = _mm256_extractf128_ps(facc[m], 1);
+            __m128 t = _mm_add_ps(l, h);
+            t = _mm_hadd_ps(t, t);
+            t = _mm_hadd_ps(t, t);
+            y[std::size_t(m) * ystride + n] = _mm_cvtss_f32(t);
+        }
+    }
+}
+#endif
+
 }  // namespace caudal
 
 #endif  // CAUDAL_GEMV_INT4_HPP
