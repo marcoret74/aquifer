@@ -40,6 +40,14 @@ target_link_libraries(caudal_flags INTERFACE Threads::Threads)
 add_executable(probe0_bw bench/probe0_bw.cpp)
 target_link_libraries(probe0_bw PRIVATE caudal_flags)
 
-# Placeholder de la Fase 1 (se añade cuando exista el archivo):
-#   bench/probe1_gemv.cpp   -> tres layouts x M=1,8
-#   tests/test_doublemap.cpp-> aserción: los dos mapas de memfd aliasan
+# --- Tests (aserciones: van a ctest) ------------------------------------------
+enable_testing()
+
+add_executable(test_doublemap tests/test_doublemap.cpp)
+target_link_libraries(test_doublemap PRIVATE caudal_flags)
+add_test(NAME doublemap COMMAND test_doublemap 64)
+
+# Placeholder de la Fase 1:
+#   bench/probe1_gemv.cpp   -> tres layouts x M=1,8   (hecho)
+#   tools/pack_qwen.py      -> safetensors -> layout A0 (pendiente)
+

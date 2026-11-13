@@ -90,6 +90,36 @@ Forma: N=65536, K=3584 (234.9 M params) · buffer int4 112 MiB · AVX2.
 
 `tok/s` proyectado para Qwen2.5-7B int4: **21.2 / 4.28 ≈ 4.9 tok/s**.
 
+## Medición · Día 2 — `test_doublemap` (2026-11-13)
+
+**12/12 aserciones · exit 0.** Kernel 7.0.0-43, cap 64 y 256 MiB.
+
+| Pregunta | Respuesta |
+|---|---|
+| ¿Los dos mapas de `memfd` aliasan por MMU? | **SÍ** — escritura por A visible en B y viceversa |
+| ¿Propiedad de anillo (una ventana que cruza el límite)? | **SÍ** — 4000 B sin una sola rama de wraparound |
+| `MADV_HUGEPAGE` sobre `memfd` | **NO-OP** (0 kB) con `shmem_enabled=never` |
+| `MADV_COLLAPSE` sobre `memfd` | **SÍ** — 131072 kB a 64 MiB, 524288 kB a 256 MiB = **100 % PMD** |
+
+### El hallazgo que cierra A1
+
+`shmem_enabled=never` **no bloquea `MADV_COLLAPSE`**. Eso significa que A1 puede
+tener las tres cosas a la vez, sin root y sin sacrificar ninguna:
+
+```
+memfd  +  doble mapeo (anillo sin ramas)  +  páginas de 2 MiB (sin dolor de TLB)
+```
+
+La tabla de compromisos que abrió el Día 0 queda **anulada**: no hay que elegir
+entre "doble mapeo con 4 KiB" y "THP con un `if` por bloque". Se tienen ambos.
+
+Notas de implementación:
+- `MADV_COLLAPSE` es **sincrónico** y best-effort: puede devolver `EAGAIN` bajo
+  fragmentación (acá `Committed_AS` ya está en 22.8 GB sobre 11.4 GB). Va en el
+  init de la arena, nunca en el hot path.
+- El RSS aparenta 2× `cap` (cuenta la misma página una vez por mapeo); el DRAM
+  real es `cap`, y eso lo prueba el aliasing.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
