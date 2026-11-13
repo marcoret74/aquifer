@@ -26,6 +26,7 @@
 #include <ctime>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <map>
 #include <string>
 #include <thread>
@@ -47,7 +48,7 @@ struct Cfg {
 };
 
 struct Lin {
-    std::size_t N{0}, K{0}, G{0};
+    std::size_t N{0}, K{0}, G{0}, stride{0};
     const std::uint8_t* packed{nullptr};
     const _Float16* scale{nullptr};
     std::size_t row_bytes{0};
@@ -161,7 +162,7 @@ struct KvRing {
 };
 
 struct Ctx {
-    std::vector<std::uint8_t> wbin, sbin, auxbin, embed;
+    std::vector<std::uint8_t> wbin, auxbin, embed;
     std::size_t V{0}, H{0};
     std::map<std::string, Lin> lin;
     std::map<std::string, const float*> aux;
@@ -217,8 +218,9 @@ void gemv_fused(Pool& pool, const std::vector<Job>& jobs, const float* x) {
             const std::size_t n1 = (b < hi ? b : hi) - lo;
             if (n1 > n0) {
                 caudal::Shape s; s.N = n1 - n0; s.K = K; s.group = grp;
-                const std::uint8_t* pk = j.L->packed + n0 * j.L->row_bytes;
-                const _Float16* sc = j.L->scale + n0 * G;
+                const std::uint8_t* pk = j.L->packed + n0 * (j.L->stride ? j.L->stride : j.L->row_bytes);
+                s.stride = j.L->stride;   // 0 = layout viejo (dos arrays)
+                const _Float16* sc = j.L->stride ? nullptr : j.L->scale;
                 if (grp == 32)
                     caudal::gemv_int4_g32(s, pk, sc, xg.data(), xqp.data(), sx, j.y + n0);
                 else
@@ -284,8 +286,9 @@ int main(int argc, char** argv) {
     }
 
     Ctx c;
-    c.wbin = slurp(A + "/weights.bin");
-    c.sbin = slurp(A + "/scales.bin");
+    if (std::ifstream t(A + "/w.bin"); t.good()) c.wbin = slurp(A + "/w.bin");
+    else { auto a1 = slurp(A + "/weights.bin"); auto a2 = slurp(A + "/scales.bin");
+           c.wbin = a1; c.wbin.insert(c.wbin.end(), a2.begin(), a2.end()); }
     c.auxbin = slurp(A + "/aux.bin");
     c.embed = slurp(A + "/embed.bf16");
 
@@ -293,12 +296,29 @@ int main(int argc, char** argv) {
     std::string kind;
     while (fi >> kind) {
         if (kind == "LINEAR") {
-            std::string name; std::size_t N, K, po, pb, so, sb;
-            fi >> name >> N >> K >> po >> pb >> so >> sb;
+            // Tolera los dos formatos para poder A/B:
+            //   viejo (8 campos): name N K po pb so sb   -> dos arrays
+            //   nuevo (7 campos): name N K off stride G  -> intercalado
+            std::string rest;
+            std::getline(fi, rest);
+            std::istringstream is(rest);
+            std::string name; is >> name;              // el nombre va primero
+            std::vector<std::size_t> v; std::size_t x;
+            while (is >> x) v.push_back(x);
+            if (v.size() < 2) { std::printf("indice ilegible: %s\n", rest.c_str()); return 1; }
+            const std::size_t N = v[0], K = v[1];
             Lin L; L.N = N; L.K = K; L.row_bytes = K / 2;
-            L.G = sb / (2 * N);                    // número de grupos, NO K/64
-            L.packed = c.wbin.data() + po;
-            L.scale = reinterpret_cast<const _Float16*>(c.sbin.data() + so);
+            // v = [N, K, ...] -> los offsets empiezan en v[2]
+            if (v.size() == 5) {                 // nuevo: N K off stride G
+                L.packed = c.wbin.data() + v[2];
+                L.stride = v[3];
+                L.G = v[4];
+            } else if (v.size() == 6) {          // viejo: N K po pb so sb
+                L.packed = c.wbin.data() + v[2];
+                L.scale = reinterpret_cast<const _Float16*>(c.wbin.data() + v[4]);
+                L.stride = 0;
+                L.G = v[5] / (2 * N);
+            } else { std::printf("indice ilegible (%zu campos)\n", v.size()); return 1; }
             c.lin[name] = L;
         } else if (kind == "AUX") {
             std::string name; std::size_t cnt, off;

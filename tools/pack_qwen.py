@@ -189,55 +189,52 @@ def main():
     print('-' * 74)
 
     os.makedirs(args.out, exist_ok=True)
-    blobs_w, blobs_s, index = [], [], {}
-    off_w = off_s = 0
+    index = {}
     total_params = 0
 
-    for name, (N, K) in todo:
-        w = st.tensor_f32(name)
-        packed, scales, err = quantize(w, GROUP)
-        total_params += N * K
+    # ── Layout INTERCALADO: cada fila = [pesos K/2][escalas G*2] ────────────
+    # Medido en probe3_ceiling: 98.7 % del techo continuo contra 90.4 % del
+    # layout de dos arrays separados. El prefetcher sigue UN stream por hilo.
+    w_path = os.path.join(args.out, 'w.bin')
+    with open(w_path, 'wb') as fw:
+        for name, (N, K) in todo:
+            w = st.tensor_f32(name)
+            packed, scales, err = quantize(w, GROUP)
+            total_params += N * K
 
-        o_w = align(off_w)
-        o_s = align(off_s)
-        blobs_w.append((o_w, packed.tobytes()))
-        blobs_s.append((o_s, scales.tobytes()))
-        index[name] = {
-            'N': int(N), 'K': int(K), 'groups': int(K // GROUP),
-            'packed_off': o_w, 'packed_bytes': int(packed.size),
-            'scale_off': o_s, 'scale_bytes': int(scales.size * 2),
-            'quant_err': round(err, 6),
-        }
-        off_w = o_w + packed.size
-        off_s = o_s + scales.size * 2
-        print(f'{name:<44}{N:>6}{K:>6}{total_bits:>7.2f}{100*err:>9.3f}')
+            rb, sbb = K // 2, (K // GROUP) * 2
+            # El stride DEBE ser múltiplo de 64: si no, cada carga de 32 B
+            # puede cruzar línea y el kernel pierde ~10 % (medido: 19.1 vs 21.0
+            # tok/s con stride sin alinear). El relleno cuesta ~1-2 % de bytes.
+            stride = (rb + sbb + 63) & ~63
+            rows = np.empty((N, stride), dtype=np.uint8)
+            rows[:, :rb] = packed
+            rows[:, rb:rb + sbb] = scales.view(np.uint8).reshape(N, sbb)
 
-    # --- Escritura -----------------------------------------------------------
-    def write_blob(path, parts, total):
-        with open(path, 'wb') as f:
-            for off, data in parts:
-                f.write(b'\0' * (off - f.tell()))
-                f.write(data)
-            f.write(b'\0' * (align(total) - f.tell()))
+            o = align(fw.tell())
+            fw.write(b'\0' * (o - fw.tell()))
+            fw.write(rows.tobytes())
 
-    w_path = os.path.join(args.out, 'weights.bin')
-    s_path = os.path.join(args.out, 'scales.bin')
-    write_blob(w_path, blobs_w, off_w)
-    write_blob(s_path, blobs_s, off_s)
+            index[name] = {'N': int(N), 'K': int(K), 'groups': int(K // GROUP),
+                           'base_off': o, 'stride': stride,
+                           'packed_bytes': int(packed.size),
+                           'scale_bytes': int(scales.size * 2),
+                           'quant_err': round(err, 6)}
+            print(f'{name:<44}{N:>6}{K:>6}{total_bits:>7.2f}{100*err:>9.3f}')
 
     errs = [v['quant_err'] for v in index.values()]
+    wsize = os.path.getsize(w_path)
     manifest = {
         'model': os.path.basename(args.model.rstrip('/')),
         'config': cfg,
         'group': GROUP,
+        'layout': 'interleaved: fila = [pesos K/2][escalas G*2]',
         'format': {'nibble': 'unsigned code+8', 'x': 'int8 signed, zero_point 0',
                    'perm': PERM},
         'bits_per_param': round(total_bits, 3),
         'total_params': total_params,
-        'weights_bytes': os.path.getsize(w_path),
-        'scales_bytes': os.path.getsize(s_path),
-        'effective_bits': round(8.0 * (os.path.getsize(w_path) +
-                                       os.path.getsize(s_path)) / total_params, 3),
+        'w_bytes': wsize,
+        'effective_bits': round(8.0 * wsize / total_params, 3),
         'quant_err_mean': round(float(np.mean(errs)), 6),
         'quant_err_max': round(float(np.max(errs)), 6),
         'tensors': index,
@@ -247,8 +244,7 @@ def main():
 
     print('-' * 74)
     print(f'params            : {total_params/1e6:.1f} M')
-    print(f'weights.bin       : {manifest["weights_bytes"]/1e6:.1f} MB')
-    print(f'scales.bin        : {manifest["scales_bytes"]/1e6:.1f} MB')
+    print(f'w.bin             : {manifest["w_bytes"]/1e6:.1f} MB (intercalado)')
     print(f'bits/param real   : {manifest["effective_bits"]:.3f}')
     print(f'error cuant. medio: {100*manifest["quant_err_mean"]:.3f} %   '
           f'max: {100*manifest["quant_err_max"]:.3f} %')
@@ -259,9 +255,8 @@ def main():
     # aux.bin   : todos los tensores 1-D (normas y biases) en float32
     lines = []
     for name, m in index.items():
-        lines.append(f'LINEAR {name} {m["N"]} {m["K"]} '
-                     f'{m["packed_off"]} {m["packed_bytes"]} '
-                     f'{m["scale_off"]} {m["scale_bytes"]}')
+        lines.append(f'LINEAR {name} {m["N"]} {m["K"]} {m["base_off"]} '
+                     f'{m["stride"]} {m["groups"]}')
 
     aux_names = [n for n in sorted(st.names()) if len(st.info(n)[1]) == 1]
     aux_off = 0
@@ -303,12 +298,13 @@ def main():
         N, K, G = meta['N'], meta['K'], meta['groups']
         print(f'\nemitiendo layout de 5 archivos para {args.layout_tensor}')
 
+        stride = meta['stride']
         with open(w_path, 'rb') as f:
-            f.seek(meta['packed_off'])
-            packed = np.frombuffer(f.read(meta['packed_bytes']), dtype=np.uint8)
-        with open(s_path, 'rb') as f:
-            f.seek(meta['scale_off'])
-            scales = np.frombuffer(f.read(meta['scale_bytes']), dtype=np.float16)
+            f.seek(meta['base_off'])
+            raw = np.frombuffer(f.read(meta['packed_bytes'] + meta['scale_bytes']),
+                                dtype=np.uint8).reshape(N, stride)
+        packed = raw[:, :meta['packed_bytes']].reshape(-1).copy()
+        scales = raw[:, meta['packed_bytes']:].copy().view(np.float16).reshape(-1)
 
         outd = args.layout_out or os.path.join(args.out, 'layout')
         os.makedirs(outd, exist_ok=True)

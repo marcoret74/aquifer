@@ -68,6 +68,7 @@ std::vector<std::uint8_t> slurp(const std::string& p) {
 }
 
 struct Seg { std::size_t off, bytes; };
+struct LinRec { std::size_t N, K, po, pb, so, sb; };
 
 }  // namespace
 
@@ -82,6 +83,7 @@ int main(int argc, char** argv) {
 
     // lista de tensores desde index.txt
     std::vector<Seg> tens;
+    std::vector<LinRec> lins;
     {
         std::ifstream fi(A + "/index.txt");
         std::string kind;
@@ -91,6 +93,7 @@ int main(int argc, char** argv) {
                 fi >> name >> N >> K >> po >> pb >> so >> szb;
                 tens.push_back({po, pb});           // pesos
                 tens.push_back({so, szb});          // escalas
+                lins.push_back({N, K, po, pb, so, szb});
             } else if (kind == "AUX") {
                 std::string name; std::size_t cnt, off; fi >> name >> cnt >> off;
             } else if (kind == "EMBED") {
@@ -155,12 +158,40 @@ int main(int argc, char** argv) {
     t1 = now_s();
     const double B_gbs = double(total) * reps / (t1 - t0) / 1e9;
 
+    // --- D: layout INTERCALADO por fila [pesos fila][escalas fila] -----------
+    std::vector<std::uint8_t> iw;
+    std::vector<Seg> itens;
+    iw.reserve(total + lins.size() * 4096);
+    for (const auto& L : lins) {
+        const std::size_t rb = L.K / 2, sbb = (L.K / 64) * 2;
+        const std::size_t base = iw.size();
+        for (std::size_t n = 0; n < L.N; ++n) {
+            iw.insert(iw.end(), wb.begin() + L.po + n * rb, wb.begin() + L.po + (n + 1) * rb);
+            iw.insert(iw.end(), sb.begin() + L.so + n * sbb, sb.begin() + L.so + (n + 1) * sbb);
+        }
+        itens.push_back({base, iw.size() - base});
+    }
+    const std::size_t itotal = iw.size();
+    auto scan_inter = [&](unsigned tid) {
+        const std::size_t lo = itotal * tid / T, hi = itotal * (tid + 1) / T;
+        g_sink ^= scan(iw.data() + lo, hi - lo);
+    };
+    run_mt(scan_inter);
+    t0 = now_s();
+    for (int r = 0; r < reps; ++r) run_mt(scan_inter);
+    t1 = now_s();
+    const double D_gbs = double(itotal) * reps / (t1 - t0) / 1e9;
+
+    std::printf("%-34s %8.2f GB/s  (%.1f %% de A)\n",
+                "D. intercalado por fila", D_gbs, 100.0 * D_gbs / A_gbs);
     std::printf("%-34s %8.2f GB/s\n", "A. stream continuo (868 MB)", A_gbs);
     std::printf("%-34s %8.2f GB/s  (%.1f %% de A)\n",
                 "B. stream por 197 tensores", B_gbs, 100.0 * B_gbs / A_gbs);
     std::printf("%-34s %8.2f GB/s  (%.1f %% de B)\n",
                 "C. generate_qwen real (medido)", 18.0, 100.0 * 18.0 / B_gbs);
     std::printf("\n");
+    std::printf("B actual vs D intercalado   : %+5.2f GB/s  (%.1f %%)\n",
+                D_gbs - B_gbs, 100.0 * (D_gbs - B_gbs) / B_gbs);
     std::printf("brecha A->B (fragmentacion) : %5.2f GB/s\n", A_gbs - B_gbs);
     std::printf("brecha B->C (computo+serial): %5.2f GB/s\n", B_gbs - 18.0);
     std::printf("techo del modelo 1.5B a A   : %.1f tok/s\n", A_gbs / 0.8683);

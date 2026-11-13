@@ -53,9 +53,16 @@ struct Shape {
     std::size_t N{0};      // filas de salida
     std::size_t K{0};      // profundidad; múltiplo de 64
     std::size_t group{64}; // valores por escala
+    // Layout INTERCALADO: cada fila es [pesos K/2][escalas groups*2], y las
+    // escalas se leen de row + row_bytes(). Medido: 98.7% del techo continuo
+    // contra 90.4% del layout de dos arrays (probe3_ceiling).
+    std::size_t stride{0};  // 0 = layout antiguo (dos arrays separados)
 
     [[nodiscard]] constexpr std::size_t groups() const noexcept { return K / group; }
     [[nodiscard]] constexpr std::size_t row_bytes() const noexcept { return K / 2; }
+    [[nodiscard]] constexpr std::size_t row_stride() const noexcept {
+        return stride ? stride : row_bytes();
+    }
 };
 
 // Permutación dentro de cada bloque de 64. Orden natural de vpunpcklbw/hbw.
@@ -140,7 +147,9 @@ inline void gemv_int4(const Shape& s,
     const std::size_t chunk = s.group / 2;   // 32 B por grupo de 64 valores
 
     for (std::size_t n = 0; n < s.N; ++n) {
-        const std::uint8_t* row = w + n * rb;
+        const std::uint8_t* row = w + n * s.row_stride();
+        const _Float16* sc = wscale ? wscale + n * G
+                                    : reinterpret_cast<const _Float16*>(row + rb);
         __m256 facc = _mm256_setzero_ps();
 
         for (std::size_t g = 0; g < G; ++g) {
@@ -169,7 +178,7 @@ inline void gemv_int4(const Shape& s,
             acc = _mm256_sub_epi32(
                 acc, _mm256_setr_epi32(8 * xgsum[g], 0, 0, 0, 0, 0, 0, 0));
 
-            const float fs = static_cast<float>(wscale[n * G + g]) * xscale;
+            const float fs = static_cast<float>(sc[g]) * xscale;
             facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), _mm256_set1_ps(fs), facc);
         }
 
@@ -207,7 +216,9 @@ inline void gemv_int4_g32(const Shape& s,
     const std::size_t blocks = s.K / 64;   // bloques de 64 valores
 
     for (std::size_t n = 0; n < s.N; ++n) {
-        const std::uint8_t* row = w + n * rb;
+        const std::uint8_t* row = w + n * s.row_stride();
+        const _Float16* sc = wscale ? wscale + n * G
+                                    : reinterpret_cast<const _Float16*>(row + rb);
         __m256 facc = _mm256_setzero_ps();
 
         for (std::size_t bb = 0; bb < blocks; ++bb) {
@@ -232,8 +243,8 @@ inline void gemv_int4_g32(const Shape& s,
 
             // Una escala por mitad del registro.
             const __m256 sv = _mm256_set_m128(
-                _mm_set1_ps(static_cast<float>(wscale[n * G + g1]) * xscale),
-                _mm_set1_ps(static_cast<float>(wscale[n * G + g0]) * xscale));
+                _mm_set1_ps(static_cast<float>(sc[g1]) * xscale),
+                _mm_set1_ps(static_cast<float>(sc[g0]) * xscale));
             facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv, facc);
         }
 
