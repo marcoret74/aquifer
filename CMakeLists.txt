@@ -99,3 +99,6 @@ target_link_libraries(stencil_3d PRIVATE caudal_flags)
 
 add_executable(probe3_ceiling bench/probe3_ceiling.cpp)
 target_link_libraries(probe3_ceiling PRIVATE caudal_flags)
+
+add_executable(probe4_batch bench/probe4_batch.cpp)
+target_link_libraries(probe4_batch PRIVATE caudal_flags)
