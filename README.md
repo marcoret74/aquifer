@@ -191,6 +191,43 @@ usa **escalas por fila** (más baratas). Por lo tanto **el 11.6 GB/s del gate es
 optimista**: el kernel de producción paga un `vpsubd` + `vcvtdpi2ps` + `vfmadd`
 por grupo. Hay que re-medir con el layout real.
 
+### La inversión unsigned: resultado
+
+| variante | bits/param | GB/s real 1 hilo | GMAC/s 1 hilo | GB/s real 8 hilos | GMAC/s 8 hilos | tok/s 7B |
+|---|---|---|---|---|---|---|
+| int4 con LUT + codesum | 4.75 | 9.9 | 16.7 | 22.0 | 37.1 | 4.88 |
+| **int4 invertido** | **4.25** | 10.2 | **19.1** | 21.2 | **39.9** | **5.25** |
+| int8 (sin desempacar) | 8.25 | 14.6 | 14.2 | **24.4** | 23.7 | 3.11 |
+
+- **La inversión rinde +14,4 % single-thread y +7,5 % agregado.** Sin LUT
+  (`vpshufb` fuera), sin `w_codesum` (4,25 bits/param), 2 ops de shuffle por
+  32 B en vez de 4.
+- **int8 queda refutado**: −26 % single-thread y −41 % agregado. A 8 hilos
+  int8 alcanza 24,4 GB/s reales e int4 21,2 → **int4 está al 87 % del techo de
+  memoria** que int8 revela: al no tener desempacado, int8 es el termómetro.
+- Correctitud verificada antes de cronometrar: `max|kernel−ref| = 1,1e-04`
+  (int4, todas las filas) y `1,2e-05` (int8).
+
+### El gate, reconsiderado
+
+Contra el gate literal (10,8 GB/s sobre bytes empaquetados): **9,55 GB/s = 88 %.
+No pasa**, por poco.
+
+Pero el gate estaba mal construido, y la evidencia es de `probe0`: **un solo
+núcleo tope a 15 GB/s sin importar el kernel**. El gate medía la tasa de emisión
+de memoria de un núcleo, no la eficiencia del kernel. Con 8 hilos —como correrá
+en producción— estamos al **87 % del techo de memoria**.
+
+| moneda | valor | contra qué |
+|---|---|---|
+| GB/s packed, 1 hilo | 9,55 | gate 10,8 → 88 % ❌ |
+| GB/s reales, 8 hilos | 21,2 | techo 24,4 → 87 % ✅ |
+| GMAC/s, 8 hilos | 39,9 | → 5,25 tok/s (7B) · 45 tok/s (1,5B) |
+
+**Decisión: el kernel se cierra acá.** Queda ~13 % de margen teórico (grupos de
+128 bajarían el pliegue, ~5 % a cambio de calidad), y no vale otro ciclo de
+formato.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

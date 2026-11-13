@@ -11,26 +11,31 @@
 #
 #  ── Formato (todas las filas contiguas, sin padding) ────────────────────────
 #    w_packed.bin   N * (K/2)      int4 empaquetado, 2 por byte.
-#                                  byte i = (code[2i] & 0xF) | (code[2i+1] << 4)
-#                                  nibble = complemento a 2: code = n<8 ? n : n-16
+#                                  byte i = (u[2i] & 0xF) | (u[2i+1] << 4)
+#                                  u = code + 8  ->  nibble UNSIGNED 0..15
 #    w_scale.bin    N * (K/64) * 2 fp16, escala por grupo de 64 (simétrica)
-#    w_codesum.bin  N * (K/64) * 4 int32, suma de los codes del grupo (sesgo)
-#    x_perm.bin     M * K          uint8 = round(x/sx) + 128, PRE-PERMUTADO
+#    x_perm.bin     M * K          int8 CON SIGNO (zero-point 0), PRE-PERMUTADO
 #    x_scale.bin    M * 4          fp32
 #    ref.bin        M * N * 4      fp32, calculado en float64 desde los
 #                                  mismos operandos cuantizados
 #
-#  ── El pre-permutado de x (por qué existe) ──────────────────────────────────
-#  El desempaquetado AVX2 produce las mitades en el orden (a, b) =
-#  ([v0..15, v32..47], [v16..31, v48..63]). Si se reordena con vperm2i128 para
-#  volver al orden k, se gastan 2 instrucciones de puerto de shuffle por cada
-#  64 valores. Si en cambio se pre-permuta x con ese mismo orden, el kernel
-#  empareja directamente y no necesita ninguna permutación.
+#  ── Por qué los nibbles son unsigned ───────────────────────────────────────
+#  vpmaddubsw exige primer operando unsigned y segundo signed. Poniendo w como
+#  unsigned (code+8) y x como int8 con signo:
 #
-#      PERM = [0..15] + [32..47] + [16..31] + [48..63]
+#      Σ u·x = Σ (code+8)·x = Σ code·x + 8·Σx
 #
-#  La suma es conmutativa: cualquier permutación consistente da el mismo
-#  producto punto. Esto se paga UNA vez en el packer y se ahorra en cada token.
+#  El término 8·Σx depende sólo del token, así que NO viaja en el artefacto:
+#  el kernel lo calcula una vez por token. Eso elimina `w_codesum` (+0.5
+#  bits/param) y, sobre todo, elimina la LUT vpshufb: el nibble ya es el valor.
+#
+#      4.75 -> 4.25 bits/param      (−10.5 % de tráfico de DRAM)
+#      4 -> 2 ops de shuffle / 32 B (−50 % en el recurso escaso de AVX2)
+#
+#  ── El pre-permutado de x ───────────────────────────────────────────────────
+#  vpunpcklbw/hbw entrega las mitades como ([v0..15, v32..47], [v16..31, v48..63]).
+#  Guardando x en ese orden, el kernel empareja directo y no gasta vperm2i128.
+#  Cualquier permutación CONSISTENTE da el mismo producto punto.
 # =============================================================================
 
 import argparse
@@ -41,23 +46,22 @@ import struct
 
 GROUP = 64  # valores por escala
 
-# Orden que produce vpunpcklbw/vpunpckhbw sobre las mitades de nibbles.
 PERM = (list(range(0, 16)) + list(range(32, 48))
         + list(range(16, 32)) + list(range(48, 64)))
 
 
 def f16(v: float) -> float:
-    """Redondea a fp16 y devuelve el valor como float (para que la referencia
-    use exactamente lo que el C++ va a leer)."""
+    """Redondea a fp16 y devuelve el valor como float: la referencia usa
+    exactamente lo que el C++ va a leer."""
     return struct.unpack('<e', struct.pack('<e', v))[0]
 
 
 def pack_nibbles(codes):
-    """codes: lista de ints en [-8, 7] -> bytes empaquetados."""
+    """codes en [-8, 7] -> bytes con nibbles unsigned (code+8) en 0..15."""
     out = bytearray(len(codes) // 2)
     for i in range(len(codes) // 2):
-        lo = codes[2 * i] & 0xF
-        hi = codes[2 * i + 1] & 0xF
+        lo = (codes[2 * i] + 8) & 0xF
+        hi = (codes[2 * i + 1] + 8) & 0xF
         out[i] = lo | (hi << 4)
     return bytes(out)
 
@@ -77,12 +81,10 @@ def main():
     G = K // GROUP
     rnd = random.Random(args.seed)
 
-    # --- Pesos ---------------------------------------------------------------
     W = [[rnd.gauss(0.0, 1.0) for _ in range(K)] for _ in range(N)]
 
     codes = [[0] * K for _ in range(N)]
     scales = [[0.0] * G for _ in range(N)]
-    codesum = [[0] * G for _ in range(N)]
 
     for n in range(N):
         for g in range(G):
@@ -92,15 +94,11 @@ def main():
             if sw == 0.0:
                 sw = 1.0
             scales[n][g] = sw
-            s = 0
             for j, v in enumerate(blk):
                 c = int(round(v / sw))
-                c = max(-8, min(7, c))
-                codes[n][g * GROUP + j] = c
-                s += c
-            codesum[n][g] = s
+                codes[n][g * GROUP + j] = max(-8, min(7, c))
 
-    # --- Activaciones --------------------------------------------------------
+    # --- Activaciones: int8 CON SIGNO, zero-point 0 --------------------------
     X = [[rnd.gauss(0.0, 1.0) for _ in range(K)] for _ in range(M)]
     x_scale = []
     xq = []
@@ -108,16 +106,14 @@ def main():
         amax = max(abs(v) for v in X[m]) or 1.0
         sx = amax / 127.0
         x_scale.append(sx)
-        row = [max(0, min(255, int(round(X[m][k] / sx)) + 128)) for k in range(K)]
-        xq.append(row)
+        xq.append([max(-127, min(127, int(round(X[m][k] / sx)))) for k in range(K)])
 
-    # x pre-permutado por bloques de 64
     x_perm = []
     for m in range(M):
         out = bytearray(K)
         for g in range(G):
             for i, p in enumerate(PERM):
-                out[g * GROUP + i] = xq[m][g * GROUP + p]
+                out[g * GROUP + i] = xq[m][g * GROUP + p] & 0xFF   # two's complement
         x_perm.append(bytes(out))
 
     # --- Referencia (float64 desde los operandos cuantizados) ----------------
@@ -128,7 +124,7 @@ def main():
             for g in range(G):
                 s = 0
                 for j in range(GROUP):
-                    s += codes[n][g * GROUP + j] * (xq[m][g * GROUP + j] - 128)
+                    s += codes[n][g * GROUP + j] * xq[m][g * GROUP + j]
                 acc += s * (scales[n][g] * x_scale[m])
             ref[m][n] = acc
 
@@ -147,11 +143,6 @@ def main():
             for g in range(G):
                 f.write(struct.pack('<e', scales[n][g]))
 
-    with open(path('w_codesum.bin'), 'wb') as f:
-        for n in range(N):
-            for g in range(G):
-                f.write(struct.pack('<i', codesum[n][g]))
-
     with open(path('x_perm.bin'), 'wb') as f:
         for m in range(M):
             f.write(x_perm[m])
@@ -168,23 +159,27 @@ def main():
     row_bytes = K // 2
     assert row_bytes % 16 == 0, 'el stride de fila debe ser multiplo de 16 B'
 
+    total_bits = 4.0 + 16.0 / GROUP
     manifest = {
         'N': N, 'K': K, 'M': M, 'group': GROUP,
         'row_bytes': row_bytes,
         'scale_bytes_per_row': G * 2,
-        'codesum_bytes_per_row': G * 4,
+        'bits_per_param': total_bits,
+        'nibble': 'unsigned (code+8), 0..15',
+        'x': 'int8 signed, zero_point 0, pre-permutado',
         'perm': PERM,
-        'alignment_note': ('row_bytes=%d es multiplo de 16: el offset de fila '
-                           'es un caudal::NodeIdx valido' % row_bytes),
+        'no_codesum': 'el sesgo 8*sum(x) se calcula por token en el kernel',
+        'files': ['w_packed.bin', 'w_scale.bin', 'x_perm.bin',
+                  'x_scale.bin', 'ref.bin'],
     }
     with open(path('manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)
 
     print(f'artefacto en {args.out}/')
     print(f'  N={N} K={K} M={M} grupos={G}  row_bytes={row_bytes}')
+    print(f'  {total_bits:.2f} bits/param  (sin w_codesum)')
     print(f'  w_packed   {N*row_bytes:>10} B')
     print(f'  w_scale    {N*G*2:>10} B')
-    print(f'  w_codesum  {N*G*4:>10} B')
     print(f'  x_perm     {M*K:>10} B')
     print(f'  ref        {M*N*4:>10} B')
 
