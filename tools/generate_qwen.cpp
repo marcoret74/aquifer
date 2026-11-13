@@ -1,24 +1,16 @@
 // =============================================================================
 //  caudal · tools/generate_qwen.cpp
 //  GENERACIÓN con KV cache en ANILLO (memfd doble mapeo) + pool de hilos.
+//  Dimensiones en RUNTIME: sirve para 0.5B, 1.5B y cualquier Qwen2.
 // =============================================================================
-//  Tres cosas nuevas respecto de forward_qwen.cpp (que queda como referencia
-//  O(T^2) ya validada contra PyTorch a 1e-6):
+//   1. KV CACHE en anillo: el memfd está mapeado DOS VECES consecutivas, así una
+//      ventana [start,end] con end-start<=cap es SIEMPRE contigua. Ninguna rama
+//      de wraparound en el bucle de atención. (Validado en test_doublemap.)
+//   2. MULTIHILO con SpinBarrier y el hilo principal como worker 0: con T+1
+//      hilos en T núcleos el barrier se estrangula (~1 s/token).
+//   3. DECODE INCREMENTAL: prefill una vez, luego O(1) GEMVs por token.
 //
-//   1. KV CACHE. El estado de atención de cada capa vive en un anillo de tamaño
-//      fijo. Se escribe en `base + t*stride`; como el mismo memfd está mapeado
-//      DOS VECES consecutivas, una ventana [start, end] con end-start <= cap es
-//      SIEMPRE contigua: ninguna rama de wraparound en el bucle de atención.
-//      (Esa es exactamente la propiedad que test_doublemap valida.)
-//
-//   2. MULTIHILO. Pool persistente con barreras: se evita el costo de crear
-//      169 GEMV x 8 hilos por token. Partición por filas de salida, sin
-//      reducción entre hilos.
-//
-//   3. DECODE INCREMENTAL. Prefill del prompt una vez; cada token nuevo cuesta
-//      O(1) GEMVs + O(T) atención (no O(T) capas completas).
-//
-//  Uso: ./generate_qwen <artefacto> <id> [<id> ...] --n <N>
+//  Uso: ./generate_qwen <artefacto> <id> [<id>...] --n <N> [--threads <T>]
 // =============================================================================
 
 #include "caudal/gemv_int4.hpp"
@@ -45,9 +37,14 @@
 
 namespace {
 
-constexpr std::size_t kH = 896, kNLY = 24, kNH = 14, kNKV = 2, kDH = 64;
-constexpr float kEps = 1e-6f, kTheta = 1000000.0f, kInvSqrtD = 1.0f / 8.0f;
 constexpr std::size_t kMaxTok = 4096;
+
+// --- hiperparámetros, leídos de model.txt ------------------------------------
+struct Cfg {
+    std::size_t H{0}, NLY{0}, NH{0}, NKV{0}, DH{0}, INTER{0}, V{0};
+    float eps{1e-6f}, theta{1e6f};
+    float inv_sqrt_d{1.0f};
+};
 
 struct Lin {
     std::size_t N{0}, K{0}, G{0};
@@ -77,8 +74,7 @@ double now_ms() {
 }
 
 // --- barrera de spin ---------------------------------------------------------
-// std::barrier bloquea en futex: ~5-20 us por encuentro. Con 168 GEMV por token
-// eso son milisegundos de puro overhead. Con 16 hilos o menos, girar gana.
+// std::barrier bloquea en futex: ~10 us por encuentro x 168 GEMV por token.
 class SpinBarrier {
 public:
     explicit SpinBarrier(unsigned t) : T_(t) {}
@@ -96,11 +92,8 @@ private:
     std::atomic<unsigned> cnt_{0}, gen_{0};
 };
 
-// --- pool persistente --------------------------------------------------------
 class Pool {
 public:
-    // T = TOTAL de hilos, contando al principal. Con T+1 (principal ocioso)
-    // el spin-barrier se estrangula: alguien gira mientras otro fue desalojado.
     explicit Pool(unsigned T) : T_(T ? T : 1), go_(T_), fin_(T_) {
         for (unsigned i = 1; i < T_; ++i)
             th_.emplace_back([this, i] {
@@ -119,7 +112,7 @@ public:
     void run(std::function<void(unsigned)> f) {
         job_ = std::move(f);
         go_.wait();
-        job_(0);              // el principal TAMBIEN trabaja
+        job_(0);
         fin_.wait();
     }
 private:
@@ -130,18 +123,17 @@ private:
     bool stop_ = false;
 };
 
-// --- anillo de KV (memfd doble mapeo) ----------------------------------------
+// --- anillo de KV ------------------------------------------------------------
 struct KvRing {
     std::uint8_t* base{nullptr};
     std::size_t cap_tok{0}, cap_bytes{0}, stride{0}, total{0};
-    int fd{-1};
 
-    void init(std::size_t tokens, std::size_t layers) {
+    void init(std::size_t tokens, std::size_t layers, std::size_t nkv, std::size_t dh) {
         cap_tok = tokens;
-        stride = kNKV * kDH * sizeof(float);       // bytes por token por cabeza-set
+        stride = nkv * dh * sizeof(float);
         cap_bytes = cap_tok * stride;
         total = layers * 2 * cap_bytes;
-        fd = ::memfd_create("caudal_kv", MFD_CLOEXEC);
+        const int fd = ::memfd_create("caudal_kv", MFD_CLOEXEC);
         if (fd < 0 || ::ftruncate(fd, static_cast<off_t>(total)) != 0) {
             std::perror("memfd"); std::exit(1);
         }
@@ -159,10 +151,12 @@ struct KvRing {
 #endif
     }
     float* k(std::size_t layer, std::size_t t) const {
-        return reinterpret_cast<float*>(base + layer * 2 * cap_bytes) + (t % cap_tok) * (stride / 4);
+        return reinterpret_cast<float*>(base + layer * 2 * cap_bytes)
+             + (t % cap_tok) * (stride / 4);
     }
     float* v(std::size_t layer, std::size_t t) const {
-        return reinterpret_cast<float*>(base + layer * 2 * cap_bytes + cap_bytes) + (t % cap_tok) * (stride / 4);
+        return reinterpret_cast<float*>(base + layer * 2 * cap_bytes + cap_bytes)
+             + (t % cap_tok) * (stride / 4);
     }
 };
 
@@ -176,14 +170,13 @@ struct Ctx {
     }
 };
 
-void rmsnorm(const float* x, const float* w, float* out, std::size_t n) {
+void rmsnorm(const float* x, const float* w, float* out, std::size_t n, float eps) {
     double ss = 0.0;
     for (std::size_t i = 0; i < n; ++i) ss += double(x[i]) * double(x[i]);
-    const float r = 1.0f / std::sqrt(float(ss / double(n)) + kEps);
+    const float r = 1.0f / std::sqrt(float(ss / double(n)) + eps);
     for (std::size_t i = 0; i < n; ++i) out[i] = x[i] * r * w[i];
 }
 
-// GEMV int4 multihilo. x se cuantiza UNA vez; los hilos solo hacen sus filas.
 void gemv_mt(Pool& pool, const Lin& L, const float* x, float* y) {
     std::vector<std::int8_t> xq(L.K), xqp(L.K);
     float amax = 0.0f;
@@ -193,13 +186,13 @@ void gemv_mt(Pool& pool, const Lin& L, const float* x, float* y) {
         const float q = std::clamp(std::round(x[i] / sx), -127.0f, 127.0f);
         xq[i] = static_cast<std::int8_t>(q);
     }
-    // La permutacion es por BLOQUE de 64 valores, NO por grupo de escala:
-    // con grupo 32 hay el doble de grupos y el bucle desbordaba el vector.
+    // La permutación es por BLOQUE de 64 valores, no por grupo de escala.
     for (std::size_t bb = 0; bb < L.K / 64; ++bb)
         for (std::size_t i = 0; i < 64; ++i)
             xqp[bb * 64 + i] = xq[bb * 64 + caudal::kPerm[i]];
 
-    caudal::Shape s0; s0.N = 0; s0.K = L.K; s0.group = L.K / L.G;
+    const std::size_t grp = L.K / L.G;
+    caudal::Shape s0; s0.N = 0; s0.K = L.K; s0.group = grp;
     std::vector<std::int32_t> xg(L.G);
     caudal::compute_x_gsum(s0, xq.data(), xg.data());
 
@@ -208,7 +201,6 @@ void gemv_mt(Pool& pool, const Lin& L, const float* x, float* y) {
         const std::size_t n0 = std::size_t(tid) * L.N / T;
         const std::size_t n1 = std::size_t(tid + 1) * L.N / T;
         if (n1 <= n0) return;
-        const std::size_t grp = L.K / L.G;          // 64 o 32
         caudal::Shape s; s.N = n1 - n0; s.K = L.K; s.group = grp;
         if (grp == 32)
             caudal::gemv_int4_g32(s, L.packed + n0 * L.row_bytes, L.scale + n0 * L.G,
@@ -223,15 +215,15 @@ void add_bias(float* y, const float* b, std::size_t n) {
     if (b) for (std::size_t i = 0; i < n; ++i) y[i] += b[i];
 }
 
-void rope_one(float* v, std::size_t pos) {
-    const std::size_t half = kDH / 2;
+void rope_one(float* v, std::size_t pos, const Cfg& c) {
+    const std::size_t half = c.DH / 2;
     for (std::size_t i = 0; i < half; ++i) {
-        const float freq = 1.0f / std::pow(kTheta, float(2 * i) / float(kDH));
+        const float freq = 1.0f / std::pow(c.theta, float(2 * i) / float(c.DH));
         const float ang = float(pos) * freq;
-        const float c = std::cos(ang), s = std::sin(ang);
+        const float co = std::cos(ang), si = std::sin(ang);
         const float a = v[i], b = v[i + half];
-        v[i] = a * c - b * s;
-        v[i + half] = b * c + a * s;
+        v[i] = a * co - b * si;
+        v[i + half] = b * co + a * si;
     }
 }
 
@@ -239,7 +231,7 @@ void rope_one(float* v, std::size_t pos) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::printf("uso: %s <artefacto> <id> [<id>...] --n <N>\n", argv[0]);
+        std::printf("uso: %s <artefacto> <id> [<id>...] --n <N> [--threads <T>]\n", argv[0]);
         return 1;
     }
     const std::string A = argv[1];
@@ -247,11 +239,31 @@ int main(int argc, char** argv) {
     int ngen = 16;
     unsigned reqT = 0;
     for (int i = 2; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--n") == 0 && i + 1 < argc) { ngen = std::atoi(argv[++i]); continue; }
-        if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) { reqT = std::atoi(argv[++i]); continue; }
+        if (!std::strcmp(argv[i], "--n") && i + 1 < argc) { ngen = std::atoi(argv[++i]); continue; }
+        if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) { reqT = std::atoi(argv[++i]); continue; }
         prompt.push_back(std::atoi(argv[i]));
     }
     if (prompt.empty()) { std::printf("falta el prompt\n"); return 1; }
+
+    // --- hiperparámetros -----------------------------------------------------
+    Cfg cfg;
+    {
+        std::ifstream fm(A + "/model.txt");
+        if (!fm) { std::printf("no abrio model.txt\n"); return 1; }
+        std::string k;
+        while (fm >> k) {
+            if (k == "H") fm >> cfg.H;
+            else if (k == "NLY") fm >> cfg.NLY;
+            else if (k == "NH") fm >> cfg.NH;
+            else if (k == "NKV") fm >> cfg.NKV;
+            else if (k == "DH") fm >> cfg.DH;
+            else if (k == "INTER") fm >> cfg.INTER;
+            else if (k == "V") fm >> cfg.V;
+            else if (k == "EPS") fm >> cfg.eps;
+            else if (k == "THETA") fm >> cfg.theta;
+        }
+        cfg.inv_sqrt_d = 1.0f / std::sqrt(float(cfg.DH));
+    }
 
     Ctx c;
     c.wbin = slurp(A + "/weights.bin");
@@ -266,10 +278,7 @@ int main(int argc, char** argv) {
             std::string name; std::size_t N, K, po, pb, so, sb;
             fi >> name >> N >> K >> po >> pb >> so >> sb;
             Lin L; L.N = N; L.K = K; L.row_bytes = K / 2;
-            // G = numero de grupos = scale_bytes / (2 B * N). NO asumir K/64:
-            // con grupo 32 son el doble de grupos y los indices de escala
-            // salen corridos (bug que produjo texto basura).
-            L.G = sb / (2 * N);
+            L.G = sb / (2 * N);                    // número de grupos, NO K/64
             L.packed = c.wbin.data() + po;
             L.scale = reinterpret_cast<const _Float16*>(c.sbin.data() + so);
             c.lin[name] = L;
@@ -284,108 +293,104 @@ int main(int argc, char** argv) {
 
     unsigned T = reqT ? reqT : std::max(1u, std::thread::hardware_concurrency());
     Pool pool(T);
-
     KvRing kv;
-    kv.init(kMaxTok, kNLY);
+    kv.init(kMaxTok, cfg.NLY, cfg.NKV, cfg.DH);
 
     std::printf("\ncaudal · generate_qwen\n");
     std::printf("artefacto : %s  (%zu lineales)\n", A.c_str(), c.lin.size());
+    std::printf("modelo    : H=%zu capas=%zu heads=%zu/%zu d=%zu inter=%zu vocab=%zu\n",
+                cfg.H, cfg.NLY, cfg.NH, cfg.NKV, cfg.DH, cfg.INTER, cfg.V);
     std::printf("hilos     : %u\n", T);
-    std::printf("KV ring   : %zu tokens x %zu capas = %.1f MB (memfd doble mapeo)\n",
-                kMaxTok, kNLY, double(kv.total) / (1024.0 * 1024.0));
+    std::printf("KV ring   : %zu tok x %zu capas = %.1f MB (memfd doble mapeo)\n",
+                kMaxTok, cfg.NLY, double(kv.total) / (1024.0 * 1024.0));
     std::printf("prompt    : %zu tokens\n\n", prompt.size());
 
-    std::vector<float> x(kH), h(kH), tmp(kH);
-    std::vector<float> q(kNH * kDH), kt(kNKV * kDH), vt(kNKV * kDH);
-    std::vector<float> att(kNH * kMaxTok), o(kH), gate(4864), up(4864);
+    std::vector<float> x(cfg.H), h(cfg.H), tmp(cfg.H);
+    std::vector<float> q(cfg.NH * cfg.DH), kt(cfg.NKV * cfg.DH), vt(cfg.NKV * cfg.DH);
+    std::vector<float> att(cfg.NH * kMaxTok), o(cfg.H), gate(cfg.INTER), up(cfg.INTER);
+    std::vector<float> logits(cfg.V);
 
     auto step = [&](int tok, std::size_t pos) {
         const std::uint16_t* e = reinterpret_cast<const std::uint16_t*>(c.embed.data());
-        for (std::size_t i = 0; i < kH; ++i) x[i] = bf16_to_f32(e[std::size_t(tok) * kH + i]);
+        for (std::size_t i = 0; i < cfg.H; ++i)
+            x[i] = bf16_to_f32(e[std::size_t(tok) * cfg.H + i]);
 
-        for (std::size_t L = 0; L < kNLY; ++L) {
+        for (std::size_t L = 0; L < cfg.NLY; ++L) {
             const std::string p = "model.layers." + std::to_string(L) + ".";
-            rmsnorm(x.data(), c.aux_of(p + "input_layernorm.weight"), h.data(), kH);
+            rmsnorm(x.data(), c.aux_of(p + "input_layernorm.weight"), h.data(), cfg.H, cfg.eps);
 
             gemv_mt(pool, c.lin.at(p + "self_attn.q_proj.weight"), h.data(), q.data());
             gemv_mt(pool, c.lin.at(p + "self_attn.k_proj.weight"), h.data(), kt.data());
             gemv_mt(pool, c.lin.at(p + "self_attn.v_proj.weight"), h.data(), vt.data());
-            add_bias(q.data(), c.aux_of(p + "self_attn.q_proj.bias"), kNH * kDH);
-            add_bias(kt.data(), c.aux_of(p + "self_attn.k_proj.bias"), kNKV * kDH);
-            add_bias(vt.data(), c.aux_of(p + "self_attn.v_proj.bias"), kNKV * kDH);
+            add_bias(q.data(), c.aux_of(p + "self_attn.q_proj.bias"), cfg.NH * cfg.DH);
+            add_bias(kt.data(), c.aux_of(p + "self_attn.k_proj.bias"), cfg.NKV * cfg.DH);
+            add_bias(vt.data(), c.aux_of(p + "self_attn.v_proj.bias"), cfg.NKV * cfg.DH);
 
-            for (std::size_t hh = 0; hh < kNH; ++hh) rope_one(q.data() + hh * kDH, pos);
-            for (std::size_t hh = 0; hh < kNKV; ++hh) rope_one(kt.data() + hh * kDH, pos);
+            for (std::size_t hh = 0; hh < cfg.NH; ++hh) rope_one(q.data() + hh * cfg.DH, pos, cfg);
+            for (std::size_t hh = 0; hh < cfg.NKV; ++hh) rope_one(kt.data() + hh * cfg.DH, pos, cfg);
 
-            std::memcpy(kv.k(L, pos), kt.data(), kNKV * kDH * sizeof(float));
-            std::memcpy(kv.v(L, pos), vt.data(), kNKV * kDH * sizeof(float));
+            std::memcpy(kv.k(L, pos), kt.data(), cfg.NKV * cfg.DH * sizeof(float));
+            std::memcpy(kv.v(L, pos), vt.data(), cfg.NKV * cfg.DH * sizeof(float));
 
-            const std::size_t rep = kNH / kNKV;
+            const std::size_t rep = cfg.NH / cfg.NKV;
             const std::size_t n = pos + 1;
-            for (std::size_t hh = 0; hh < kNH; ++hh) {
+            for (std::size_t hh = 0; hh < cfg.NH; ++hh) {
                 const std::size_t kvi = hh / rep;
-                const float* kb = kv.k(L, 0);   // el anillo: ventana [0,n) contigua
+                const float* kb = kv.k(L, 0);      // ventana [0,n) contigua
                 const float* vb = kv.v(L, 0);
                 double mx = -1e30;
                 for (std::size_t s = 0; s < n; ++s) {
-                    double d = 0.0;
-                    const float* ks = kb + s * (kNKV * kDH) + kvi * kDH;
-                    for (std::size_t i = 0; i < kDH; ++i)
-                        d += double(q[hh * kDH + i]) * double(ks[i]);
-                    d *= double(kInvSqrtD);
-                    att[hh * kMaxTok + s] = float(d);
-                    mx = std::max(mx, d);
+                    double dd = 0.0;
+                    const float* ks = kb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                    for (std::size_t i = 0; i < cfg.DH; ++i)
+                        dd += double(q[hh * cfg.DH + i]) * double(ks[i]);
+                    dd *= double(cfg.inv_sqrt_d);
+                    att[hh * kMaxTok + s] = float(dd);
+                    mx = std::max(mx, dd);
                 }
                 double sum = 0.0;
                 for (std::size_t s = 0; s < n; ++s) {
-                    const double e2 = std::exp(double(att[hh * kMaxTok + s]) - mx);
-                    att[hh * kMaxTok + s] = float(e2);
-                    sum += e2;
+                    const double ex = std::exp(double(att[hh * kMaxTok + s]) - mx);
+                    att[hh * kMaxTok + s] = float(ex);
+                    sum += ex;
                 }
-                for (std::size_t i = 0; i < kDH; ++i) {
+                for (std::size_t i = 0; i < cfg.DH; ++i) {
                     double acc = 0.0;
                     for (std::size_t s = 0; s < n; ++s)
                         acc += double(att[hh * kMaxTok + s]) / sum *
-                               double(vb[s * (kNKV * kDH) + kvi * kDH + i]);
-                    o[hh * kDH + i] = float(acc);
+                               double(vb[s * (cfg.NKV * cfg.DH) + kvi * cfg.DH + i]);
+                    o[hh * cfg.DH + i] = float(acc);
                 }
             }
 
             gemv_mt(pool, c.lin.at(p + "self_attn.o_proj.weight"), o.data(), tmp.data());
-            for (std::size_t i = 0; i < kH; ++i) x[i] += tmp[i];
+            for (std::size_t i = 0; i < cfg.H; ++i) x[i] += tmp[i];
 
-            rmsnorm(x.data(), c.aux_of(p + "post_attention_layernorm.weight"), h.data(), kH);
+            rmsnorm(x.data(), c.aux_of(p + "post_attention_layernorm.weight"), h.data(), cfg.H, cfg.eps);
             gemv_mt(pool, c.lin.at(p + "mlp.gate_proj.weight"), h.data(), gate.data());
             gemv_mt(pool, c.lin.at(p + "mlp.up_proj.weight"), h.data(), up.data());
-            for (std::size_t i = 0; i < 4864; ++i)
+            for (std::size_t i = 0; i < cfg.INTER; ++i)
                 gate[i] = (gate[i] / (1.0f + std::exp(-gate[i]))) * up[i];
             gemv_mt(pool, c.lin.at(p + "mlp.down_proj.weight"), gate.data(), tmp.data());
-            for (std::size_t i = 0; i < kH; ++i) x[i] += tmp[i];
+            for (std::size_t i = 0; i < cfg.H; ++i) x[i] += tmp[i];
         }
 
-        rmsnorm(x.data(), c.aux_of("model.norm.weight"), h.data(), kH);
-        std::vector<float> logits(c.V);
+        rmsnorm(x.data(), c.aux_of("model.norm.weight"), h.data(), cfg.H, cfg.eps);
         gemv_mt(pool, c.lin.at("model.embed_tokens.weight"), h.data(), logits.data());
         std::size_t best = 0;
-        for (std::size_t i = 1; i < c.V; ++i) if (logits[i] > logits[best]) best = i;
+        for (std::size_t i = 1; i < cfg.V; ++i) if (logits[i] > logits[best]) best = i;
         return int(best);
     };
 
-    // --- prefill -------------------------------------------------------------
     const double t0 = now_ms();
     for (std::size_t i = 0; i + 1 < prompt.size(); ++i) (void)step(prompt[i], i);
     const double t1 = now_ms();
-    int next = step(prompt.back(), prompt.size() - 1);
+    std::vector<int> out;
+    out.push_back(step(prompt.back(), prompt.size() - 1));
     const double t2 = now_ms();
 
-    std::vector<int> out;
-    out.push_back(next);
-
-    // --- decode --------------------------------------------------------------
     const double t3 = now_ms();
-    for (int i = 1; i < ngen; ++i) {
-        out.push_back(step(out.back(), prompt.size() + i - 1));
-    }
+    for (int i = 1; i < ngen; ++i) out.push_back(step(out.back(), prompt.size() + i - 1));
     const double t4 = now_ms();
 
     std::printf("prefill  : %.1f ms (%zu tokens)\n", t1 - t0, prompt.size() - 1);

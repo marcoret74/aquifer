@@ -278,6 +278,16 @@ def main():
             fe.write(st.f.read(b - a))
         lines.append(f'EMBED model.embed_tokens.weight {e["shape"][0]} {e["shape"][1]}')
 
+    # model.txt: hiperparametros en una linea, para que el C++ no parsee JSON
+    if cfg:
+        with open(os.path.join(args.out, 'model.txt'), 'w') as fm:
+            for k, v in [('H', cfg.get('hidden_size')), ('NLY', cfg.get('num_hidden_layers')),
+                         ('NH', cfg.get('num_attention_heads')), ('NKV', cfg.get('num_key_value_heads')),
+                         ('INTER', cfg.get('intermediate_size')), ('V', cfg.get('vocab_size')),
+                         ('EPS', cfg.get('rms_norm_eps')), ('THETA', cfg.get('rope_theta'))]:
+                fm.write(f'{k} {v}\n')
+            fm.write(f'DH {cfg["hidden_size"] // cfg["num_attention_heads"]}\n')
+
     with open(os.path.join(args.out, 'index.txt'), 'w') as fi:
         fi.write('\n'.join(lines) + '\n')
     print(f'index.txt         : {len(index)} lineales, {len(aux_names)} aux')
