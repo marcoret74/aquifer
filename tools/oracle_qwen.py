@@ -197,10 +197,11 @@ class Qwen:
         if t.dim() != 2:
             return t
         N, K = t.shape
-        if K % 64:
+        qg = getattr(self, 'qgroup', 64)
+        if K % qg:
             return t
-        G = K // 64
-        g = t.view(N, G, 64)
+        G = K // qg
+        g = t.view(N, G, qg)
         sw = (g.abs().amax(-1, keepdim=True) / 7.0).clamp_min(1e-8).half().float()
         codes = (g / sw).round().clamp(-8, 7)
         return (codes * sw).view(N, K)

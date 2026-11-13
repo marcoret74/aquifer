@@ -33,7 +33,7 @@ import sys
 
 import numpy as np
 
-GROUP = 64
+GROUP = 64   # se puede sobreescribir con --group
 PERM = (list(range(0, 16)) + list(range(32, 48))
         + list(range(16, 32)) + list(range(48, 64)))
 
@@ -85,9 +85,10 @@ class SafeTensors:
 # -----------------------------------------------------------------------------
 #  Cuantización int4 por grupo de 64 (vectorizada)
 # -----------------------------------------------------------------------------
-def quantize(w):
+def quantize(w, group=GROUP):
     """w: float32 [N, K] -> (packed uint8 [N, K/2], scales fp16 [N, G], err)"""
     N, K = w.shape
+    GROUP = group
     if K % GROUP:
         raise SystemExit(f'K={K} no es multiplo de {GROUP}')
     G = K // GROUP
@@ -143,7 +144,11 @@ def main():
     ap.add_argument('--layout-out', default=None)
     ap.add_argument('--layout-tokens', type=int, default=2,
                     help='cuantos x sinteticos para el set de 5 archivos')
+    ap.add_argument('--group', type=int, default=64, choices=[16, 32, 64],
+                    help='valores por escala (64 = 4.25 bits, 32 = 4.75 bits)')
     args = ap.parse_args()
+    global GROUP
+    GROUP = args.group
 
     st_path = os.path.join(args.model, 'model.safetensors')
     if not os.path.exists(st_path):
@@ -174,7 +179,8 @@ def main():
             todo.sort()
             print('  (lm_head atado -> se empaqueta embed_tokens como lineal)')
 
-    print(f'modelo : {args.model}')
+    total_bits = 4.0 + 16.0 / GROUP
+    print(f'modelo : {args.model}   (grupo {GROUP} -> {total_bits:.2f} bits/param)')
     print(f'tensores lineales: {len(todo)}')
     print(f'{"nombre":<44}{"N":>6}{"K":>6}{"bits":>7}{"err%":>9}')
     print('-' * 74)
@@ -186,7 +192,7 @@ def main():
 
     for name, (N, K) in todo:
         w = st.tensor_f32(name)
-        packed, scales, err = quantize(w)
+        packed, scales, err = quantize(w, GROUP)
         total_params += N * K
 
         o_w = align(off_w)
@@ -201,7 +207,7 @@ def main():
         }
         off_w = o_w + packed.size
         off_s = o_s + scales.size * 2
-        print(f'{name:<44}{N:>6}{K:>6}{4.25:>7.2f}{100*err:>9.3f}')
+        print(f'{name:<44}{N:>6}{K:>6}{total_bits:>7.2f}{100*err:>9.3f}')
 
     # --- Escritura -----------------------------------------------------------
     def write_blob(path, parts, total):
@@ -223,7 +229,7 @@ def main():
         'group': GROUP,
         'format': {'nibble': 'unsigned code+8', 'x': 'int8 signed, zero_point 0',
                    'perm': PERM},
-        'bits_per_param': 4.25,
+        'bits_per_param': round(total_bits, 3),
         'total_params': total_params,
         'weights_bytes': os.path.getsize(w_path),
         'scales_bytes': os.path.getsize(s_path),
@@ -329,7 +335,7 @@ def main():
             np.array(xsc, dtype=np.float32).tobytes())
         open(os.path.join(outd, 'ref.bin'), 'wb').write(ref.tobytes())
         json.dump({'N': N, 'K': K, 'M': len(xs), 'group': GROUP,
-                   'bits_per_param': 4.25,
+                   'bits_per_param': round(total_bits, 3),
                    'note': 'pesos REALES de Qwen2.5; ref en float64'},
                   open(os.path.join(outd, 'manifest.json'), 'w'), indent=1)
         print(f'  -> {outd}  (N={N} K={K} M={len(xs)})')

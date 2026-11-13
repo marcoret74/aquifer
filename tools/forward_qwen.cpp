@@ -114,9 +114,11 @@ void gemv_i4(const Lin& L, const float* x, float* y) {
     // El kernel espera x PRE-PERMUTADO por kPerm (el packer hace lo mismo con
     // el artefacto). La suma por grupo es invariante a la permutacion.
     std::vector<std::int8_t> xqp(L.K);
-    for (std::size_t g = 0; g < L.G; ++g)
+    // La permutacion es por BLOQUE de 64 valores, NO por grupo de escala:
+    // con grupo 32 hay el doble de grupos y el bucle desbordaba el vector.
+    for (std::size_t bb = 0; bb < L.K / 64; ++bb)
         for (std::size_t i = 0; i < 64; ++i)
-            xqp[g * 64 + i] = xq[g * 64 + caudal::kPerm[i]];
+            xqp[bb * 64 + i] = xq[bb * 64 + caudal::kPerm[i]];
 
     std::vector<std::int32_t> xg(L.G);
     caudal::compute_x_gsum(s, xq.data(), xg.data());
@@ -168,7 +170,8 @@ int main(int argc, char** argv) {
             std::size_t N, K, po, pb, so, sb;
             fi >> name >> N >> K >> po >> pb >> so >> sb;
             Lin L;
-            L.N = N; L.K = K; L.G = K / 64; L.row_bytes = K / 2;
+            L.N = N; L.K = K; L.row_bytes = K / 2;
+            L.G = sb / (2 * N);   // derivado, no K/64
             L.packed = c.wbin.data() + po;
             L.scale = reinterpret_cast<const _Float16*>(c.sbin.data() + so);
             c.lin[name] = L;

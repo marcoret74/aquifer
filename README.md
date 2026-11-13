@@ -392,6 +392,41 @@ matriz grande). Este workload llega a 26,6 GMAC/s porque: (a) 169 GEMV chicos
 en vez de uno grande, (b) throttling de potencia, (c) secciones seriales
 (RMSNorm, atención, SiLU). **El número honesto es 52-54 tok/s.**
 
+## Día 7 — grupo 32: medido, no opinado (2026-11-13)
+
+Dos muestras de texto no son una medición. Perplejidad con teacher forcing sobre
+88 tokens de prosa en español:
+
+| config | bits/param | ppl | Δ vs bf16 | tok/s |
+|---|---|---|---|---|
+| bf16 | 16 | 4,487 | — | — |
+| int4 **g64** | 4,25 | 5,908 | **+31,7 %** | 52,8 |
+| int4 **g32** | 4,50 | **5,073** | **+13,1 %** | 49,3 |
+| int4 g16 | 4,75 | 4,988 | +11,2 % | — |
+
+**g32 recupera el 59 % del daño de cuantización por un 6,6 % de throughput.**
+g16 añade solo 0,6 puntos de bits para ganar 1,9 puntos de ppl: no paga.
+
+Corrige lo que yo había dicho al ver el texto: con dos párrafos parecía que "la
+diferencia es capacidad del modelo, no cuantización". Falso — el 0.5B pierde 32 %
+de perplejidad a g64, y eso sí se arregla con el grupo.
+
+### Dos bugs que sólo aparecieron al cambiar el grupo
+
+1. **`L.G = K/64` estaba hardcodeado** en los cargadores. Con grupo 32 son el
+   doble de grupos, y todos los índices de escala salían corridos → texto basura.
+   Ahora se deriva de `scale_bytes / (2·N)`.
+2. **El bucle de permutación iteraba por grupo de escala** (28 × 64 = 2K) en vez
+   de por bloque de 64 valores → **corrupción de heap**. La permutación es del
+   layout, no de la cuantización; son ejes independientes.
+
+### El kernel g32 no cuesta un pliegue extra
+
+Con `kPerm`, los dos grupos caen limpios en las mitades del acumulador:
+lane 0-3 = grupo 0, lane 4-7 = grupo 1. Aplicar dos escalas distintas cuesta
+**un solo `set_m128`**, no un pliegue por grupo. Por eso g32 pierde solo el 6,6 %
+(que es puramente los bytes extra), no el doble.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

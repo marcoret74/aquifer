@@ -183,6 +183,70 @@ inline void gemv_int4(const Shape& s,
 }
 #endif
 
+// -----------------------------------------------------------------------------
+//  Variante para grupo = 32 (2 grupos por bloque de 64 valores).
+// -----------------------------------------------------------------------------
+//  La permutación kPerm deja los dos grupos separados en las mitades del
+//  acumulador:
+//      a = [v0..15 | v32..47]  ->  lanes 0-3 = grupo 0 (k0..15),  4-7 = grupo 1
+//      b = [v16..31| v48..63]  ->  lanes 0-3 = grupo 0 (k16..31), 4-7 = grupo 1
+//  Sumando a+b, cada mitad del registro es un grupo completo. Entonces una
+//  escala distinta por mitad cuesta UN solo vinsertf128 (set_m128), no un
+//  pliegue extra por grupo.
+#if defined(__AVX2__)
+inline void gemv_int4_g32(const Shape& s,
+                          const std::uint8_t* __restrict w,
+                          const _Float16* __restrict wscale,
+                          const std::int32_t* __restrict xgsum,
+                          const std::int8_t* __restrict xperm,
+                          float xscale,
+                          float* __restrict y) {
+    const __m256i m0f = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const std::size_t G = s.groups(), rb = s.row_bytes();
+    const std::size_t blocks = s.K / 64;   // bloques de 64 valores
+
+    for (std::size_t n = 0; n < s.N; ++n) {
+        const std::uint8_t* row = w + n * rb;
+        __m256 facc = _mm256_setzero_ps();
+
+        for (std::size_t bb = 0; bb < blocks; ++bb) {
+            const __m256i v = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(row + bb * 32));
+            const __m256i lo = _mm256_and_si256(v, m0f);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
+            const __m256i a = _mm256_unpacklo_epi8(lo, hi);
+            const __m256i b = _mm256_unpackhi_epi8(lo, hi);
+
+            const std::int8_t* xg = xperm + bb * 64;
+            const __m256i x0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xg));
+            const __m256i x1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xg + 32));
+
+            __m256i acc = _mm256_madd_epi16(_mm256_maddubs_epi16(a, x0), ones16);
+            acc = _mm256_add_epi32(
+                acc, _mm256_madd_epi16(_mm256_maddubs_epi16(b, x1), ones16));
+
+            const std::size_t g0 = 2 * bb, g1 = 2 * bb + 1;
+            acc = _mm256_sub_epi32(acc, _mm256_setr_epi32(
+                8 * xgsum[g0], 0, 0, 0, 8 * xgsum[g1], 0, 0, 0));
+
+            // Una escala por mitad del registro.
+            const __m256 sv = _mm256_set_m128(
+                _mm_set1_ps(static_cast<float>(wscale[n * G + g1]) * xscale),
+                _mm_set1_ps(static_cast<float>(wscale[n * G + g0]) * xscale));
+            facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv, facc);
+        }
+
+        __m128 lo128 = _mm256_castps256_ps128(facc);
+        __m128 hi128 = _mm256_extractf128_ps(facc, 1);
+        __m128 sum = _mm_add_ps(lo128, hi128);
+        sum = _mm_hadd_ps(sum, sum);
+        sum = _mm_hadd_ps(sum, sum);
+        y[n] = _mm_cvtss_f32(sum);
+    }
+}
+#endif
+
 }  // namespace caudal
 
 #endif  // CAUDAL_GEMV_INT4_HPP

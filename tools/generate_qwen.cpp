@@ -193,11 +193,13 @@ void gemv_mt(Pool& pool, const Lin& L, const float* x, float* y) {
         const float q = std::clamp(std::round(x[i] / sx), -127.0f, 127.0f);
         xq[i] = static_cast<std::int8_t>(q);
     }
-    for (std::size_t g = 0; g < L.G; ++g)
+    // La permutacion es por BLOQUE de 64 valores, NO por grupo de escala:
+    // con grupo 32 hay el doble de grupos y el bucle desbordaba el vector.
+    for (std::size_t bb = 0; bb < L.K / 64; ++bb)
         for (std::size_t i = 0; i < 64; ++i)
-            xqp[g * 64 + i] = xq[g * 64 + caudal::kPerm[i]];
+            xqp[bb * 64 + i] = xq[bb * 64 + caudal::kPerm[i]];
 
-    caudal::Shape s0; s0.N = 0; s0.K = L.K; s0.group = 64;
+    caudal::Shape s0; s0.N = 0; s0.K = L.K; s0.group = L.K / L.G;
     std::vector<std::int32_t> xg(L.G);
     caudal::compute_x_gsum(s0, xq.data(), xg.data());
 
@@ -206,9 +208,14 @@ void gemv_mt(Pool& pool, const Lin& L, const float* x, float* y) {
         const std::size_t n0 = std::size_t(tid) * L.N / T;
         const std::size_t n1 = std::size_t(tid + 1) * L.N / T;
         if (n1 <= n0) return;
-        caudal::Shape s; s.N = n1 - n0; s.K = L.K; s.group = 64;
-        caudal::gemv_int4(s, L.packed + n0 * L.row_bytes, L.scale + n0 * L.G,
-                          xg.data(), xqp.data(), sx, y + n0);
+        const std::size_t grp = L.K / L.G;          // 64 o 32
+        caudal::Shape s; s.N = n1 - n0; s.K = L.K; s.group = grp;
+        if (grp == 32)
+            caudal::gemv_int4_g32(s, L.packed + n0 * L.row_bytes, L.scale + n0 * L.G,
+                                  xg.data(), xqp.data(), sx, y + n0);
+        else
+            caudal::gemv_int4(s, L.packed + n0 * L.row_bytes, L.scale + n0 * L.G,
+                              xg.data(), xqp.data(), sx, y + n0);
     });
 }
 
@@ -258,7 +265,11 @@ int main(int argc, char** argv) {
         if (kind == "LINEAR") {
             std::string name; std::size_t N, K, po, pb, so, sb;
             fi >> name >> N >> K >> po >> pb >> so >> sb;
-            Lin L; L.N = N; L.K = K; L.G = K / 64; L.row_bytes = K / 2;
+            Lin L; L.N = N; L.K = K; L.row_bytes = K / 2;
+            // G = numero de grupos = scale_bytes / (2 B * N). NO asumir K/64:
+            // con grupo 32 son el doble de grupos y los indices de escala
+            // salen corridos (bug que produjo texto basura).
+            L.G = sb / (2 * N);
             L.packed = c.wbin.data() + po;
             L.scale = reinterpret_cast<const _Float16*>(c.sbin.data() + so);
             c.lin[name] = L;
