@@ -28,6 +28,43 @@ Mide ancho de banda de **lectura pura** sobre memoria anónima pre-faulteada, a
 1..N hilos, con y sin `MADV_HUGEPAGE`. Ese número (`BW_ef`) es el que gobierna
 todas las tablas de tok/s.
 
+## Medición · Día 0 (2026-11-13)
+
+i7-10510U · 8 hilos · L3 8 MiB · 10 GB RAM · `probe0_bw 512 3`
+
+| Configuración | Batería | **Enchufado** |
+|---|---|---|
+| DRAM (512 MiB, lectura pura) | 12.9 GB/s | **18.0 GB/s** |
+| L3 (8 MiB, 4 hilos) | — | 107 GB/s |
+
+Lectura del dato:
+
+- La DRAM **satura en ~18 GB/s con 2 hilos**; 8 hilos no mejora (15→18→17→12).
+  Plateau ⇒ es límite de memoria, no de tasa de emisión.
+- La L3 **sí** escala (18 → 58 → 107 GB/s a 1/2/4 hilos) ⇒ el barrido mide bien y
+  el muro es la DRAM. Ratio DRAM/L3 = **5.9×**.
+- 18.0 GB/s = **84 % de DDR4-2666 de un solo canal** (21.3 GB/s teóricos).
+  Hipótesis: un solo DIMM. Confirmar con `sudo dmidecode -t 17`.
+  Si es así, un segundo SODIMM duplica el ancho de banda y vale más que
+  cualquier optimización de kernel.
+- THP: `anon = [madvise]` (opera, pero sólo 37 % por fragmentación:
+  `Committed_AS` 22.8 GB sobre 11.4 GB); **`shmem = [never]`** ⇒ el plan de A1
+  (`memfd` + THP) es **no-op** sin root; pool `hugetlbfs` = 0.
+  ⇒ El backing de A1 debe ser seleccionable en runtime, no fijo.
+
+### Derivados (η = 0.8 sobre BW_ef)
+
+| Modelo | int4 | tok/s hoy | tok/s con 2º DIMM (~36 GB/s) |
+|---|---|---|---|
+| Qwen2.5-0.5B | 0.30 GB | 48 | 96 |
+| Qwen2.5-1.5B | 0.88 GB | 16 | 33 |
+| Qwen2.5-3B | 1.74 GB | 8.3 | 17 |
+| Qwen2.5-7B | 4.28 GB | 3.4 | 6.8 |
+| Qwen2.5-14B | 8.27 GB | 1.7 | 3.5 |
+
+`M*(int4) = 55` ⇒ en este equipo el ridge es **inalcanzable**: no existe lote
+que lo haga compute-bound. La única palanca es leer menos bytes.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

@@ -40,6 +40,7 @@
 #include <atomic>
 #include <barrier>
 #include <cerrno>
+#include <dirent.h>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -144,6 +145,39 @@ unsigned cpu_max_mhz() {
     return ok ? khz / 1000 : 0;
 }
 
+// Estado de energía real: AC online/offline + estado de la batería.
+// Sin esto, un BW bajo es indecidible entre "DRAM lenta" y "CPU racionada".
+std::string power_state() {
+    std::string ac = "AC:?", bat = "BAT:?";
+    DIR* d = opendir("/sys/class/power_supply");
+    if (!d) return "(n/d)";
+    while (dirent* e = readdir(d)) {
+        if (e->d_name[0] == '.') continue;
+        char path[320];
+
+        std::snprintf(path, sizeof path, "/sys/class/power_supply/%s/online", e->d_name);
+        if (std::FILE* f = std::fopen(path, "r")) {
+            unsigned v = 0;
+            if (std::fscanf(f, "%u", &v) == 1)
+                ac = std::string(e->d_name) + (v ? ":online" : ":offline");
+            std::fclose(f);
+        }
+
+        std::snprintf(path, sizeof path, "/sys/class/power_supply/%s/status", e->d_name);
+        if (std::FILE* f = std::fopen(path, "r")) {
+            char buf[64] = {0};
+            if (std::fgets(buf, sizeof buf, f)) {
+                std::string s(buf);
+                while (!s.empty() && s.back() == '\n') s.pop_back();
+                bat = std::string(e->d_name) + ":" + s;
+            }
+            std::fclose(f);
+        }
+    }
+    closedir(d);
+    return ac + "  " + bat;
+}
+
 // Barrido de lectura puro. 8 acumuladores independientes para que el compilador
 // vectorice sin crear una cadena de dependencia serial por la suma.
 [[gnu::noinline]] std::uint64_t scan_readonly(const std::byte* p, std::size_t n) {
@@ -217,7 +251,8 @@ int main(int argc, char** argv) {
                 read_line("/sys/kernel/mm/transparent_hugepage/shmem_enabled").c_str());
     std::printf("governor          : %s\n",
                 read_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").c_str());
-    std::printf("freq max posible  : %u MHz\n\n", cpu_max_mhz());
+    std::printf("freq max posible  : %u MHz\n", cpu_max_mhz());
+    std::printf("energía           : %s\n\n", power_state().c_str());
 
     // Reserva. MAP_NORESERVE para no comprometer swap por 1 TiB de virtual.
     void* raw = mmap(nullptr, n, PROT_READ | PROT_WRITE,
@@ -333,13 +368,16 @@ int main(int argc, char** argv) {
     if (fmax && peak_mhz && static_cast<unsigned long>(peak_mhz) * 100ul <
                                 static_cast<unsigned long>(fmax) * 60ul) {
         std::printf("\n");
-        std::printf("  ⚠  MEDICIÓN LIMITADA POR FRECUENCIA\n");
+        std::printf("  ⚠  FRECUENCIA BAJO EL PICO\n");
         std::printf("     pico observado %u MHz vs %u MHz posibles (%.0f%%)  —  governor: %s\n",
                     peak_mhz, fmax,
                     100.0 * static_cast<double>(peak_mhz) / static_cast<double>(fmax),
                     read_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").c_str());
-        std::printf("     Este BW_ef es de ESTA sesión, no del hardware. En un\n");
-        std::printf("     portátil 15W con batería descargando es lo esperado.\n");
+        std::printf("     energía: %s\n", power_state().c_str());
+        std::printf("     Si el equipo está con batería, en perfil de bajo consumo o\n");
+        std::printf("     es un U-series de 15 W, este BW_ef es un PISO, no el techo.\n");
+        std::printf("     Un workload memory-bound además NO pide turbo: parte de la\n");
+        std::printf("     caída es esperada y no invalida la medición.\n");
     }
 
     // Derivados del diseño. M* = ridge · bits/16; con int4, M* = ridge/4.
