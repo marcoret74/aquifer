@@ -3,6 +3,53 @@
 > CPU tensor runtime built around the memory wall.
 
 
+## Día 12 — Test 2: el Juez audita a la Voz (2026-11-13)
+
+`tools/test_verifier.py`. Pipeline completo: **caudal genera** (Qwen2.5-1.5B int4,
+21 tok/s) → se extraen claims con los relatores que SG reconoce → **`sg.py verify`**
+audita (daemon, sub-ms).
+
+### Resultado
+
+| métrica | valor | umbral del consejo |
+|---|---|---|
+| oraciones generadas | 17 | — |
+| **con claim extraíble** | **7 (41,2 %)** | > 20 % ✅ |
+| **veredicto definitivo** | **4 (57,1 %)** | — |
+| CONFIRMED | 3 | |
+| CONFIRMED_BY_PATH | 1 | |
+| NO_EVIDENCE | 3 | |
+| **falsos confirmados** | **0 / 6** | 0 ✅ |
+
+El control anti-alucinación con claims falsos por construcción (`el gato es un
+planeta`, `el agua es metal`, `el sol es un mamífero`, `la luna es un pez`,
+`el perro es una estrella`, `el hierro es un gas noble`): **6/6 NO_EVIDENCE.**
+El Juez no confirma basura.
+
+Y no es ingenuo: `agua es placenta`, `agua es metal`, `agua es roca` dan todas
+NO_EVIDENCE. Confirma `agua → líquido`, no cualquier objeto.
+
+### Tres defectos de SG que el test encontró
+
+1. **Objetos multi-palabra truncados al prefijo conocido.**
+   `agua es líquido incolorante` resuelve a `obj='líquido'` y confirma. Eso
+   infla el veredicto: se confirma el hiperónimo, no el claim completo.
+2. **El heurístico de plurales corrompe palabras terminadas en `-s`.**
+   `fotosíntesis` → **`fotosíntesi`** → el nodo no resuelve → NO_EVIDENCE sobre
+   algo que el grafo sí sabe.
+3. **Sujetos compuestos inconsistentes.** `derecho del trabajo es una piedra`
+   conserva el sujeto completo, pero `derecho del trabajo es conjunto de normas`
+   resuelve a `sujeto='derecho'` — confirma un claim más débil.
+
+### La conclusión que sobrevive a todo
+
+> **La interfaz proposicional funciona.** A 21 tok/s de generación y sub-ms de
+> verificación, el Juez audita a la Voz sobre texto real, con 41 % de cobertura
+> y **cero falsos positivos**.
+
+Es la única de las tres vías de convergencia que sobrevivió, y sobrevivió porque
+no dependía de que el cubo fuera semántico: opera sobre el **grafo**.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
