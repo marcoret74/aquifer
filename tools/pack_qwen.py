@@ -95,9 +95,12 @@ def quantize(w, group=GROUP):
 
     g = w.reshape(N, G, GROUP)
     amax = np.abs(g).max(axis=2)
-    sw = (amax / 7.0).astype(np.float32)
-    sw[sw < 1e-8] = 1e-8                      # nunca dividir por cero
-    sw16 = sw.astype(np.float16)
+    # OJO: clampear en fp32 antes del cast NO alcanza. fp16 no representa 1e-8
+    # (subnormal mínimo ~6e-8): 1e-8 -> 0 -> división por cero -> nan.
+    # Hay grupos con amax==0 (canales muertos), así que el clamp va en dominio
+    # fp16 y en el mínimo NORMAL, que sobrevive seguro.
+    MIN_F16 = np.float16(6.103515625e-05)      # 2^-14, menor normal de fp16
+    sw16 = np.maximum((amax / 7.0).astype(np.float16), MIN_F16)
     sw_back = sw16.astype(np.float32)          # el valor REAL que leerá el kernel
 
     codes = np.rint(g / sw_back[:, :, None])

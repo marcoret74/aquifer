@@ -181,7 +181,11 @@ class Qwen:
         self._wc = {}
 
     def w(self, name):
-        # caché en bf16 (1 GB), se castea por uso: evita releer 1 GB por token
+        # lowmem=True (default): SIN cache. En un forward completo cada peso se
+        # lee una sola vez, asi que cachear 3 GB no ahorra I/O y desborda la RAM
+        # de 11 GB. El cache solo sirve para GENERACION token a token.
+        if getattr(self, 'lowmem', True):
+            return self.st.get('model.' + name).float()
         if name not in self._wc:
             self._wc[name] = self.st.get('model.' + name)
         return self._wc[name].float()
@@ -202,7 +206,10 @@ class Qwen:
             return t
         G = K // qg
         g = t.view(N, G, qg)
-        sw = (g.abs().amax(-1, keepdim=True) / 7.0).clamp_min(1e-8).half().float()
+        # Clamp en dominio fp16: 1e-8 NO es representable (min subnormal ~6e-8),
+        # y los grupos con amax==0 daban sw=0 -> division por cero -> nan.
+        sw = (g.abs().amax(-1, keepdim=True) / 7.0).half()
+        sw = torch.clamp(sw, min=torch.finfo(torch.float16).tiny).float()
         codes = (g / sw).round().clamp(-8, 7)
         return (codes * sw).view(N, K)
 

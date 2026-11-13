@@ -427,6 +427,52 @@ lane 0-3 = grupo 0, lane 4-7 = grupo 1. Aplicar dos escalas distintas cuesta
 **un solo `set_m128`**, no un pliegue por grupo. Por eso g32 pierde solo el 6,6 %
 (que es puramente los bytes extra), no el doble.
 
+## Día 8 — Qwen2.5-1.5B en silicio (2026-11-13)
+
+| | 0.5B | **1.5B** |
+|---|---|---|
+| params | 494 M | **1.544 G** |
+| artefacto g32 | 278 MB | **868 MB** (771,8 + 96,5) |
+| bits/param | 4,50 | 4,50 |
+| err. cuantización | 10,18 % | 10,18 % medio · 12,81 % máx |
+| **ppl bf16** | 4,487 | **3,335** |
+| ppl g64 | +31,7 % | **+25,0 %** |
+| ppl g32 | +13,1 % | **+22,7 %** |
+| tok/s (4 hilos) | 54,3 | **17,5** |
+| prefill 13 tok | 222 ms | 675 ms |
+| 1er token | 17 ms | 54 ms |
+
+```
+"Soy un asistente de inteligencia artificial creado por Anthropic para ser
+útil, confiable y inofensivo. Estoy diseñado para ayudarte con información
+general, responder preguntas y realizar tareas simples, pero no tengo una
+identidad personal real. Estoy aquí para ayud..."
+```
+
+### Tres correcciones que debo hacer
+
+**1. "Un modelo más grande toleraría peor la compresión" — falso.** La 1.5B
+tolerancia es *mejor*: +25,0 % vs +31,7 % a g64. Los modelos grandes son más
+robustos a la cuantización, como dice la literatura.
+
+**2. g32 rinde mucho menos en la 1.5B.** De 31,7→13,1 en la 0.5B, pero de
+25,0→22,7 en la 1.5B. Para la 1.5B, **g64 puede ser mejor trato**: 1,9 puntos de
+ppl por 6 % de throughput. El óptimo depende del tamaño del modelo.
+
+**3. Se desbordó la memoria.** `ppl_qwen` cacheaba los 1,5B en bf16 (3 GB) más
+las copias float32. En un forward completo cada peso se lee **una sola vez**, así
+que el caché no ahorraba I/O y costaba 3 GB. Desactivado: pico ahora 3,1 GB.
+
+### Dos bugs de la descarga/empaquetado
+
+- **El archivo llegó con 41,7 % de ceros.** El descargador paralelo hizo
+  `truncate` al tamaño final y se cortó por timeout: el tamaño mentía. Detectado
+  escaneando chunks; se rebajaron 1,297 GB por rangos a 10,9 MB/s.
+- **fp16 no representa 1e-8.** `sw[sw<1e-8]=1e-8` (clamp en fp32) se convierte
+  en `0` al castear a fp16 → división por cero → `ppl = nan`. Hay 3135 grupos con
+  `amax=0` (canales muertos en `down_proj`). El clamp va en dominio fp16 y en el
+  mínimo normal (`2^-14`).
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
