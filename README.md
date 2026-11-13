@@ -473,6 +473,56 @@ que el caché no ahorraba I/O y costaba 3 GB. Desactivado: pico ahora 3,1 GB.
   `amax=0` (canales muertos en `down_proj`). El clamp va en dominio fp16 y en el
   mínimo normal (`2^-14`).
 
+## Día 9 — stencil 3D: la hipótesis se confirma en líneas y se refuta en tiempo (2026-11-13)
+
+`bench/stencil_3d.cpp` · volumen 256³ (16,8 MB, 1 B/voxel) · stencil 3×3×3 ·
+tres layouts, verificados equivalentes (mismo campo, mismo resultado).
+
+| layout | líneas/stencil | B útiles | ns/voxel | vs ROW |
+|---|---|---|---|---|
+| **ROW** | 9,21 | 4,6 % | **5,98** | **1,00×** |
+| MORTON | 3,36 | 12,6 % | 10,12 | 0,59× |
+| BRICK 16³ | 3,36 | 12,6 % | 21,37 | 0,28× |
+| ROW + tabla offsets | — | — | 10,99 | — |
+| MORTON + tabla offsets | — | — | 12,90 | — |
+
+### Lo que se confirmó
+
+**El conteo de líneas es exacto.** Predije 1,5³ = 3,375 y salió 3,36. Y
+9,21 → 3,36 es un factor **2,74×** menos tráfico exigido. La geometría de
+Morton hace lo que dice.
+
+### Lo que se refutó
+
+**El layout con 2,74× menos líneas es 2,2× MÁS LENTO en reloj de pared.**
+
+La razón es que *"líneas por stencil" mide el requisito instantáneo, no la tasa
+de fallos en régimen*. Barriendo el volumen, el acceso de row-major es un
+stream con stride que **el prefetcher de hardware predice perfectamente**; los
+3,36 de Morton son dispersos y lo derrotan. El prefetcher vale más que las
+líneas.
+
+### Lo que se refutó de mi propia propuesta
+
+**Bricking 16³ es el peor de los tres (21,37 ns, 3,6× más lento).** Resuelve el
+problema de MMU (ladrillo = página de 4 KiB) y crea un problema de cómputo:
+añade un nivel de indirección sobre Morton. Era mi sugerencia; medida, no paga.
+
+### Dónde sí paga (y no es acá)
+
+Esta medición y `bench_fase0` no se contradicen: miden **patrones distintos**.
+
+| patrón | gana | evidencia |
+|---|---|---|
+| barrido secuencial (stencil) | **row-major** | 5,98 vs 10,12 ns/voxel |
+| consulta espacial aleatoria (k-NN) | **Morton** | −28,7 % líneas |
+
+En una consulta aleatoria no hay prefetcher que ayude, y ahí el orden espacial
+cobra. En un barrido, el prefetcher ya hace el trabajo.
+
+**Conclusión: no construyas un sustrato de memoria espacial para barridos. Si lo
+construyes, es para pointer-chasing, no para stencils.**
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
