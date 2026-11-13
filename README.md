@@ -508,7 +508,51 @@ líneas.
 problema de MMU (ladrillo = página de 4 KiB) y crea un problema de cómputo:
 añade un nivel de indirección sobre Morton. Era mi sugerencia; medida, no paga.
 
-### Dónde sí paga (y no es acá)
+### Corrección del diagnóstico (el consejo tenía razón)
+
+Yo dije que el prefetcher explicaba la derrota de Morton. **Falso.** Claude hizo
+la cuenta que yo no hice:
+
+```
+3 planos de 256² = 197 KB  ->  caben en L2 (256 KB por núcleo)
+DRAM por pasada  = 33,6 MB -> 1,6 ms a 21 GB/s
+medido ROW       = 98 ms   ->  DRAM es el 1,6 % del tiempo
+```
+
+**El stencil no es un problema de memoria: es un problema de instrucciones.**
+Y la prueba definitiva: reescribí row-major sin aritmética de dirección
+(9 punteros de fila) y bajó a **0,53 ns — 11,5× más rápido**, verificado
+correcto contra el genérico. El binario tiene 78 instrucciones vectoriales:
+**el compilador vectorizó, y ése es todo el 11,5×.**
+
+Los layouts basados en mapa (Morton, brick, tiled) **no se pueden vectorizar**:
+el índice es opaco. Así que todas las mediciones anteriores medían generación
+de direcciones, no el sistema de memoria.
+
+### Resultado completo (256³, 1 B/voxel)
+
+| layout | líneas/stencil | ns/voxel | vs ROW |
+|---|---|---|---|
+| ROW (mapa genérico) | 9,21 | 6,11 | 1,00× |
+| MORTON | 3,36 | 10,94 | 0,56× |
+| BRICK 16³ | 3,36 | 22,02 | 0,28× |
+| TILED 16³ row-major | 5,02 | 15,67 | 0,39× |
+| **ROW sin aritmética (ROWPTR)** | — | **0,53** | **11,51×** |
+
+**TILED era la predicción falsable de kimi (esperaba ≤6,5 ns). Dio 15,67. Falló.**
+Y confirma lo que dijo qwen: *no existe un layout con 3,36 líneas Y velocidad de
+row-major en un barrido denso.*
+
+### La lección de método
+
+> **No podés preguntar por el layout hasta que el kernel esté vectorizado.**
+> A 0,53 ns/voxel no hay presión de memoria que aliviar: el orden de los datos
+> es irrelevante porque el cuello está en otro lado.
+
+Tres hipótesis mías murieron en este día: el prefetcher como causa, el bricking
+como solución, y el tiled como variante ganadora.
+
+
 
 Esta medición y `bench_fase0` no se contradicen: miden **patrones distintos**.
 

@@ -190,6 +190,55 @@ double stencil_ns_opt(std::vector<std::uint8_t>& vol, std::vector<std::uint8_t>&
     return (t1 - t0) / (double(reps) * double(n) * double(n) * double(n));
 }
 
+
+// --- TILED: ladrillo 16^3 con ROW-MAJOR dentro (no Morton) -------------------
+// Conserva streams lineales cortos (16 B por fila) y agrupa el vecindario.
+struct TiledMap {
+    int nt;
+    explicit TiledMap(int N) : nt((N + 15) / 16) {}
+    inline std::size_t operator()(int x, int y, int z) const {
+        const std::size_t t = (std::size_t(z >> 4) * nt + (y >> 4)) * nt + (x >> 4);
+        const std::size_t inb = std::size_t((z & 15) * 16 + (y & 15)) * 16 + (x & 15);
+        return t * 4096 + inb;
+    }
+};
+
+// --- ROWPTR: row-major sin aritmetica de direccion ---------------------------
+// 9 punteros de fila calculados una vez por (z,y); los 27 accesos son indices
+// sobre puntero. Mide cuanto cuesta el mapa, no el layout.
+inline double stencil_ptr(const std::vector<std::uint8_t>& vol,
+                          std::vector<std::uint8_t>& out, int N, int reps) {
+    const int n = N - 2;
+    const double t0 = now_ns();
+    for (int r = 0; r < reps; ++r) {
+        for (int z = 1; z < N - 1; ++z) {
+            const std::uint8_t* pm = &vol[std::size_t(z - 1) * N * N];
+            const std::uint8_t* pc = &vol[std::size_t(z) * N * N];
+            const std::uint8_t* pp = &vol[std::size_t(z + 1) * N * N];
+            std::uint8_t* oz = &out[std::size_t(z) * N * N];
+            for (int y = 1; y < N - 1; ++y) {
+                const std::uint8_t* a0 = pm + std::size_t(y - 1) * N;
+                const std::uint8_t* b0 = pc + std::size_t(y - 1) * N;
+                const std::uint8_t* c0 = pp + std::size_t(y - 1) * N;
+                std::uint8_t* o = oz + std::size_t(y) * N;
+                for (int x = 1; x < N - 1; ++x) {
+                    const unsigned s =
+                        a0[x-1]+a0[x]+a0[x+1] + a0[x-1+N]+a0[x+N]+a0[x+1+N]
+                      + a0[x-1+2*N]+a0[x+2*N]+a0[x+1+2*N]
+                      + b0[x-1]+b0[x]+b0[x+1] + b0[x-1+N]+b0[x+N]+b0[x+1+N]
+                      + b0[x-1+2*N]+b0[x+2*N]+b0[x+1+2*N]
+                      + c0[x-1]+c0[x]+c0[x+1] + c0[x-1+N]+c0[x+N]+c0[x+1+N]
+                      + c0[x-1+2*N]+c0[x+2*N]+c0[x+1+2*N];
+                    o[x] = std::uint8_t(s);
+                }
+            }
+        }
+        g_sink ^= out[std::size_t(r) % out.size()];
+    }
+    const double t1 = now_ns();
+    return (t1 - t0) / (double(reps) * double(n) * double(n) * double(n));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -206,10 +255,11 @@ int main(int argc, char** argv) {
     const RowMap    row{N};
     const MortonMap mort;
     const BrickMap  brick;
+    const TiledMap  tiled{N};
 
     // Tres volumenes, el MISMO campo logico escrito con cada mapa.
-    std::vector<std::uint8_t> v_row(total), v_mor(total), v_bri(total);
-    std::vector<std::uint8_t> o_row(total), o_mor(total), o_bri(total);
+    std::vector<std::uint8_t> v_row(total), v_mor(total), v_bri(total), v_til(total);
+    std::vector<std::uint8_t> o_row(total), o_mor(total), o_bri(total), o_til(total);
     for (int z = 0; z < N; ++z)
         for (int y = 0; y < N; ++y)
             for (int x = 0; x < N; ++x) {
@@ -217,6 +267,7 @@ int main(int argc, char** argv) {
                 v_row[row(x, y, z)] = f;
                 v_mor[mort(x, y, z)] = f;
                 v_bri[brick(x, y, z)] = f;
+                v_til[tiled(x, y, z)] = f;
             }
 
     // --- verificación 1: los mapas son biyecciones consistentes -------------
@@ -238,6 +289,7 @@ int main(int argc, char** argv) {
     const double l_row = lines_per_stencil(row, N, samples);
     const double l_mor = lines_per_stencil(mort, N, samples);
     const double l_bri = lines_per_stencil(brick, N, samples);
+    const double l_til = lines_per_stencil(tiled, N, samples);
 
     // --- verificación 2: mismo resultado en coordenadas logicas -------------
     auto run_into = [&](auto map, std::vector<std::uint8_t>& vol,
@@ -272,6 +324,21 @@ int main(int argc, char** argv) {
     const double t_row = stencil_ns(v_row, o_row, row, N, reps);
     const double t_mor = stencil_ns(v_mor, o_mor, mort, N, reps);
     const double t_bri = stencil_ns(v_bri, o_bri, brick, N, reps);
+    const double t_til = stencil_ns(v_til, o_til, tiled, N, reps);
+    const double t_ptr = stencil_ptr(v_row, o_row, N, reps);
+    // ROWPTR es 12x mas rapido; hay que probar que el compilador vectorizo SIN
+    // romper el resultado. Se compara contra el ROW generico en el interior.
+    {
+        std::vector<std::uint8_t> chk(total);
+        stencil_ptr(v_row, chk, N, 1);
+        bool okp = true;
+        for (int z = 1; z < N - 1 && okp; z += 7)
+            for (int y = 1; y < N - 1 && okp; y += 7)
+                for (int x = 1; x < N - 1 && okp; x += 7)
+                    if (chk[row(x, y, z)] != o_row[row(x, y, z)]) okp = false;
+        std::printf("ROWPTR correcto : %s\n", okp ? "OK" : "FALLA");
+        if (!okp) return 1;
+    }
 
     std::vector<std::int32_t> d_row, d_mor;
     build_delta(row, d_row);
@@ -289,6 +356,9 @@ int main(int argc, char** argv) {
     line("ROW", l_row, t_row);
     line("MORTON", l_mor, t_mor);
     line("BRICK", l_bri, t_bri);
+    line("TILED", l_til, t_til);
+    std::printf("%-8s %10s %9s %10.2f %11.2fx\n",
+                "ROWPTR", "-", "-", t_ptr, t_row / t_ptr);
 
     std::printf("\n");
     std::printf("%-14s %10s %12s\n", "OPTIMIZADO", "ns/voxel", "vs row-opt");
