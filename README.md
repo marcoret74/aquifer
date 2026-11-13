@@ -156,6 +156,93 @@ MoE. Anotado, no corrido.
 Y la calidad: la traza de "7 × 8" se va por las ramas. El motor está firme; la
 prosa de un 1,5 B en int4, todavía no.
 
+## Día 15 — SmolLM2 destapó un bug de cuantización que Qwen tapaba (2026-11-13)
+
+Premisa de partida: *"SmolLM2 es otra arquitectura (MHA, `NKV == NH`), entra sin
+tocar código"*. **Falso.** Entró, corrió, y escupió basura.
+
+### Síntoma
+
+Primer token `7359` (`' controvers'`) **repetido 48 veces**, e idéntico para
+prompts distintos (ids `1`, `100`, `1000`, `15319`, `40000`). Es decir: la
+salida no dependía de la entrada.
+
+### La bisección (antes de tocar una línea de kernel)
+
+Tres instrumentos nuevos:
+
+| herramienta | para qué |
+|---|---|
+| `--dump` en `generate_qwen` | normas de `h_in, q, k, v, o_attn, o_proj, gate, up, mlp_out` y `|x|` por capa |
+| `tools/probe_logits.py` | oráculo fp32 + `--quant` (int4 al vuelo) + `--xq` (int8 en x) + `--norms` |
+| `tools/probe_layer0.py` | recomputa la capa 0 en numpy **leyendo el artefacto empacado** |
+| `tools/check_pack.py` | dequantiza el artefacto y lo compara con el safetensors |
+
+Con la capa 0 sola:
+
+| cantidad | C++ (antes) | numpy sobre el artefacto | |
+|---|---|---|---|
+| `h_in` | 11,08525 | 11,08525 | idéntico |
+| `mlp_out` | **51,30** | **79,62** | **−36 %** |
+
+`h_in` exacto descarta embedding, `rmsnorm` y los pesos de norma. La pérdida
+aparecía en cada GEMV y **acumulaba** con la profundidad: 24 capas después, el
+modelo elegía un token fijo.
+
+### La causa: una escala por token
+
+`caudal` cuantizaba las activaciones a int8 con **una sola escala por token**
+(`amax/127`). Replicando esa aritmética en el oráculo sale **exactamente** el
+token del C++, con las mismas tres opciones en el mismo orden:
+
+| numerica | primer token | p |
+|---|---|---|
+| fp32 (referencia) | `La` | 0,783 |
+| int4 g32, x sin tocar | `La` | 0,679 |
+| + int8 en x, **1 escala por token** | `controvers` | 0,544 |
+| + int8 en x, 1 escala por grupo de 32 | `La` | 0,687 |
+| + int8 en x, 1 escala por grupo de 64 | `La` | 0,668 |
+
+Un *outlier* en `x` fija la escala de toda la fila y aplasta el resto. SmolLM2
+tiene outliers de activación mucho más agresivos que Qwen2.5, y por eso el
+esquema llevaba semanas tapado: **el modelo benévolo hacía de testigo mudo.**
+
+### El fix
+
+`xscale` pasa de un escalar por token a `const float*` con **una escala por
+grupo** (`M*G`), en `gemv_ref`, `gemv_int4`, `gemv_int4_g32` y
+`gemv_int4_g32_M<M>`. La referencia escalar ya multiplicaba por grupo
+(`sc[g] * xscale`), así que el kernel solo cambia de dónde lee.
+
+De paso se cerró un agujero: la permutación `kPerm` se aplica en bloques de 64 y
+el resto (`K % 64`) **quedaba sin escribir**.
+
+Verificación en la capa 0: `mlp_out` 51,30 → **80,30** (numpy: 79,62), y
+SmolLM2 responde `La capital de Francia es Paris.`
+
+### Coste: cero medible
+
+Mejor de 3 corridas, 1 secuencia, 4 hilos:
+
+| modelo | antes | después |
+|---|---|---|
+| Qwen2.5-1.5B | 23,4 | **23,7** |
+| R1-Distill-1.5B | 23,3 | **23,1** |
+
+### Números de SmolLM2-1.7B
+
+1 secuencia **19,1–19,8 tok/s**; 4 secuencias **19,9 tok/s agregados**
+(5,0 por secuencia). Amortiza mucho peor que Qwen (×1,8): con `NKV == NH = 32`
+el anillo de KV mueve 8× más bytes por token y posición.
+
+### Lo que enseña
+
+- **Un modelo que anda no valida el esquema de cuantización**; solo lo oculta.
+- El motor era **numéricamente fiel a su especificación**. La especificación
+  estaba mal, y eso solo se ve cuando el modelo tiene outliers.
+- La regla de siempre: bisecar con números intermedios, no leer código a ojo.
+  El `h_in` idéntico fue lo que puso la lupa dentro de la capa.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

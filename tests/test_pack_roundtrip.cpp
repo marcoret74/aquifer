@@ -96,9 +96,13 @@ int main(int argc, char** argv) {
         const std::int8_t* xm = xp + m * s.K;
         caudal::compute_x_gsum(s, xm, xgsum.data());
 
-        caudal::gemv_ref(s, w.data(), ws, xm, xs[m], y_ref.data());
+        // El kernel pide una escala POR GRUPO; aqui x no se cuantiza de
+        // verdad, asi que la misma escala en todos los grupos reproduce el
+        // caso antiguo (una por token).
+        const std::vector<float> xsg(s.groups(), xs[m]);
+        caudal::gemv_ref(s, w.data(), ws, xm, xsg.data(), y_ref.data());
 #if defined(__AVX2__)
-        caudal::gemv_int4(s, w.data(), ws, xgsum.data(), xm, xs[m], y_fast.data());
+        caudal::gemv_int4(s, w.data(), ws, xgsum.data(), xm, xsg.data(), y_fast.data());
 #else
         std::printf("  (sin AVX2: se omite la comparacion de kernel)\n");
         for (std::size_t n = 0; n < s.N; ++n) y_fast[n] = y_ref[n];

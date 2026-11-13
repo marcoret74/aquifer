@@ -252,6 +252,8 @@ def main():
         'effective_bits': round(8.0 * wsize / total_params, 3),
         'quant_err_mean': round(float(np.mean(errs)), 6),
         'quant_err_max': round(float(np.max(errs)), 6),
+        'layout': ('split: weights.bin + scales.bin' if splitted else
+                   'interleaved: fila = [pesos K/2][escalas G*2]'),
         'tensors': index,
     }
     with open(os.path.join(args.out, 'manifest.json'), 'w') as f:

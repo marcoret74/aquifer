@@ -106,7 +106,7 @@ inline void gemv_ref(const Shape& s,
                      const std::uint8_t* __restrict w,
                      const _Float16* __restrict wscale,
                      const std::int8_t* __restrict xperm,
-                     float xscale,
+                     const float* __restrict xscale,   // una por grupo
                      float* __restrict y) {
     const std::size_t G = s.groups(), rb = s.row_bytes();
     for (std::size_t n = 0; n < s.N; ++n) {
@@ -123,7 +123,7 @@ inline void gemv_ref(const Shape& s,
             }
             acc += static_cast<double>(dot)
                  * static_cast<double>(wscale[n * G + g])
-                 * static_cast<double>(xscale);
+                 * static_cast<double>(xscale[g]);
         }
         y[n] = static_cast<float>(acc);
     }
@@ -138,7 +138,7 @@ inline void gemv_int4(const Shape& s,
                       const _Float16* __restrict wscale,
                       const std::int32_t* __restrict xgsum,
                       const std::int8_t* __restrict xperm,
-                      float xscale,
+                      const float* __restrict xscale,   // una por grupo
                       float* __restrict y) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -178,7 +178,7 @@ inline void gemv_int4(const Shape& s,
             acc = _mm256_sub_epi32(
                 acc, _mm256_setr_epi32(8 * xgsum[g], 0, 0, 0, 0, 0, 0, 0));
 
-            const float fs = static_cast<float>(sc[g]) * xscale;
+            const float fs = static_cast<float>(sc[g]) * xscale[g];
             facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), _mm256_set1_ps(fs), facc);
         }
 
@@ -208,7 +208,7 @@ inline void gemv_int4_g32(const Shape& s,
                           const _Float16* __restrict wscale,
                           const std::int32_t* __restrict xgsum,
                           const std::int8_t* __restrict xperm,
-                          float xscale,
+                          const float* __restrict xscale,   // una por grupo
                           float* __restrict y) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -243,8 +243,8 @@ inline void gemv_int4_g32(const Shape& s,
 
             // Una escala por mitad del registro.
             const __m256 sv = _mm256_set_m128(
-                _mm_set1_ps(static_cast<float>(sc[g1]) * xscale),
-                _mm_set1_ps(static_cast<float>(sc[g0]) * xscale));
+                _mm_set1_ps(static_cast<float>(sc[g1]) * xscale[g1]),
+                _mm_set1_ps(static_cast<float>(sc[g0]) * xscale[g0]));
             facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv, facc);
         }
 
@@ -275,7 +275,9 @@ inline void gemv_int4_g32(const Shape& s,
 //  La DRAM real CAE con M: se deja de ser memory-bound y se pasa a compute-bound.
 //  Techo de cómputo leído del coste marginal: ~63 tok/s.
 //
-//  xperm: M*K int8 pre-permutados;  xgsum: M*G;  xscale: M;  y: M*N.
+//  xperm: M*K int8 pre-permutados;  xgsum: M*G;  xscale: M*G (una por
+//  grupo, no una por token: con una sola escala por token los modelos de
+//  activaciones con outliers --SmolLM2-- colapsan);  y: M*N.
 #if defined(__AVX2__)
 template <unsigned M>
 inline void gemv_int4_g32_M(const Shape& s,
@@ -322,8 +324,8 @@ inline void gemv_int4_g32_M(const Shape& s,
                     8 * xgsum[std::size_t(m) * G + g0], 0, 0, 0,
                     8 * xgsum[std::size_t(m) * G + g1], 0, 0, 0));
                 const __m256 sv = _mm256_set_m128(
-                    _mm_set1_ps(static_cast<float>(sc[g1]) * xscale[m]),
-                    _mm_set1_ps(static_cast<float>(sc[g0]) * xscale[m]));
+                    _mm_set1_ps(static_cast<float>(sc[g1]) * xscale[std::size_t(m) * G + g1]),
+                    _mm_set1_ps(static_cast<float>(sc[g0]) * xscale[std::size_t(m) * G + g0]));
                 facc[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv, facc[m]);
             }
         }

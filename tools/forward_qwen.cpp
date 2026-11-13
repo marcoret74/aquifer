@@ -122,7 +122,8 @@ void gemv_i4(const Lin& L, const float* x, float* y) {
 
     std::vector<std::int32_t> xg(L.G);
     caudal::compute_x_gsum(s, xq.data(), xg.data());
-    caudal::gemv_int4(s, L.packed, L.scale, xg.data(), xqp.data(), sx, y);
+    const std::vector<float> xsg(s.groups(), sx);   // una escala por grupo
+    caudal::gemv_int4(s, L.packed, L.scale, xg.data(), xqp.data(), xsg.data(), y);
 }
 
 // --- RoPE --------------------------------------------------------------------

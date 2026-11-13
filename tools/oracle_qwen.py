@@ -85,6 +85,27 @@ def _bytes_to_unicode():
     return dict(zip(bs, [chr(c) for c in cs]))
 
 
+# Patron de GPT-2: lo usan los ByteLevel con use_regex=true (Llama/SmolLM2).
+GPT2_PAT = (r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+"
+            r"|\s+(?!\S)|\s+")
+
+
+def _pretok_spec(t):
+    """Devuelve (patron_compilado, separar_digitos).
+
+    Dos familias de tokenizer en el repo:
+      * Qwen2: pre_tokenizer = Sequence[Split(pattern=Regex(...))]  -> usa su regex.
+      * Llama/SmolLM2: Sequence[Digits(individual_digits), ByteLevel(use_regex)]
+        -> regex de GPT-2 y cada digito por separado.
+    """
+    pt = t.get('pre_tokenizer') or {}
+    if pt.get('type') == 'Sequence':
+        subs = pt.get('pretokenizers', [])
+        dig = any(s.get('type') == 'Digits' for s in subs)
+        return regex.compile(GPT2_PAT), dig
+    return regex.compile(pt['pretokenizers'][0]['pattern']['Regex']), False
+
+
 class Tokenizer:
     def __init__(self, path):
         t = json.load(open(path))
@@ -94,8 +115,7 @@ class Tokenizer:
             a, b = m.split(' ')
             self.rank[(a, b)] = i
         self.added = {a['content']: a['id'] for a in t.get('added_tokens', [])}
-        self.pat = regex.compile(
-            t['pre_tokenizer']['pretokenizers'][0]['pattern']['Regex'])
+        self.pat, self.digits_split = _pretok_spec(t)
         self.b2u = _bytes_to_unicode()
         self.u2b = {v: k for k, v in self.b2u.items()}
         # id -> str, para decodificar
@@ -128,9 +148,12 @@ class Tokenizer:
         ids = []
         for m in self.pat.finditer(text):
             chunk = m.group(0)
-            s = ''.join(self.b2u[b] for b in chunk.encode('utf-8'))
-            for piece in self._bpe(s):
-                ids.append(self.vocab[piece])
+            # Digits(individual_digits=true): cada digito es su propio trozo.
+            trozos = regex.findall(r'\d|\D+', chunk) if self.digits_split else [chunk]
+            for trozo in trozos:
+                s = ''.join(self.b2u[b] for b in trozo.encode('utf-8'))
+                for piece in self._bpe(s):
+                    ids.append(self.vocab[piece])
         return ids
 
     def encode(self, text, allow_special=True):

@@ -206,24 +206,39 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
     // (era el 10 % del paso). Se reparte entre los hilos por rango de m.
     std::vector<std::int8_t> xq(M * K), xqp(M * K);
     std::vector<std::int32_t> xg(M * G);
-    std::vector<float> xs(M);
+    std::vector<float> xs(M * G);
     pool.run([&](unsigned tid) {
         const unsigned T0 = pool.size();
         const unsigned a = unsigned(std::size_t(tid) * M / T0);
         const unsigned b = unsigned(std::size_t(tid + 1) * M / T0);
         for (unsigned m = a; m < b; ++m) {
             const float* xm = x + std::size_t(m) * K;
-            float amax = 0.0f;
-            for (std::size_t i = 0; i < K; ++i) amax = std::max(amax, std::fabs(xm[i]));
-            const float sx = (amax > 0.0f ? amax / 127.0f : 1.0f);
-            xs[m] = sx;
             std::int8_t* q = xq.data() + std::size_t(m) * K;
-            for (std::size_t i = 0; i < K; ++i)
-                q[i] = static_cast<std::int8_t>(std::clamp(std::round(xm[i] / sx), -127.0f, 127.0f));
+            float* sm = xs.data() + std::size_t(m) * G;
+            // Una escala por GRUPO, no por token. Con una sola escala por
+            // token, un outlier en x arruina el resto de la fila: medido en
+            // SmolLM2 (id 7359 "controvers" en bucle, p=0.54) contra 0.69
+            // en 'La' con escala por grupo.
+            for (std::size_t g = 0; g < G; ++g) {
+                const std::size_t b0 = g * grp;
+                float amax = 0.0f;
+                for (std::size_t i = 0; i < grp; ++i)
+                    amax = std::max(amax, std::fabs(xm[b0 + i]));
+                const float sx = (amax > 0.0f ? amax / 127.0f : 1.0f);
+                sm[g] = sx;
+                for (std::size_t i = 0; i < grp; ++i)
+                    q[b0 + i] = static_cast<std::int8_t>(
+                        std::clamp(std::round(xm[b0 + i] / sx), -127.0f, 127.0f));
+            }
             std::int8_t* qp = xqp.data() + std::size_t(m) * K;
-            for (std::size_t bb = 0; bb < K / 64; ++bb)
+            const std::size_t bloques = K / 64;
+            for (std::size_t bb = 0; bb < bloques; ++bb)
                 for (std::size_t i = 0; i < 64; ++i)
                     qp[bb * 64 + i] = q[bb * 64 + caudal::kPerm[i]];
+            // Resto que no completa un bloque de 64: se copia sin permutar
+            // (kPerm no esta definido para bloques parciales). Ningun modelo
+            // actual lo ejercita, pero antes quedaba sin escribir.
+            for (std::size_t i = bloques * 64; i < K; ++i) qp[i] = q[i];
             caudal::Shape s0; s0.N = 0; s0.K = K; s0.group = grp;
             caudal::compute_x_gsum(s0, q, xg.data() + std::size_t(m) * G);
         }
@@ -309,6 +324,15 @@ std::vector<int> prompt_lookup(const std::vector<int>& ctx, int k) {
 
 }  // namespace
 
+static double vnorm(const float* p, std::size_t n) {
+    double s = 0.0;
+    for (std::size_t i = 0; i < n; ++i) s += double(p[i]) * double(p[i]);
+    return std::sqrt(s);
+}
+
+static bool g_dump = false;
+static int g_stepn = 0;
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("uso: %s <artefacto> --n <N> [--threads T] [--ctx C] "
@@ -326,6 +350,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads") reqT = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--spec") spec = std::atoi(next().c_str());
+        else if (a == "--dump") g_dump = true;
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
@@ -435,16 +460,29 @@ int main(int argc, char** argv) {
             for (std::size_t j = 0; j < cfg.H; ++j)
                 x[i * cfg.H + j] = bf16_to_f32(e[std::size_t(toks[i]) * cfg.H + j]);
 
+        if (g_dump && g_stepn == 0)
+            std::printf("DUMP m=%u tok0=%d pos0=%zu  x[0..3]=%.6f %.6f %.6f %.6f\n",
+                        m, toks[0], std::size_t(pos[0]), x[0], x[1], x[2], x[3]);
+
         for (std::size_t L = 0; L < cfg.NLY; ++L) {
             const std::string p = "model.layers." + std::to_string(L) + ".";
             for (unsigned i = 0; i < m; ++i)
                 rmsnorm(x.data() + i * cfg.H, c.aux_of(p + "input_layernorm.weight"),
                         h.data() + i * cfg.H, cfg.H, cfg.eps);
 
+            if (g_dump && g_stepn == 0 && L == 0)
+                std::printf("DUMP L0 |h_in|=%.5f\n", vnorm(h.data(), cfg.H));
+
             const Job jq{&c.lin.at(p + "self_attn.q_proj.weight"), q.data()};
             const Job jk{&c.lin.at(p + "self_attn.k_proj.weight"), kt.data()};
             const Job jv{&c.lin.at(p + "self_attn.v_proj.weight"), vt.data()};
               gemv_group_M(pool, {jq, jk, jv}, m, h.data(), cfg.H);
+
+            if (g_dump && g_stepn == 0 && L == 0)
+                std::printf("DUMP L0 |q|=%.5f |k|=%.5f |v|=%.5f\n",
+                            vnorm(q.data(), cfg.NH * cfg.DH),
+                            vnorm(kt.data(), cfg.NKV * cfg.DH),
+                            vnorm(vt.data(), cfg.NKV * cfg.DH));
 
 
             for (unsigned i = 0; i < m; ++i) {
@@ -496,8 +534,14 @@ int main(int argc, char** argv) {
                 }
             }
 
+            if (g_dump && g_stepn == 0 && L == 0)
+                std::printf("DUMP L0 |o_attn|=%.5f\n", vnorm(o.data(), cfg.H));
+
               const Job jo{&c.lin.at(p + "self_attn.o_proj.weight"), tmp.data()};
               gemv_group_M(pool, {jo}, m, o.data(), cfg.H);
+
+            if (g_dump && g_stepn == 0 && L == 0)
+                std::printf("DUMP L0 |o_proj|=%.5f\n", vnorm(tmp.data(), cfg.H));
 
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j];
 
@@ -507,6 +551,10 @@ int main(int argc, char** argv) {
             { const Job jg{&c.lin.at(p + "mlp.gate_proj.weight"), gate.data()};
               const Job ju{&c.lin.at(p + "mlp.up_proj.weight"), up.data()};
               gemv_group_M(pool, {jg, ju}, m, h.data(), cfg.H); }
+
+            if (g_dump && g_stepn == 0 && L == 0)
+                std::printf("DUMP L0 |gate|=%.5f |up|=%.5f\n",
+                            vnorm(gate.data(), cfg.INTER), vnorm(up.data(), cfg.INTER));
 
             {
                 const unsigned T2 = pool.size();
@@ -520,7 +568,17 @@ int main(int argc, char** argv) {
             { const Job jd{&c.lin.at(p + "mlp.down_proj.weight"), tmp.data()};
               gemv_group_M(pool, {jd}, m, gate.data(), cfg.INTER); }
 
+            if (g_dump && g_stepn == 0 && L == 0)
+                std::printf("DUMP L0 |mlp_out|=%.5f\n", vnorm(tmp.data(), cfg.H));
+
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j];
+
+            if (g_dump && g_stepn == 0) {
+                double s2 = 0.0;
+                for (std::size_t j = 0; j < m * cfg.H; ++j) s2 += double(x[j]) * x[j];
+                std::printf("DUMP L=%2zu |x|=%.5f x0=%.5f x1=%.5f\n",
+                            L, std::sqrt(s2), x[0], x[1]);
+            }
         }
 
         for (unsigned i = 0; i < m; ++i)
@@ -540,6 +598,17 @@ int main(int argc, char** argv) {
             for (std::size_t j = 1; j < cfg.V; ++j) if (lg[j] > lg[best]) best = j;
             out[i] = int(best);
         }
+        if (g_dump && g_stepn == 0) {
+            const float* lg = logits.data();
+            std::vector<std::size_t> idx(cfg.V);
+            for (std::size_t j = 0; j < cfg.V; ++j) idx[j] = j;
+            std::partial_sort(idx.begin(), idx.begin() + 5, idx.end(),
+                              [&](std::size_t a2, std::size_t b2) { return lg[a2] > lg[b2]; });
+            std::printf("DUMP logits top5:");
+            for (int k = 0; k < 5; ++k) std::printf(" %zu:%.4f", idx[k], lg[idx[k]]);
+            std::printf("\n");
+        }
+        ++g_stepn;
         return out;
     };
 

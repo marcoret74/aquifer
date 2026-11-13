@@ -145,12 +145,13 @@ int main(int argc, char** argv) {
     caudal::compute_x_gsum(s, x, xg);
 
     const float xs = 0.02f;
+    const std::vector<float> xsg(s.groups(), xs);   // una escala por grupo
 
     // --- Correctitud antes de cronometrar ------------------------------------
     {
         std::vector<float> yr(s.N);
-        caudal::gemv_int4(s, w4, sc, xg, x, xs, y);
-        caudal::gemv_ref(s, w4, sc, x, xs, yr.data());
+        caudal::gemv_int4(s, w4, sc, xg, x, xsg.data(), y);
+        caudal::gemv_ref(s, w4, sc, x, xsg.data(), yr.data());
         double worst = 0.0;
         for (std::size_t n = 0; n < s.N; ++n)
             worst = std::max(worst, std::fabs((double)y[n] - (double)yr[n]));
@@ -187,7 +188,7 @@ int main(int argc, char** argv) {
 
     auto run4 = [&](std::size_t b, std::size_t e) {
         caudal::Shape sub = s; sub.N = e - b;
-        caudal::gemv_int4(sub, w4 + b * rb, sc + b * G, xg, x, xs, y + b);
+        caudal::gemv_int4(sub, w4 + b * rb, sc + b * G, xg, x, xsg.data(), y + b);
     };
     auto run8 = [&](std::size_t b, std::size_t e) {
         gemv_i8(b, e, w8, sc, xg, x, xs, y);
