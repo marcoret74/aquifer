@@ -27,6 +27,7 @@
 #include <ctime>
 #include <fstream>
 #include <functional>
+#include <algorithm>
 #include <map>
 #include <sstream>
 #include <string>
@@ -39,7 +40,7 @@
 
 namespace {
 
-constexpr unsigned kMaxM = 4;          // secuencias por pasada
+constexpr unsigned kMaxM = 8;          // secuencias por pasada
 
 struct Cfg {
     std::size_t H{0}, NLY{0}, NH{0}, NKV{0}, DH{0}, INTER{0}, V{0};
@@ -166,6 +167,28 @@ struct Ctx {
     }
 };
 
+// Producto punto AVX2 float. La atencion estaba en escalar double: 128 ops
+// por score contra 16 FMAs vectoriales.
+inline float dot_f32(const float* __restrict a, const float* __restrict b, std::size_t n) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    std::size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),      _mm256_loadu_ps(b + i),      a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),  _mm256_loadu_ps(b + i + 8),  a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), a3);
+    }
+    for (; i + 8 <= n; i += 8)
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
+    a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    __m128 lo = _mm256_castps256_ps128(a0), hi = _mm256_extractf128_ps(a0, 1);
+    __m128 t = _mm_add_ps(lo, hi);
+    t = _mm_hadd_ps(t, t); t = _mm_hadd_ps(t, t);
+    float r = _mm_cvtss_f32(t);
+    for (; i < n; ++i) r += a[i] * b[i];
+    return r;
+}
+
 void rmsnorm(const float* x, const float* w, float* out, std::size_t n, float eps) {
     double ss = 0.0;
     for (std::size_t i = 0; i < n; ++i) ss += double(x[i]) * double(x[i]);
@@ -232,7 +255,11 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                     case 1: caudal::gemv_int4_g32_M<1>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     case 2: caudal::gemv_int4_g32_M<2>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     case 3: caudal::gemv_int4_g32_M<3>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                    default: caudal::gemv_int4_g32_M<4>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 4: caudal::gemv_int4_g32_M<4>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 5: caudal::gemv_int4_g32_M<5>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 6: caudal::gemv_int4_g32_M<6>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 7: caudal::gemv_int4_g32_M<7>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    default: caudal::gemv_int4_g32_M<8>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                 }
             }
             off = hi;
@@ -288,9 +315,10 @@ int main(int argc, char** argv) {
         std::printf("maximo %u secuencias, pediste %zu\n", kMaxM, prompts.size());
         return 1;
     }
-    // longitud comun de prompt (se trunca al minimo)
+    // Cada secuencia conserva SU longitud: truncar al minimo hacia que el
+    // modelo recibiera prompts cortados a mitad de frase (y repitiera el texto).
     std::size_t plen = prompts[0].size();
-    for (auto& p : prompts) plen = std::min(plen, p.size());
+    for (auto& p : prompts) plen = std::max(plen, p.size());
 
     Cfg cfg;
     {
@@ -416,27 +444,29 @@ int main(int argc, char** argv) {
                     const float* kb = kv.slot(seq[i], L, false, 0);
                     const float* vb = kv.slot(seq[i], L, true, 0);
                     const float* qh = q.data() + (i * cfg.NH + hh) * cfg.DH;
-                    double mx = -1e30;
+                    float* arow = att.data() + hh * std::size_t(ctx);
+                    float mx = -1e30f;
                     for (std::size_t s = 0; s < n; ++s) {
-                        double d = 0.0;
                         const float* ks = kb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
-                        for (std::size_t j = 0; j < cfg.DH; ++j) d += double(qh[j]) * double(ks[j]);
-                        d *= double(cfg.inv_sqrt_d);
-                        att[hh * std::size_t(ctx) + s] = float(d);
+                        const float d = dot_f32(qh, ks, cfg.DH) * cfg.inv_sqrt_d;
+                        arow[s] = d;
                         mx = std::max(mx, d);
                     }
-                    double sum = 0.0;
+                    float sum = 0.0f;
                     for (std::size_t s = 0; s < n; ++s) {
-                        const double ex = std::exp(double(att[hh * std::size_t(ctx) + s]) - mx);
-                        att[hh * std::size_t(ctx) + s] = float(ex);
+                        const float ex = std::exp(arow[s] - mx);
+                        arow[s] = ex;
                         sum += ex;
                     }
-                    for (std::size_t j = 0; j < cfg.DH; ++j) {
-                        double acc = 0.0;
-                        for (std::size_t s = 0; s < n; ++s)
-                            acc += double(att[hh * std::size_t(ctx) + s]) / sum *
-                                   double(vb[s * (cfg.NKV * cfg.DH) + kvi * cfg.DH + j]);
-                        o[(i * cfg.NH + hh) * cfg.DH + j] = float(acc);
+                    const float inv = 1.0f / sum;
+                    float* oacc = o.data() + (i * cfg.NH + hh) * cfg.DH;
+                    std::fill(oacc, oacc + cfg.DH, 0.0f);
+                    for (std::size_t s = 0; s < n; ++s) {
+                        const __m256 p = _mm256_set1_ps(arow[s] * inv);
+                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                        for (std::size_t j = 0; j + 8 <= cfg.DH; j += 8)
+                            _mm256_storeu_ps(oacc + j, _mm256_fmadd_ps(
+                                p, _mm256_loadu_ps(vs + j), _mm256_loadu_ps(oacc + j)));
                     }
                 }
             }
@@ -488,7 +518,8 @@ int main(int argc, char** argv) {
     // --- prefill (una secuencia a la vez, M=1) -------------------------------
     const double tp0 = now_ms();
     for (unsigned s = 0; s < NS; ++s) {
-        for (std::size_t i = 0; i + 1 < plen; ++i) (void)step({s}, {prompts[s][i]}, {i});
+        const std::size_t n_s = prompts[s].size();
+        for (std::size_t i = 0; i + 1 < n_s; ++i) (void)step({s}, {prompts[s][i]}, {i});
     }
     const double tp1 = now_ms();
 
@@ -497,7 +528,7 @@ int main(int argc, char** argv) {
     for (unsigned s = 0; s < NS; ++s) seqids[s] = s;
     std::vector<int> last(NS);
     std::vector<std::size_t> pos(NS);
-    for (unsigned s = 0; s < NS; ++s) { pos[s] = plen - 1; last[s] = prompts[s][plen - 1]; }
+    for (unsigned s = 0; s < NS; ++s) { pos[s] = prompts[s].size() - 1; last[s] = prompts[s].back(); }
 
     std::vector<std::vector<int>> gen(NS);
     const int steps = ngen;
