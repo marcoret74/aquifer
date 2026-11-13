@@ -87,3 +87,6 @@ endif()
 # Pendiente Fase 1: tools/pack_qwen.py (safetensors -> layout A0 real)
 
 
+
+add_executable(forward_qwen tools/forward_qwen.cpp)
+target_link_libraries(forward_qwen PRIVATE caudal_flags)

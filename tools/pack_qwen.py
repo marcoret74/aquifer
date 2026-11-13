@@ -166,6 +166,14 @@ def main():
     if not todo:
         raise SystemExit('no se encontro ningun tensor lineal 2D')
 
+    # lm_head atado: si no hay lm_head.weight, el GEMV final usa embed_tokens
+    if 'lm_head.weight' not in st.header and 'model.embed_tokens.weight' in st.header:
+        e = st.header['model.embed_tokens.weight']
+        if len(e['shape']) == 2:
+            todo.append(('model.embed_tokens.weight', tuple(e['shape'])))
+            todo.sort()
+            print('  (lm_head atado -> se empaqueta embed_tokens como lineal)')
+
     print(f'modelo : {args.model}')
     print(f'tensores lineales: {len(todo)}')
     print(f'{"nombre":<44}{"N":>6}{"K":>6}{"bits":>7}{"err%":>9}')
@@ -235,6 +243,38 @@ def main():
     print(f'bits/param real   : {manifest["effective_bits"]:.3f}')
     print(f'error cuant. medio: {100*manifest["quant_err_mean"]:.3f} %   '
           f'max: {100*manifest["quant_err_max"]:.3f} %')
+
+    # --- Material para el forward en C++ (sin JSON ni safetensors) -----------
+    # index.txt: LINEAL / AUX / EMBED, parseable con >>
+    # embed.bf16: tabla de lookup (bf16 crudo, sin tocar)
+    # aux.bin   : todos los tensores 1-D (normas y biases) en float32
+    lines = []
+    for name, m in index.items():
+        lines.append(f'LINEAR {name} {m["N"]} {m["K"]} '
+                     f'{m["packed_off"]} {m["packed_bytes"]} '
+                     f'{m["scale_off"]} {m["scale_bytes"]}')
+
+    aux_names = [n for n in sorted(st.names()) if len(st.info(n)[1]) == 1]
+    aux_off = 0
+    with open(os.path.join(args.out, 'aux.bin'), 'wb') as fa:
+        for n in aux_names:
+            a = st.tensor_f32(n).astype(np.float32)
+            fa.write(a.tobytes())
+            lines.append(f'AUX {n} {a.size} {aux_off}')
+            aux_off += a.size
+
+    # embed_tokens crudo en bf16 (lookup exacto, no cuantizado)
+    if 'model.embed_tokens.weight' in st.header:
+        e = st.header['model.embed_tokens.weight']
+        a, b = e['data_offsets']
+        st.f.seek(st.data_start + a)
+        with open(os.path.join(args.out, 'embed.bf16'), 'wb') as fe:
+            fe.write(st.f.read(b - a))
+        lines.append(f'EMBED model.embed_tokens.weight {e["shape"][0]} {e["shape"][1]}')
+
+    with open(os.path.join(args.out, 'index.txt'), 'w') as fi:
+        fi.write('\n'.join(lines) + '\n')
+    print(f'index.txt         : {len(index)} lineales, {len(aux_names)} aux')
 
     # --- Set de 5 archivos para validar el kernel C++ con pesos REALES -------
     if args.layout_tensor:

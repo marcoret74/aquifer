@@ -271,6 +271,73 @@ calidad del modelo. Para int4/g64 es el valor esperado (~11 % es
 `amax/(7·√12)` sobre gaussianas). Si degrada la perplejidad **no está medido**, y
 medirlo requiere el forward completo.
 
+## Día 5 — el forward, validado capa por capa (2026-11-13)
+
+`tools/oracle_qwen.py` (PyTorch, sin transformers) + `tools/forward_qwen.cpp`.
+
+### El oráculo primero se valida a sí mismo
+
+Un oráculo sin validar no sirve: si el oráculo y el C++ comparten un
+malentendido del spec, coinciden y ambos están mal. Por eso el oráculo se
+valida **generando texto**:
+
+```
+prompt: "¿Quién eres?"
+  -> "Estoy aquí para ayudarte. ¿Cómo puedo asistirte hoy?"
+```
+
+Eso confirma el spec completo de Qwen2: RMSNorm **plano** (no `1+w`),
+**biases en q/k/v** (Llama no los tiene), GQA 7x, RoPE theta 1e6, SwiGLU,
+lm_head atado.
+
+### La matemática del C++ contra PyTorch
+
+```
+modo --exact (pesos int4-dequantizados, x float)
+  embed      0.000e+00
+  capa  0    4.332e-06
+  capa  1    3.709e-06
+  capa 2-24  ~1.5e-07
+  argmax coincide · capas con error alto: 0
+```
+
+**1e-6.** RMSNorm, RoPE, atención causal con GQA, SwiGLU, residual y lm_head
+atado están correctos.
+
+### El kernel int4 real
+
+```
+  capas 3-20   2.7e-02  (2.7 %)  <- cuantización de x a int8 por tensor
+  argmax = 68012 = "Hola"  (coincide con el oráculo cuantizado)
+  forward: 302.7 ms para T=14 -> 21.6 ms/token
+           1 hilo, sin KV cache  =  46 tok/s
+```
+
+22.8 GMAC/s single-thread: consistente con los 19-20 medidos. A 8 hilos
+(40 GMAC/s) la proyección de **81 tok/s** se sostiene.
+
+### Hallazgo de calidad (hay que decirlo)
+
+int4/g64 cambia la respuesta del 0.5B:
+
+| pesos | respuesta |
+|---|---|
+| bf16 | "Estoy aquí para ayudarte. ¿Cómo puedo asistirte hoy?" |
+| int4/g64 | "Hola, no puedo ser ident..." |
+
+El C++ **reproduce exactamente** el oráculo cuantizado, así que la degradación
+es de la cuantización, no del kernel. Un modelo de 0.5B es muy sensible a 4
+bits: para este tamaño habría que ir a grupo 32 o 5-6 bits (el 7B tolera 4).
+
+### Tres bugs que sólo la comparación capa-por-capa encontró
+
+1. **Faltaban los biases de q/k/v.** Detectado por conteo: 290 tensores en el
+   archivo vs 218 esperados; los 72 = 24x3 que sobraban eran los biases.
+2. **`Shape::group` es VALORES por grupo (64), no NÚMERO de grupos (K/64).**
+   Confundirlos producía un segfault leyendo 64 "grupos" de 7 bytes.
+3. **`x` debe ir pre-permutado por `kPerm`** antes de entrar al kernel. Sin
+   eso el producto punto empareja índices distintos y da 100 % de error.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
