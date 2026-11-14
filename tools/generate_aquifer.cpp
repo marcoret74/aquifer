@@ -222,6 +222,7 @@ struct MMapFile {
         void* p = ::mmap(nullptr, size ? size : 1, PROT_READ, MAP_SHARED, fd, 0);
         if (p == MAP_FAILED) { std::perror("mmap"); std::exit(1); }
         ptr = static_cast<std::uint8_t*>(p);
+        ::madvise(ptr, size, MADV_HUGEPAGE);
     }
 
     ~MMapFile() {
