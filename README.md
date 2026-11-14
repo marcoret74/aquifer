@@ -741,6 +741,25 @@ super-bloque. ggml lo resuelve así:
 
 Eso es reescribir el kernel y el camino de cuantización de `x`. Pendiente.
 
+## Regla de trabajo — cuándo dejar de tocar código
+
+**Dos intentos fallidos seguidos sobre el mismo problema = parar y consultar al
+panel (Claude, Gemini, Qwen) con las mediciones en la mano.** No un tercero.
+
+El caso que la originó (Día 24): tres intentos de optimizar el decodificador de
+6 bits del super-bloque —vectorizar la corrección del mínimo, quitar las ramas,
+inline con `memcpy`— movieron 11,8 → 13,9 tok/s sobre un objetivo de 22. La
+consulta al panel resolvió el diagnóstico en una pasada: **el costo no estaba
+en el decodificador sino en hacer fp32 por grupo de 32 en vez de una vez por
+super-bloque**. ggml lo hace acumulando en int32 y aplicando `d`/`dmin` una sola
+vez cada 256 valores.
+
+Costo de no haberla aplicado antes: ~2 h y decenas de miles de tokens en
+parches sobre un kernel que había que reescribir.
+
+Corolario: la consulta rinde cuando lleva **números medidos**, no impresiones.
+En ese caso lo que destrabó fue la tabla instrucciones/ciclos por esquema.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
