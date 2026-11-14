@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,7 @@
 #include <iostream>
 #include <algorithm>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -92,22 +94,34 @@ double now_ms() {
     return double(t.tv_sec) * 1e3 + double(t.tv_nsec) * 1e-6;
 }
 
-// --- barrera de spin ---------------------------------------------------------
+// --- barrera híbrida spin + sleep (latencia 0 en generación, 0% CPU en reposo) ---
 class SpinBarrier {
 public:
     explicit SpinBarrier(unsigned t) : T_(t) {}
-    void wait() noexcept {
+    void wait() {
         const unsigned g = gen_.load(std::memory_order_acquire);
         if (cnt_.fetch_add(1, std::memory_order_acq_rel) + 1 == T_) {
             cnt_.store(0, std::memory_order_relaxed);
             gen_.fetch_add(1, std::memory_order_release);
+            cv_.notify_all();
         } else {
-            while (gen_.load(std::memory_order_acquire) == g) _mm_pause();
+            // Spin corto (~30.000 iteraciones) para latencia cero durante generación
+            for (int spin = 0; spin < 30000; ++spin) {
+                if (gen_.load(std::memory_order_acquire) != g) return;
+                _mm_pause();
+            }
+            // Si el modelo terminó de responder y espera input del usuario: ¡dormir de verdad!
+            std::unique_lock<std::mutex> lk(m_);
+            cv_.wait(lk, [&]() {
+                return gen_.load(std::memory_order_acquire) != g;
+            });
         }
     }
 private:
     unsigned T_;
     std::atomic<unsigned> cnt_{0}, gen_{0};
+    std::mutex m_;
+    std::condition_variable cv_;
 };
 
 class Pool {
