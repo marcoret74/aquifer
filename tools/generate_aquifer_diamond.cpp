@@ -1106,7 +1106,7 @@ int main(int argc, char** argv) {
             }
             std::vector<std::uint8_t> active_mask;
             const std::uint8_t* p_mask = nullptr;
-            if (crystal_loaded && g_diamond_pct < 100 && L < crystal.layers.size()) {
+            if (m == 1 && crystal_loaded && g_diamond_pct < 100 && L < crystal.layers.size()) {
                 active_mask.resize(cfg.INTER, 0);
                 const auto& dl = crystal.layers[L];
                 // 1. Proyectar h en los 3 ejes del cristal óptico
@@ -1174,8 +1174,7 @@ int main(int argc, char** argv) {
                 std::printf("DUMP out[0..5]: %f %f %f %f %f\n", tmp[0], tmp[1], tmp[2], tmp[3], tmp[4]);
             }
 
-            const float rescale = (p_mask && g_diamond_pct > 0 && g_diamond_pct < 100)
-                                      ? (100.0f / float(g_diamond_pct)) : 1.0f;
+            const float rescale = 1.0f;
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j] * rescale;
 
             // El Portero desaloja de inmediato la Capa L de la RAM fisica (alineado a pagina)

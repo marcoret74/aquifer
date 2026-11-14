@@ -125,10 +125,10 @@ def main():
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/qwen05/tokenizer.json"
         if args.system is None:
-            args.system = "Eres un asistente servicial que responde siempre en español de forma concisa."
+            args.system = "You are a helpful assistant."
         if args.n is None:
             args.n = 256
-        model_title = "Qwen 2.5-0.5B Instruct (Ultra-Rápido ~52 tok/s)"
+        model_title = "Qwen 2.5-0.5B Instruct (Ultra-Fast ~52 tok/s)"
         bot_color = BLUE
         bot_label = "Qwen-0.5B"
         eos_str = "151643,151645"
@@ -138,7 +138,7 @@ def main():
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/qwen3b/tokenizer.json"
         if args.system is None:
-            args.system = "Eres un asistente servicial que responde siempre en español de forma concisa."
+            args.system = "You are a helpful assistant."
         if args.n is None:
             args.n = 512
         model_title = "Qwen 2.5-3B Instruct (Aquifer Zero-Copy Paging)"
@@ -151,10 +151,10 @@ def main():
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/coder15/tokenizer.json"
         if args.system is None:
-            args.system = "Eres un asistente experto en programación de software, arquitectura de sistemas y algoritmos. Genera código limpio, moderno, tipado y bien explicado."
+            args.system = "You are an expert assistant in software engineering, systems architecture, and algorithms. Write clean, modern, typed, and well-explained code."
         if args.n is None:
             args.n = 512
-        model_title = "Qwen 2.5-Coder-1.5B Instruct (Código y Sistemas)"
+        model_title = "Qwen 2.5-Coder-1.5B Instruct (Code & Systems)"
         bot_color = GREEN
         bot_label = "Qwen-Coder"
         eos_str = "151643,151645"
@@ -164,7 +164,7 @@ def main():
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/tiny/tokenizer.json"
         if args.system is None:
-            args.system = "Eres un asistente servicial que responde siempre en español."
+            args.system = "You are a helpful assistant."
         if args.n is None:
             args.n = 256
         model_title = "TinyLlama-1.1B Chat"
@@ -177,7 +177,7 @@ def main():
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/smol2/tokenizer.json"
         if args.system is None:
-            args.system = "Eres un asistente servicial que responde siempre en español."
+            args.system = "You are a helpful assistant."
         if args.n is None:
             args.n = 256
         model_title = "SmolLM2-1.7B Instruct"
@@ -190,7 +190,7 @@ def main():
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/qwen15/tokenizer.json"
         if args.system is None:
-            args.system = "Eres un asistente servicial que responde siempre en español."
+            args.system = "You are a helpful assistant."
         if args.n is None:
             args.n = 256
         model_title = "Qwen 2.5-1.5B Instruct"
@@ -255,10 +255,10 @@ def main():
                 break
 
     print(f"\n{BOLD}================================================================={RESET}")
-    print(f"{BOLD}      Caudal Shell Interactiva · {model_title}                  {RESET}")
-    print(f"  Comandos especiales:                                           ")
-    print(f"    {YELLOW}/reset{RESET}  -> Reiniciar memoria de la conversación           ")
-    print(f"    {YELLOW}/salir{RESET}  -> Salir de la shell                             ")
+    print(f"{BOLD}      Aquifer Interactive Shell · {model_title}                  {RESET}")
+    print(f"  Commands:                                                      ")
+    print(f"    {YELLOW}/reset{RESET} (or {YELLOW}/clear{RESET})  -> Reset conversation history & KV cache  ")
+    print(f"    {YELLOW}/exit{RESET}  (or {YELLOW}/quit{RESET})   -> Exit interactive shell                 ")
     print(f"{BOLD}================================================================={RESET}\n")
 
     history = []
@@ -266,17 +266,17 @@ def main():
     try:
         while True:
             try:
-                user_input = input(f"{GREEN}{BOLD}Tú > {RESET}").strip()
+                user_input = input(f"{GREEN}{BOLD}You > {RESET}").strip()
             except (EOFError, KeyboardInterrupt):
-                print("\nSaliendo...")
+                print("\nExiting...")
                 break
 
             if not user_input:
                 continue
 
-            if user_input.lower() in ("/salir", "/exit", "exit", "quit"):
+            if user_input.lower() in ("/exit", "/quit", "exit", "quit", "/salir", "salir"):
                 break
-            elif user_input.lower() in ("/reset", "/limpiar", "clear"):
+            elif user_input.lower() in ("/reset", "/clear", "clear", "/limpiar", "reset"):
                 history.clear()
                 proc.stdin.write("RESET\n")
                 proc.stdin.flush()
@@ -289,7 +289,7 @@ def main():
                     for line in proc.stdout:
                         if line.strip() == "PREWARMED":
                             break
-                print(f"{YELLOW}[Memoria y KV-cache reiniciados]{RESET}\n")
+                print(f"{YELLOW}[Memory and KV-cache reset]{RESET}\n")
                 continue
 
             history.append(("user", user_input))
