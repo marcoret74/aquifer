@@ -380,48 +380,43 @@ El `Q4_0` con embedding a 4 bits se generó con `llama-quantize
 - Con bits/peso emparejados (Q4_0, 4,50), llama.cpp da 19,3 y nosotros 21,1,
   otra vez dentro del ruido.
 
-### Conclusión honesta
+### Desglose del paso, y el techo que no era techo
 
-**No somos más rápidos que llama.cpp.** Somos comparables en tok/s con estos dos
-modelos, y ellos son más eficientes por byte. La lectura correcta del resultado
-es la inversa de la celebración: el motor propio está a la altura en velocidad,
-pero el kernel todavía tiene un 10–25 % de margen contra el techo de silicio, y
-la ventaja de bytes es una decisión de cuantización con coste de calidad no
-verificado.
+Instrumentado el motor (`--time`), el reparto por token es inequívoco:
 
-Lo accionable sale de la tabla, no del ranking: **18 GB/s contra 25,3 de techo**
-es el número a atacar (arena mmap, layout de escalas, kernels por grupo).
+| modelo | GEMV | atención | ms/paso |
+|---|---|---|---|
+| Qwen2.5-1.5B | **97,2 %** | 2,8 % | 47,11 |
+| TinyLlama-1.1B | **94,9 %** | 5,1 % | 32,65 |
 
-### Calidad: el ppl **no** es comparable entre motores (intento fallido, documentado)
+No hay overhead que rascar: el motor entrega 18,4 GB/s y el kernel aislado
+(`probe1_gemv`, 4 hilos) da **19,0 GB/s**. Estamos al 97 % de nuestro propio
+kernel. La atención es marginal, así que el lote no ayuda por ahí.
 
-Se intentó cerrar la duda de calidad con `llama-perplexity` sobre el mismo
-corpus (1200 tokens de prosa del README, ventana de 512):
+**Retirada de una afirmación:** la columna «% del techo» de la tabla se apoyaba
+en un techo de 25,3 GB/s que hoy **no se reproduce**. La misma máquina da 16,3
+(`probe0`, 2 hilos), 19,0 (`probe1`, 4 hilos) y 25,3 (histórico). Encima
+`probe0` reporta 900 MHz con 4 hilos mientras el motor corriendo mantiene
+2,7–2,9 GHz: su columna de MHz es un artefacto. Con tres techos incompatibles no
+se puede decir «72 % del techo»; lo defendible es: **~9 % por debajo de
+llama.cpp en el mismo bloque, y al 97 % de nuestro propio kernel**.
 
-| medición | ppl |
+Antes de perseguir «18 → 24 GB/s» hay que construir un banco de ancho de banda
+confiable (buffers pre-tocados, muestreo de frecuencia, repeticiones).
+
+### Intento de layout: intercalar sin relleno (negativo)
+
+El intercalado perdió en el Día 13 por los huecos de relleno (stride alineado a
+64 B). Se re-empaquetó con **stride exacto** (`--stride-align 0`), mismo tamaño
+que `split` (868,3 MB, 4,500 bits/peso), y volvió a perder:
+
+| layout | tok/s (mejor de 4) |
 |---|---|
-| caudal bf16 (misma ventana, 511 transiciones) | 38,49 |
-| caudal int4 g32 (idem) | 47,05 |
-| llama.cpp Q4_K_M (`-c 512 --chunks 1`) | 27,06 ± 5,62 |
+| split (dos arrays) | **19,4** |
+| intercalado sin relleno | 18,0 |
 
-**Esa tabla no se puede usar para comparar motores**, y queda escrito para que
-no se cite:
-
-1. **Tokenizadores distintos.** La perplejidad solo es comparable sobre la
-   *misma* secuencia de tokens; el mismo texto tokenizado por dos vocabularios
-   da secuencias y denominadores distintos.
-2. **`llama-perplexity` no puntúa todo lo que lee.** Usa la primera mitad del
-   contexto como calentamiento y evalúa la segunda. Nosotros promediamos las
-   511 transiciones completas. Y el corpus estaba duplicado para llegar a los
-   1024 tokens mínimos, así que su mitad puntuada era texto repetido: ppl
-   artificialmente baja.
-
-Lo único válido de esa corrida es **interno**: int4 g32 degrada **+22,2 %**
-sobre bf16 en la ventana idéntica (47,05 / 38,49), consistente con el +22,7 %
-ya documentado.
-
-La comparación honesta pendiente es **bits por carácter sobre el mismo texto**,
-que sí es invariante al tokenizador, o forzar la misma secuencia de ids en
-ambos motores (imposible sin re-tokenizar el GGUF).
+**No era el relleno: es el prefetcher**, que sigue dos streams densos mejor que
+uno intercalado aunque no tenga agujeros. El layout de dos arrays se queda.
 
 ## Orden de construcción
 

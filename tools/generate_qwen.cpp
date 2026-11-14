@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +38,10 @@
 #include <immintrin.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+// Instrumentacion opcional (--time).
+static double g_t_gemv = 0.0, g_t_attn = 0.0;
+static bool g_time = false;
 
 namespace {
 
@@ -199,6 +204,7 @@ void rmsnorm(const float* x, const float* w, float* out, std::size_t n, float ep
 // --- GEMV por grupo, M vectores de entrada -----------------------------------
 void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                   const float* x, std::size_t K) {
+    const auto t0 = std::chrono::steady_clock::now();
     const Lin& L0 = *jobs[0].L;
     const std::size_t G = L0.G, grp = K / G;
 
@@ -280,6 +286,9 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
             off = hi;
         }
     });
+    if (g_time)
+        g_t_gemv += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
 }
 
 void add_bias(float* y, const float* b, std::size_t n) {
@@ -351,6 +360,7 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--spec") spec = std::atoi(next().c_str());
         else if (a == "--dump") g_dump = true;
+        else if (a == "--time") g_time = true;
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
@@ -499,6 +509,7 @@ int main(int argc, char** argv) {
                             cfg.NKV * cfg.DH * sizeof(float));
             }
 
+            const auto ta = std::chrono::steady_clock::now();
             const std::size_t rep = cfg.NH / cfg.NKV;
             for (unsigned i = 0; i < m; ++i) {
                 const std::size_t n = pos[i] + 1;
@@ -536,6 +547,10 @@ int main(int argc, char** argv) {
 
             if (g_dump && g_stepn == 0 && L == 0)
                 std::printf("DUMP L0 |o_attn|=%.5f\n", vnorm(o.data(), cfg.H));
+
+            if (g_time)
+                g_t_attn += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - ta).count();
 
               const Job jo{&c.lin.at(p + "self_attn.o_proj.weight"), tmp.data()};
               gemv_group_M(pool, {jo}, m, o.data(), cfg.H);
@@ -642,6 +657,14 @@ int main(int argc, char** argv) {
 
     std::printf("prefill  : %.1f ms (%u secuencias x %zu tokens)\n", tp1 - tp0, NS, plen);
     std::printf("decode   : %.1f ms para %d pasos x %u secuencias\n", td1 - td0, steps, NS);
+    if (g_time) {
+        // El cierre de gemv_group_M no puede tocar g_t_gemv sin un objeto;
+        // se acumula aqui con una lambda al salir de cada llamada.
+        std::printf("TIME gemv=%.0f ms  attn=%.0f ms  (%.1f%% / %.1f%%)\n",
+                    g_t_gemv, g_t_attn,
+                    100.0 * g_t_gemv / (g_t_gemv + g_t_attn > 0 ? g_t_gemv + g_t_attn : 1),
+                    100.0 * g_t_attn / (g_t_gemv + g_t_attn > 0 ? g_t_gemv + g_t_attn : 1));
+    }
     std::printf("           %.2f ms/paso  ->  %.1f tok/s AGREGADOS  (%.1f por secuencia)\n\n",
                 (td1 - td0) / steps,
                 1000.0 * steps * NS / (td1 - td0),

@@ -147,6 +147,9 @@ def main():
     ap.add_argument('--layout-out', default=None)
     ap.add_argument('--layout-tokens', type=int, default=2,
                     help='cuantos x sinteticos para el set de 5 archivos')
+    ap.add_argument('--stride-align', type=int, default=64,
+                    help='alineacion del stride en layout inter (0 = exacto, sin '
+                         'huecos: era el agujero que hundio el intercalado)')
     ap.add_argument('--layout', default='split', choices=['split', 'inter'],
                     help='split = weights.bin+scales.bin (MEDIDO mas rapido: 22.2 '
                          'tok/s); inter = w.bin con filas [pesos][escalas] (18.0)')
@@ -221,7 +224,11 @@ def main():
                                'scale_bytes': int(scales.size * 2),
                                'quant_err': round(err, 6)}
             else:
-                stride = (rb + sbb + 63) & ~63
+                if args.stride_align > 0:
+                    a_ = args.stride_align
+                    stride = (rb + sbb + a_ - 1) & ~(a_ - 1)
+                else:
+                    stride = rb + sbb
                 rows = np.empty((N, stride), dtype=np.uint8)
                 rows[:, :rb] = packed
                 rows[:, rb:rb + sbb] = scales.view(np.uint8).reshape(N, sbb)
