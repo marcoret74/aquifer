@@ -301,7 +301,67 @@ inline void gemv_int4_g32_M(const Shape& s,
 #pragma GCC unroll 8
         for (unsigned m = 0; m < M; ++m) facc[m] = _mm256_setzero_ps();
 
-        for (std::size_t bb = 0; bb < blocks; ++bb) {
+        std::size_t bb = 0;
+        // --- 8 grupos (4 bloques) por iteracion ---------------------------
+        // Las 8 escalas se convierten fp16->fp32 con UN _mm256_cvtph_ps y se
+        // reparten con permutevar8x32_ps. Antes se construia una escala por
+        // bloque (2 conversiones + 2 mul + 2 set1 + insert = ~8 instr cada
+        // 32 B); medido con perf, era ~1/3 de las instrucciones del bucle.
+#ifndef CAUDAL_LEGACY_SCALE
+        if (G % 8 == 0) {
+#else
+        if (false) {
+#endif
+            const __m256i p0 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+            const __m256i p1 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
+            const __m256i p2 = _mm256_setr_epi32(4, 4, 4, 4, 5, 5, 5, 5);
+            const __m256i p3 = _mm256_setr_epi32(6, 6, 6, 6, 7, 7, 7, 7);
+            for (; bb + 4 <= blocks; bb += 4) {
+                __m256i A[4], B[4];
+#pragma GCC unroll 4
+                for (int j = 0; j < 4; ++j) {
+                    const __m256i v = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i*>(row + (bb + std::size_t(j)) * 32));
+                    const __m256i lo = _mm256_and_si256(v, m0f);
+                    const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
+                    A[j] = _mm256_unpacklo_epi8(lo, hi);
+                    B[j] = _mm256_unpackhi_epi8(lo, hi);
+                }
+                const std::size_t gbase = 2 * bb;
+                const __m256 w8 = _mm256_cvtph_ps(
+                    _mm_loadu_si128(reinterpret_cast<const __m128i*>(sc + gbase)));
+
+#pragma GCC unroll 8
+                for (unsigned m = 0; m < M; ++m) {
+                    const __m256 s8 = _mm256_mul_ps(
+                        w8, _mm256_loadu_ps(xscale + std::size_t(m) * G + gbase));
+                    const __m256 sv[4] = {_mm256_permutevar8x32_ps(s8, p0),
+                                          _mm256_permutevar8x32_ps(s8, p1),
+                                          _mm256_permutevar8x32_ps(s8, p2),
+                                          _mm256_permutevar8x32_ps(s8, p3)};
+#pragma GCC unroll 4
+                    for (int j = 0; j < 4; ++j) {
+                        const std::int8_t* xm = xperm + std::size_t(m) * s.K
+                                                + (bb + std::size_t(j)) * 64;
+                        const __m256i x0 = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i*>(xm));
+                        const __m256i x1 = _mm256_loadu_si256(
+                            reinterpret_cast<const __m256i*>(xm + 32));
+                        __m256i acc = _mm256_madd_epi16(_mm256_maddubs_epi16(A[j], x0), ones16);
+                        acc = _mm256_add_epi32(
+                            acc, _mm256_madd_epi16(_mm256_maddubs_epi16(B[j], x1), ones16));
+                        const std::size_t gg = gbase + std::size_t(2 * j);
+                        acc = _mm256_sub_epi32(acc, _mm256_setr_epi32(
+                            8 * xgsum[std::size_t(m) * G + gg], 0, 0, 0,
+                            8 * xgsum[std::size_t(m) * G + gg + 1], 0, 0, 0));
+                        facc[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv[j], facc[m]);
+                    }
+                }
+            }
+        }
+
+        // --- cola (o G no multiplo de 8) ---------------------------------
+        for (; bb < blocks; ++bb) {
             const __m256i v = _mm256_loadu_si256(
                 reinterpret_cast<const __m256i*>(row + bb * 32));
             const __m256i lo = _mm256_and_si256(v, m0f);

@@ -522,6 +522,49 @@ golpe. Elimina la construcción por bloque y no toca la precisión.
 | La división por elemento al cuantizar x | recíproco por grupo, A/B intercalado | sin efecto |
 | Layout intercalado sin relleno | 18,0 vs 19,4 tok/s | peor |
 
+## Día 20 — El bucle de 8 grupos: paridad de ciclos por byte (2026-11-13)
+
+La optimización que salió del `perf` del Día 19: las 8 escalas de un tramo de
+512 valores se convierten **fp16 → fp32 con un solo `_mm256_cvtph_ps`** y se
+reparten con `_mm256_permutevar8x32_ps`, en vez de construir una escala por
+bloque de 32 B (2 conversiones + 2 `mul` + 2 `set1` + `insert`).
+
+### Verificación antes de medir
+
+El kernel `gemv_int4_g32_M<M>` **no tenía test** (el roundtrip cubre el de grupo
+64). Se agregó `tests/check_g32M.cpp`: compara contra la referencia escalar con
+la misma data empaquetada, en G=16/48/64/256 con M=3. El kernel optimizado da
+**error máximo 0,00e+00** — bit-exacto, no "parecido".
+
+### Resultado (instrucciones de `perf`, deterministas)
+
+| | instrucciones | ciclos | IPC | **ciclos/byte** |
+|---|---|---|---|---|
+| antes | 132,98 G | 75,67 G | 1,76 | 0,597 |
+| **después** | **100,59 G** (−24,4 %) | **72,10 G** (−4,7 %) | 1,40 | **0,569** |
+| llama.cpp Q4_K_M | 93,59 G | 80,89 G | 1,16 | **0,566** |
+
+**Paridad de ciclos por byte alcanzada**: 0,569 contra 0,566, moviendo un 25 %
+menos de bytes. El IPC baja de 1,76 a 1,40 porque se eliminó trabajo: quedamos
+más cerca de ser puramente memory-bound, que es donde queremos estar.
+
+En tok/s, A/B intercalado (mismo binario, macro `CAUDAL_LEGACY_SCALE`):
+
+| ronda | nuevo | viejo |
+|---|---|---|
+| 1 | **23,0** | 20,1 |
+| 2 | **19,1** | 17,3 |
+| 3 | **22,5** | 20,7 |
+
+**+8,7 % a +14,4 %**, siempre a favor. El texto sigue correcto en los dos
+modelos (`La capital de Francia es París.`, `El nombre de la capital de Francia
+es París.`) y las dos suites pasan.
+
+La predicción de que esto cerraba en ~0,56 se cumplió. Lo que **no** se cumplió
+es la premisa que la originó: no fueron "8 de 28 instrucciones parásitas" en el
+sentido de un lane por grupo —el acumulador tiene 4 lanes por grupo y no mapea
+a 8—, sino que se amortizó la *conversión* de las escalas.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
