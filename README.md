@@ -243,6 +243,72 @@ el anillo de KV mueve 8× más bytes por token y posición.
 - La regla de siempre: bisecar con números intermedios, no leer código a ojo.
   El `h_in` idéntico fue lo que puso la lupa dentro de la capa.
 
+## Día 16 — TinyLlama: el cuarto modelo y la ley que los ordena a todos (2026-11-13)
+
+TinyLlama-1.1B-Chat aporta combinaciones que ninguno de los tres anteriores
+tenía: **GQA con ratio 8** (`NH=32`, `NKV=4` — Qwen usaba 6, SmolLM2 1),
+`lm_head` propio en arquitectura Llama, `DH=64`, vocab 32000, `rope_theta` 1e4.
+
+```
+H 2048 / NLY 22 / NH 32 / NKV 4 / DH 64 / INTER 5632 / V 32000
+581,9 MB empaquetado · 155 lineales · 45 aux · 4,500 bits/param
+```
+
+**Entró sin tocar una línea de motor.** Respondió
+`El país de Francia es la capital de Francia, y su nombre es París.` y cierra
+con `</s>`. La prosa es la de un 1.1B; el motor hizo su trabajo.
+
+### La ley de ancho de banda
+
+Poniendo los cuatro modelos en la misma tabla (1 secuencia, 4 hilos), lo
+interesante no es el ranking sino la constante:
+
+| modelo | artefacto | ms/paso | tok/s | **GB/s efectivos** |
+|---|---|---|---|---|
+| Qwen2.5-1.5B | 868,3 MB | 42,7 | 23,4 | 20,3 |
+| R1-Distill-1.5B | 868,3 MB | 43,3 | 23,1 | 20,1 |
+| TinyLlama-1.1B | 581,9 MB | 30,1 | **33,3** | 19,3 |
+| SmolLM2-1.7B | 962,6 MB | 50,5 | 19,8 | 19,1 |
+
+**19,1 – 20,3 GB/s en los cuatro**, o sea 76–80 % del techo medido de
+25,3 GB/s. No es coincidencia: es el mismo motor leyendo pesos a la misma
+velocidad. Que TinyLlama sea el más rápido **no** es que sea mejor modelo, es
+que pesa 33 % menos por token.
+
+La métrica honesta para comparar modelos en `caudal` no es tok/s: es
+**GB/s efectivos**. tok/s se deduce del tamaño del artefacto.
+
+### Batching
+
+| modelo | 1 seq | 4 seq (agregado) | por secuencia |
+|---|---|---|---|
+| TinyLlama-1.1B | 31,4–33,3 | **58,2** | 14,6 |
+| Qwen2.5-1.5B | 23,7 | 43,1 | 10,8 |
+| R1-Distill-1.5B | 23,1 | 39,9 | 10,0 |
+| SmolLM2-1.7B | 19,1–19,8 | 19,9 | 5,0 |
+
+TinyLlama es también el que mejor amortiza en lote (×1,85). SmolLM2 sigue
+siendo el peor (×1,04) por el anillo de KV de `NKV == NH = 32`.
+
+> En lote la cuenta cambia de naturaleza: los pesos se leen **una vez por paso**
+> y salen M tokens. TinyLlama a M=4 mueve 581,9 MB en 68,69 ms = **8,5 GB/s**:
+> ya no es memory-bound, es compute-bound. Es el mismo cambio de régimen que
+> documentó `probe4_batch`.
+
+### Tokenizer: tercera familia
+
+TinyLlama no usa byte-level sino **SentencePiece** (`pre_tokenizer: null`,
+normalizador que antepone `U+2581` y cambia espacios por `U+2581`, decodificador
+con `ByteFallback`). El tokenizer casero aprendió esa rama: BPE sobre el texto
+normalizado, `<0xXX>` para lo que no está en el vocabulario, y `U+2581` → espacio
+al decodificar. Ahora cubre Qwen2, SmolLM2 y Llama-2/Mistral.
+
+**Límite declarado:** al separar por tokens especiales, `_encode_plain` antepone
+un `U+2581` a cada segmento, así que tras `</s>` queda un `▁` que HF quizá no
+pondría. Los ids pueden diferir de los de HF en ese detalle. La prueba del motor
+sigue siendo válida porque **C++ y oráculo usan exactamente los mismos ids**; lo
+que no se puede afirmar es que la tokenización sea bit-idéntica a la de `transformers`.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

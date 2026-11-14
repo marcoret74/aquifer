@@ -91,19 +91,25 @@ GPT2_PAT = (r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+"
 
 
 def _pretok_spec(t):
-    """Devuelve (patron_compilado, separar_digitos).
+    """Devuelve (modo, patron_compilado, separar_digitos).
 
-    Dos familias de tokenizer en el repo:
-      * Qwen2: pre_tokenizer = Sequence[Split(pattern=Regex(...))]  -> usa su regex.
-      * Llama/SmolLM2: Sequence[Digits(individual_digits), ByteLevel(use_regex)]
-        -> regex de GPT-2 y cada digito por separado.
+    Tres familias de tokenizer vistas hasta ahora:
+      * Qwen2   -> Sequence[Split(Regex)]: usar su regex, byte-level.
+      * SmolLM2 -> Sequence[Digits, ByteLevel]: regex de GPT-2 + digitos sueltos.
+      * Llama-2/TinyLlama (SentencePiece) -> pre_tokenizer null y normalizador
+        que antepone U+2581 y cambia espacios por U+2581: NO hay byte-level;
+        el BPE va sobre el texto normalizado y lo que falta en el vocabulario
+        cae a tokens <0xXX> (byte fallback).
     """
-    pt = t.get('pre_tokenizer') or {}
-    if pt.get('type') == 'Sequence':
+    pt = t.get('pre_tokenizer')
+    norm = json.dumps(t.get('normalizer') or {})
+    if pt is None and '\\u2581' in norm:
+        return 'sp', None, False
+    if pt and pt.get('type') == 'Sequence':
         subs = pt.get('pretokenizers', [])
-        dig = any(s.get('type') == 'Digits' for s in subs)
-        return regex.compile(GPT2_PAT), dig
-    return regex.compile(pt['pretokenizers'][0]['pattern']['Regex']), False
+        dig = any(x.get('type') == 'Digits' for x in subs)
+        return 'regex', regex.compile(GPT2_PAT), dig
+    return 'regex', regex.compile(pt['pretokenizers'][0]['pattern']['Regex']), False
 
 
 class Tokenizer:
@@ -115,7 +121,7 @@ class Tokenizer:
             a, b = m.split(' ')
             self.rank[(a, b)] = i
         self.added = {a['content']: a['id'] for a in t.get('added_tokens', [])}
-        self.pat, self.digits_split = _pretok_spec(t)
+        self.mode, self.pat, self.digits_split = _pretok_spec(t)
         self.b2u = _bytes_to_unicode()
         self.u2b = {v: k for k, v in self.b2u.items()}
         # id -> str, para decodificar
@@ -123,7 +129,37 @@ class Tokenizer:
         for s, i in self.added.items():
             self.id2s[i] = s
 
+    def _merge(self, parts):
+        while len(parts) > 1:
+            best, best_r = None, None
+            for i in range(len(parts) - 1):
+                r = self.rank.get((parts[i], parts[i + 1]))
+                if r is not None and (best_r is None or r < best_r):
+                    best_r, best = r, (parts[i], parts[i + 1])
+            if best is None:
+                break
+            out, i = [], 0
+            while i < len(parts):
+                if i < len(parts) - 1 and (parts[i], parts[i + 1]) == best:
+                    out.append(parts[i] + parts[i + 1])
+                    i += 2
+                else:
+                    out.append(parts[i])
+                    i += 1
+            parts = out
+        return parts
+
     def _bpe(self, word):
+        if self.mode == 'sp':
+            # SentencePiece: simbolos = caracteres; lo que no esta en el
+            # vocabulario se parte en sus bytes UTF-8 (<0xXX>).
+            parts = []
+            for ch in word:
+                if ch in self.vocab:
+                    parts.append(ch)
+                else:
+                    parts += ['<0x%02X>' % b for b in ch.encode('utf-8')]
+            return self._merge(parts)
         parts = list(word)
         while len(parts) > 1:
             best, best_r = None, None
@@ -146,6 +182,11 @@ class Tokenizer:
 
     def _encode_plain(self, text):
         ids = []
+        if self.mode == 'sp':
+            s = '\u2581' + text.replace(' ', '\u2581')
+            for piece in self._bpe(s):
+                ids.append(self.vocab[piece])
+            return ids
         for m in self.pat.finditer(text):
             chunk = m.group(0)
             # Digits(individual_digits=true): cada digito es su propio trozo.
@@ -173,6 +214,26 @@ class Tokenizer:
         return ids
 
     def decode(self, ids):
+        if self.mode == 'sp':
+            trozos, pend = [], bytearray()
+            for i in ids:
+                s = self.id2s.get(int(i))
+                if s is None:
+                    continue
+                if len(s) == 6 and s.startswith('<0x') and s.endswith('>'):
+                    try:
+                        pend.append(int(s[3:5], 16))
+                        continue
+                    except ValueError:
+                        pass
+                if pend:
+                    trozos.append(pend.decode('utf-8', 'replace'))
+                    pend = bytearray()
+                trozos.append(s)
+            if pend:
+                trozos.append(pend.decode('utf-8', 'replace'))
+            txt = ''.join(trozos).replace('\u2581', ' ')
+            return txt[1:] if txt.startswith(' ') else txt
         raw = b''
         for i in ids:
             s = self.id2s.get(int(i))
