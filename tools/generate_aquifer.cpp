@@ -263,9 +263,9 @@ struct Ctx {
     }
 };
 
-// Producto punto AVX2 float. La atencion estaba en escalar double: 128 ops
-// por score contra 16 FMAs vectoriales.
+// Producto punto AVX2/SSE4 float.
 inline float dot_f32(const float* __restrict a, const float* __restrict b, std::size_t n) {
+#if defined(__AVX2__)
     __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
     std::size_t i = 0;
     for (; i + 32 <= n; i += 32) {
@@ -283,6 +283,21 @@ inline float dot_f32(const float* __restrict a, const float* __restrict b, std::
     float r = _mm_cvtss_f32(t);
     for (; i < n; ++i) r += a[i] * b[i];
     return r;
+#else
+    __m128 a0 = _mm_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(a + i),      _mm_loadu_ps(b + i)));
+        a1 = _mm_add_ps(a1, _mm_mul_ps(_mm_loadu_ps(a + i + 4),  _mm_loadu_ps(b + i + 4)));
+        a2 = _mm_add_ps(a2, _mm_mul_ps(_mm_loadu_ps(a + i + 8),  _mm_loadu_ps(b + i + 8)));
+        a3 = _mm_add_ps(a3, _mm_mul_ps(_mm_loadu_ps(a + i + 12), _mm_loadu_ps(b + i + 12)));
+    }
+    a0 = _mm_add_ps(_mm_add_ps(a0, a1), _mm_add_ps(a2, a3));
+    a0 = _mm_hadd_ps(a0, a0); a0 = _mm_hadd_ps(a0, a0);
+    float r = _mm_cvtss_f32(a0);
+    for (; i < n; ++i) r += a[i] * b[i];
+    return r;
+#endif
 }
 
 void rmsnorm(const float* x, const float* w, float* out, std::size_t n, float eps) {
@@ -389,6 +404,7 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                         default: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     }
                     continue;
+#if defined(__AVX2__)
                 } else if (j.L->kmin) {
                     const std::uint8_t* hp = j.L->kmin + n0 * (K / 256) * 16;
                     switch (M) {
@@ -413,6 +429,12 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                     case 7: caudal::gemv_int4_g32_M<7>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     default: caudal::gemv_int4_g32_M<8>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                 }
+#else
+                } else {
+                    std::fprintf(stderr, "Error: solo la cuantizacion afin es soportada en SSE4.2\n");
+                    std::abort();
+                }
+#endif
             }
             off = hi;
         }
@@ -760,11 +782,25 @@ int main(int argc, char** argv) {
                     float* oacc = o.data() + (i * cfg.NH + hh) * cfg.DH;
                     std::fill(oacc, oacc + cfg.DH, 0.0f);
                     for (std::size_t s = 0; s < n; ++s) {
+#if defined(__AVX2__)
                         const __m256 p = _mm256_set1_ps(arow[s] * inv);
                         const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
                         for (std::size_t j = 0; j + 8 <= cfg.DH; j += 8)
                             _mm256_storeu_ps(oacc + j, _mm256_fmadd_ps(
                                 p, _mm256_loadu_ps(vs + j), _mm256_loadu_ps(oacc + j)));
+#else
+                        const __m128 p = _mm_set1_ps(arow[s] * inv);
+                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                        std::size_t j = 0;
+                        for (; j + 4 <= cfg.DH; j += 4) {
+                            __m128 cur = _mm_loadu_ps(oacc + j);
+                            __m128 v = _mm_loadu_ps(vs + j);
+                            _mm_storeu_ps(oacc + j, _mm_add_ps(cur, _mm_mul_ps(p, v)));
+                        }
+                        for (; j < cfg.DH; ++j) {
+                            oacc[j] += (arow[s] * inv) * vs[j];
+                        }
+#endif
                     }
                 }
             }
