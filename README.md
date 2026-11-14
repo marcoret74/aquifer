@@ -565,6 +565,46 @@ es la premisa que la originó: no fueron "8 de 28 instrucciones parásitas" en e
 sentido de un lane por grupo —el acumulador tiene 4 lanes por grupo y no mapea
 a 8—, sino que se amortizó la *conversión* de las escalas.
 
+## Día 21 — ¿Somos más rápidos que llama.cpp? Depende del formato (2026-11-13)
+
+Comparación repetida **después** de la optimización del Día 20, en bloques
+consecutivos (no intercalados: nuestro `slurp` expulsa su GGUF de la caché).
+
+### Qwen2.5-1.5B — nuestro formato pesa 22,3 % menos
+
+| | caudal (868 MB, 4,50 bpw) | llama.cpp (1117 MB, 5,79 bpw) |
+|---|---|---|
+| bloque 1 | 23,8 · 23,6 · 23,3 | 20,25 · 20,22 · 20,16 |
+| bloque 2 | 21,9 · 21,8 · 20,7 | 20,90 · 20,53 · 20,30 |
+| **mediana** | **22,85** | **20,28** |
+
+**+12,7 % en tok/s.** Pero por byte seguimos por debajo: 20,7 GB/s contra
+23,4 GB/s. La ventaja en tok/s viene de **leer menos**, no de mover más rápido.
+
+### TinyLlama-1.1B — formatos casi iguales (4,50 vs 5,16 bpw)
+
+| | caudal (582 MB) | llama.cpp (667 MB) |
+|---|---|---|
+| bloque limpio | 32,4 · 32,0 · 31,7 | 32,32 · 32,09 · 31,52 |
+| **mediana** | **32,0** | **32,09** |
+
+**Empate.** (Un segundo bloque dio 30,9 vs 10,8, con ambos motores degradados:
+la máquina se cayó a mitad de corrida y ese bloque no vale.)
+
+### La respuesta
+
+- **A igual formato: empate.** TinyLlama lo demuestra con 13 % de diferencia de
+  bytes, donde la ventaja de compresión casi no pesa.
+- **Con nuestro formato más chico: ganamos en tok/s** (+12,7 % en Qwen), porque
+  leemos 22,3 % menos bytes.
+- **Por byte: ellos siguen adelante** (23,4 contra 20,7 GB/s). Lo que igualamos
+  en el Día 20 fue los **ciclos por byte**, que es otra cosa: mide eficiencia
+  computacional, no caudal.
+
+Así que "más rápidos" no es una propiedad del motor: es una propiedad del
+**par motor+formato**. Y el formato más chico se paga en calidad, que sigue sin
+medirse de forma comparable.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
