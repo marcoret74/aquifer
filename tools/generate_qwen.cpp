@@ -61,6 +61,7 @@ struct Cfg {
 struct Lin {
     std::size_t N{0}, K{0}, G{0}, stride{0};
     const std::uint8_t* packed{nullptr};
+    const std::uint8_t* kmin{nullptr};      // headers de 16 B por super-bloque
     const _Float16* scale{nullptr};
     std::size_t row_bytes{0};
 };
@@ -347,6 +348,20 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                 const _Float16* sc = j.L->stride ? nullptr
                                                  : (j.L->scale + n0 * j.L->G);
                 float* yy = j.y;   // M*N, fila m en yy + m*N
+                if (j.L->kmin) {
+                    const std::uint8_t* hp = j.L->kmin + n0 * (K / 256) * 16;
+                    switch (M) {
+                        case 1: caudal::gemv_int4_kmin_M<1>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 2: caudal::gemv_int4_kmin_M<2>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 3: caudal::gemv_int4_kmin_M<3>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 4: caudal::gemv_int4_kmin_M<4>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 5: caudal::gemv_int4_kmin_M<5>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 6: caudal::gemv_int4_kmin_M<6>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 7: caudal::gemv_int4_kmin_M<7>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        default: caudal::gemv_int4_kmin_M<8>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    }
+                    continue;
+                }
                 switch (M) {
                     case 1: caudal::gemv_int4_g32_M<1>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     case 2: caudal::gemv_int4_g32_M<2>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
@@ -509,7 +524,19 @@ int main(int argc, char** argv) {
         std::ifstream fi(A + "/index.txt");
         std::string kind;
         while (fi >> kind) {
-            if (kind == "LINEAR") {
+            if (kind == "LINEARK") {              // super-bloque + minimo
+                std::string rest; std::getline(fi, rest);
+                std::istringstream is(rest);
+                std::string name; is >> name;
+                std::size_t N2, K2, off2, pb2, so2, sb2;
+                is >> N2 >> K2 >> off2 >> pb2 >> so2 >> sb2;
+                Lin L; L.N = N2; L.K = K2; L.row_bytes = K2 / 2;
+                L.packed = c.wbin.data() + off2;
+                L.scale = nullptr;
+                L.kmin = c.wbin.data() + c.wbase + so2;
+                L.stride = 0; L.G = K2 / 32;
+                c.lin[name] = L;
+            } else if (kind == "LINEAR") {
                 std::string rest; std::getline(fi, rest);
                 std::istringstream is(rest);
                 std::string name; is >> name;

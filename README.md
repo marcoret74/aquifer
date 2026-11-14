@@ -686,6 +686,61 @@ La Opción A queda **agotada como palanca barata**, con su número medido. Las
 dos que quedan: aceptar el canje documentado (22 % menos bytes por 5,5 % de
 calidad por bit), o ir a kernel con super-bloques.
 
+## Día 24 — Super-bloque con mínimo: calidad sí, velocidad todavía no (2026-11-13)
+
+Implementado el esquema tipo Q4_K **con test primero**, como se acordó.
+
+### Formato (4,50 bits/peso exactos, mismo tamaño de artefacto)
+
+Super-bloque de 256 valores = 8 grupos de 32. Header de 16 B:
+
+```
+[0..1] d fp16   [2..3] dmin fp16   [4..15] 16 campos de 6 bits (8 sc + 8 m)
+w = d*sc_g*q + b_g ,  b_g = dmin*(m_g - 32)   q in [0,15]
+```
+
+El mínimo va **centrado en 32 y con signo**. La primera versión usaba `m >= 0`
+y el test la cazó: un grupo con mínimo positivo (>0) se aplastaba entero.
+
+### Lo que se ganó (medido)
+
+| artefacto | MB | bpw | PPL (2ª mitad) | BPC |
+|---|---|---|---|---|
+| g32 (escalas fp16) | 868,3 | 4,50 | 34,89 | 1,8257 |
+| **kmin (super-bloque)** | **868,3** | **4,50** | **31,90** | **1,7798** |
+| bf16 (techo) | — | 16,0 | 29,12 | 1,7329 |
+
+**−2,5 % de BPC (−8,5 % de ppl) al mismo tamaño**, mejor que la simulación que
+predecía 2,2. Error de cuantización medio: 10,02 % → **8,10 %**.
+
+`tests/test_kmin.cpp` da **0 fallos** con error máximo 3e-3 sobre |y| de 8–16
+(0,04 %, atribuible al redondeo fp16 de `d`).
+
+### Lo que se perdió
+
+**22 → 13,9 tok/s.** `perf`: 101 G → **203 G instrucciones** (+100 %), ciclos
+104 G → 126 G (+20 %). Tres intentos de arreglo (vectorizar la corrección del
+mínimo, decodificador sin ramas, inline con `memcpy`) solo llevaron 11,8 → 13,9.
+
+**Hipótesis refutadas por medición:** el decodificador de 6 bits no es el
+problema (232 instr/super-bloque es ~10× lo esperable, pero desenrollarlo no
+cambió nada), y tampoco hay throttling: kmin corre a **3600 MHz** contra los
+3400 de g32.
+
+### El camino, según el panel (Claude y Gemini, por separado)
+
+El error es **hacer fp32 por cada grupo de 32** en vez de una vez por
+super-bloque. ggml lo resuelve así:
+
+1. Acumular `sc_g * A_g` en **int32** dentro del super-bloque (A_g = suma del
+   producto en ese grupo).
+2. Resolver el término del mínimo con **un** `madd` contra `xgsum`.
+3. Multiplicar por `d` y `dmin` **una sola vez cada 256 valores**.
+4. Y de paso cuantizar `x` **por super-bloque** (Q8_K) en vez de por grupo de
+   32, que elimina el `xscale` por grupo del bucle.
+
+Eso es reescribir el kernel y el camino de cuantización de `x`. Pendiente.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

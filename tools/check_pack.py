@@ -19,6 +19,35 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from oracle_qwen import SafeTensors  # noqa: E402
 
 
+def dequant_kmin(packed_u8, hdr_u8, N, K):
+    """Esquema con minimo: w = d*sc_g*q + dmin*(m_g-32), q in [0,15]."""
+    SBn = K // 256
+    q = np.empty((N, K), dtype=np.float32)
+    q[:, 0::2] = (packed_u8 & 0x0F)
+    q[:, 1::2] = (packed_u8 >> 4) & 0x0F
+    h = np.ascontiguousarray(hdr_u8).reshape(N, SBn, 16)
+    d = h[:, :, 0:2].copy().view(np.float16).astype(np.float32).reshape(N, SBn, 1)
+    dmin = h[:, :, 2:4].copy().view(np.float16).astype(np.float32).reshape(N, SBn, 1)
+    lo = np.zeros((N, SBn), np.uint64)
+    hi = np.zeros((N, SBn), np.uint64)
+    for i in range(8):
+        lo |= h[:, :, 4 + i].astype(np.uint64) << np.uint64(8 * i)
+    for i in range(4):
+        hi |= h[:, :, 12 + i].astype(np.uint64) << np.uint64(8 * i)
+    def campo(t):
+        bit = 6 * t
+        if bit >= 64:
+            return (hi >> np.uint64(bit - 64)) & np.uint64(0x3F)
+        if bit + 6 <= 64:
+            return (lo >> np.uint64(bit)) & np.uint64(0x3F)
+        return ((lo >> np.uint64(bit)) | (hi << np.uint64(64 - bit))) & np.uint64(0x3F)
+    sc = np.stack([campo(t) for t in range(8)], axis=2).astype(np.float32)
+    mn = np.stack([campo(8 + t) for t in range(8)], axis=2).astype(np.float32)
+    s_eff = (d * sc).reshape(N, K // 32, 1)
+    b_eff = (dmin * (mn - 32.0)).reshape(N, K // 32, 1)
+    return (q.reshape(N, K // 32, 32) * s_eff + b_eff).reshape(N, K)
+
+
 def dequant(packed_u8, scales_u8, N, K, G):
     """packed_u8: (N, K/2) uint8 con dos nibbles por byte, ya con offset +8.
 

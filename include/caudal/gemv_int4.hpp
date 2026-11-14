@@ -42,6 +42,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #if defined(__AVX2__)
 #  include <immintrin.h>
@@ -397,6 +398,147 @@ inline void gemv_int4_g32_M(const Shape& s,
             t = _mm_hadd_ps(t, t);
             t = _mm_hadd_ps(t, t);
             y[std::size_t(m) * ystride + n] = _mm_cvtss_f32(t);
+        }
+    }
+}
+#endif
+
+
+// -----------------------------------------------------------------------------
+//  Esquema con minimo por grupo (super-bloque de 256 = 8 grupos de 32).
+// -----------------------------------------------------------------------------
+//  Header de 16 B por super-bloque (0,5 bits/valor, igual que las escalas fp16
+//  por grupo de 32):  [0..1] d fp16   [2..3] dmin fp16   [4..15] 16 campos 6 bits
+//  Reconstruccion:  w = d*sc_g*q + b_g ,  b_g = dmin*(m_g - 32)  (CON SIGNO)
+//  Producto:        Sum w*x = Sum_g xscale_g * ( s_g*A_g + b_g*B_g )
+//  con s_g = d*sc_g, A_g = Sum q*xq, B_g = Sum xq (xgsum, ya existente).
+//  El minimo centrado en 32 cubre grupos negativos Y positivos: con m>=0 fijo,
+//  un grupo con minimo positivo (>0) se aplastaba (bug encontrado por el test).
+inline void kmin_header(const std::uint8_t* h, float& d, float& dmin,
+                        int sc[8], int m[8]) {
+    _Float16 dh, dmh;
+    std::memcpy(&dh, h, 2);
+    std::memcpy(&dmh, h + 2, 2);
+    d = static_cast<float>(dh);
+    dmin = static_cast<float>(dmh);
+    std::uint64_t lo = 0, hi = 0;
+    std::memcpy(&lo, h + 4, 8);
+    std::uint32_t hi32 = 0;
+    std::memcpy(&hi32, h + 12, 4);
+    hi = hi32;
+    int vals[16];
+#pragma GCC unroll 16
+    for (int t = 0; t < 16; ++t) {
+        const int bit = 6 * t;
+        std::uint64_t v;
+        if (bit >= 64) v = hi >> (bit - 64);
+        else if (bit + 6 <= 64) v = lo >> bit;
+        else v = (lo >> bit) | (hi << (64 - bit));
+        vals[t] = int(v & 0x3F);
+    }
+#pragma GCC unroll 8
+    for (int g = 0; g < 8; ++g) { sc[g] = vals[g]; m[g] = vals[8 + g]; }
+}
+
+#if defined(__AVX2__)
+template <unsigned M>
+inline void gemv_int4_kmin_M(const Shape& s,
+                             const std::uint8_t* __restrict w,
+                             const std::uint8_t* __restrict hdr,
+                             const std::int32_t* __restrict xgsum,
+                             const std::int8_t* __restrict xperm,
+                             const float* __restrict xscale,
+                             float* __restrict y,
+                             std::size_t ystride) {
+    const __m256i m0f = _mm256_set1_epi8(0x0F);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const std::size_t G = s.K / 32;
+    const std::size_t SBn = s.K / 256;
+
+    for (std::size_t n = 0; n < s.N; ++n) {
+        const std::uint8_t* row = w + n * (s.K / 2);
+        const std::uint8_t* hrow = hdr + n * SBn * 16;
+        __m256 facc[M], minv[M];
+#pragma GCC unroll 8
+        for (unsigned m = 0; m < M; ++m) { facc[m] = _mm256_setzero_ps(); minv[m] = facc[m]; }
+
+        for (std::size_t sb = 0; sb < SBn; ++sb) {
+            const std::uint8_t* h = hrow + sb * 16;
+            _Float16 dh, dmh;
+            std::memcpy(&dh, h, 2);
+            std::memcpy(&dmh, h + 2, 2);
+            const float d = static_cast<float>(dh);
+            const float dmin = static_cast<float>(dmh);
+            std::uint64_t lo64;
+            std::memcpy(&lo64, h + 4, 8);
+            std::uint32_t hi32;
+            std::memcpy(&hi32, h + 12, 4);
+            const std::uint64_t hi64 = hi32;
+            int vals[16];
+#pragma GCC unroll 16
+            for (int t = 0; t < 16; ++t) {
+                const int bit = 6 * t;
+                std::uint64_t v;
+                if (bit >= 64) v = hi64 >> (bit - 64);
+                else if (bit + 6 <= 64) v = lo64 >> bit;
+                else v = (lo64 >> bit) | (hi64 << (64 - bit));
+                vals[t] = int(v & 0x3F);
+            }
+            const __m256 b8 = _mm256_mul_ps(
+                _mm256_cvtepi32_ps(_mm256_setr_epi32(
+                    vals[8] - 32, vals[9] - 32, vals[10] - 32, vals[11] - 32,
+                    vals[12] - 32, vals[13] - 32, vals[14] - 32, vals[15] - 32)),
+                _mm256_set1_ps(dmin));
+#pragma GCC unroll 8
+            for (unsigned m = 0; m < M; ++m) {
+                const std::size_t base = std::size_t(m) * G + sb * 8;
+                const __m256 prod = _mm256_mul_ps(
+                    _mm256_loadu_ps(xscale + base),
+                    _mm256_cvtepi32_ps(_mm256_loadu_si256(
+                        reinterpret_cast<const __m256i*>(xgsum + base))));
+                minv[m] = _mm256_fmadd_ps(b8, prod, minv[m]);
+            }
+#pragma GCC unroll 4
+            for (int j = 0; j < 4; ++j) {
+                const std::size_t bb = sb * 4 + std::size_t(j);
+                const __m256i v = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(row + bb * 32));
+                const __m256i lo = _mm256_and_si256(v, m0f);
+                const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
+                const __m256i a = _mm256_unpacklo_epi8(lo, hi);
+                const __m256i b = _mm256_unpackhi_epi8(lo, hi);
+                const int g0 = 2 * j, g1 = 2 * j + 1;
+                const float s0 = d * float(vals[g0]);
+                const float s1 = d * float(vals[g1]);
+#pragma GCC unroll 8
+                for (unsigned m = 0; m < M; ++m) {
+                    const std::int8_t* xm = xperm + std::size_t(m) * s.K + bb * 64;
+                    const __m256i x0 = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i*>(xm));
+                    const __m256i x1 = _mm256_loadu_si256(
+                        reinterpret_cast<const __m256i*>(xm + 32));
+                    __m256i acc = _mm256_madd_epi16(_mm256_maddubs_epi16(a, x0), ones16);
+                    acc = _mm256_add_epi32(
+                        acc, _mm256_madd_epi16(_mm256_maddubs_epi16(b, x1), ones16));
+                    const std::size_t o0 = std::size_t(m) * G + sb * 8 + std::size_t(g0);
+                    const __m256 sv = _mm256_set_m128(
+                        _mm_set1_ps(s1 * xscale[o0 + 1]),
+                        _mm_set1_ps(s0 * xscale[o0]));
+                    facc[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv, facc[m]);
+                }
+            }
+        }
+#pragma GCC unroll 8
+        for (unsigned m = 0; m < M; ++m) {
+            auto hsum = [](__m256 v) {
+                __m128 l = _mm256_castps256_ps128(v);
+                __m128 h = _mm256_extractf128_ps(v, 1);
+                __m128 t = _mm_add_ps(l, h);
+                t = _mm_hadd_ps(t, t);
+                t = _mm_hadd_ps(t, t);
+                return _mm_cvtss_f32(t);
+            };
+            y[std::size_t(m) * ystride + n] = hsum(facc[m]) + hsum(minv[m]);
         }
     }
 }

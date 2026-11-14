@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from check_pack import dequant          # noqa: E402
+from check_pack import dequant, dequant_kmin   # noqa: E402
 from oracle_qwen import Qwen, Tokenizer  # noqa: E402
 
 
@@ -29,7 +29,11 @@ class Artefacto:
             f = line.split()
             if not f:
                 continue
-            if f[0] == 'LINEAR' and len(f) == 8:       # split
+            if f[0] == 'LINEARK' and len(f) == 8:      # kmin
+                self.lin[f[1]] = dict(N=int(f[2]), K=int(f[3]), off=int(f[4]),
+                                      pb=int(f[5]), soff=int(f[6]), sb=int(f[7]),
+                                      kmin=True)
+            elif f[0] == 'LINEAR' and len(f) == 8:     # split
                 self.lin[f[1]] = dict(N=int(f[2]), K=int(f[3]), off=int(f[4]),
                                       pb=int(f[5]), soff=int(f[6]), sb=int(f[7]))
             elif f[0] == 'LINEAR' and len(f) == 7:     # intercalado
@@ -58,6 +62,11 @@ class Artefacto:
             return torch.from_numpy(a)
         m = self.lin[nombre]
         N, K = m['N'], m['K']
+        if m.get('kmin'):
+            pk = np.frombuffer(self.W, np.uint8, N * (K // 2), m['off']).reshape(N, K // 2)
+            hb = N * (K // 256) * 16
+            hd = np.frombuffer(self.S, np.uint8, hb, m['soff']).reshape(N, K // 256 * 16)
+            return torch.from_numpy(dequant_kmin(pk, hd, N, K))
         if 'stride' in m:                               # intercalado
             G = m['groups']
             rows = np.frombuffer(self.W, np.uint8, N * m['stride'],

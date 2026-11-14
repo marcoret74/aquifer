@@ -91,6 +91,65 @@ class SafeTensors:
 CLIP_GRID = ()
 
 
+def quantize_kmin(w):
+    """Super-bloque de 256 con minimo CON SIGNO. 4,50 bpw exactos.
+
+    w = d*sc_g*q + dmin*(m_g-32),  q in [0,15], sc y m de 6 bits.
+    Header de 16 B por super-bloque: [d fp16][dmin fp16][12 B de 16 campos].
+    """
+    N, K = w.shape
+    if K % 256:
+        raise SystemExit(f'K={K} no es multiplo de 256')
+    SBn, G = K // 256, K // 32
+    pk = np.empty((N, K // 2), dtype=np.uint8)
+    hdr = np.empty((N, SBn * 16), dtype=np.uint8)
+    num2 = den2 = 0.0
+    filas = max(1, min(N, int(1.5e8 // max(1, K * 4))))
+    for r0 in range(0, N, filas):
+        r1 = min(N, r0 + filas)
+        x = np.ascontiguousarray(w[r0:r1]).reshape(r1 - r0, SBn, 8, 32)
+        lo = x.min(axis=3)
+        hi = x.max(axis=3)
+        sc = (hi - lo) / 15.0
+        d = sc.max(axis=2, keepdims=True) / 63.0
+        d = np.maximum(d, np.float32(1e-8))
+        scq = np.clip(np.rint(sc / d), 0, 63)
+        b = lo
+        dmin = np.maximum(np.abs(b).max(axis=2, keepdims=True) / 32.0, np.float32(1e-8))
+        mq = np.clip(np.rint(b / dmin) + 32, 0, 63)
+        s_eff = d * scq
+        b_eff = dmin * (mq - 32)
+        q = np.clip(np.rint((x - b_eff[:, :, :, None])
+                            / np.maximum(s_eff[:, :, :, None], np.float32(1e-8))), 0, 15)
+        deq = s_eff[:, :, :, None] * q + b_eff[:, :, :, None]
+        num2 += float(((x - deq) ** 2).sum())
+        den2 += float((x.astype(np.float64) ** 2).sum())
+        u = (q.astype(np.int16).reshape(r1 - r0, K)).astype(np.uint8)
+        pk[r0:r1] = u[:, 0::2] | (u[:, 1::2] << 4)
+        # header
+        vals = np.concatenate([scq, mq], axis=2).astype(np.uint64)   # (rows,SBn,16)
+        lo64 = np.zeros((r1 - r0, SBn), np.uint64)
+        hi64 = np.zeros((r1 - r0, SBn), np.uint64)
+        for t in range(16):
+            v = vals[:, :, t] & np.uint64(0x3F)
+            bit = 6 * t
+            if bit >= 64:
+                hi64 |= v << np.uint64(bit - 64)
+            elif bit + 6 <= 64:
+                lo64 |= v << np.uint64(bit)
+            else:
+                lo64 |= v << np.uint64(bit)
+                hi64 |= v >> np.uint64(64 - bit)
+        h = hdr[r0:r1].reshape(r1 - r0, SBn, 16)
+        h[:, :, 0:2] = (d[:, :, 0].astype(np.float16)).view(np.uint8).reshape(r1 - r0, SBn, 2)
+        h[:, :, 2:4] = (dmin[:, :, 0].astype(np.float16)).view(np.uint8).reshape(r1 - r0, SBn, 2)
+        for i in range(8):
+            h[:, :, 4 + i] = ((lo64 >> np.uint64(8 * i)) & np.uint64(0xFF)).astype(np.uint8)
+        for i in range(4):
+            h[:, :, 12 + i] = ((hi64 >> np.uint64(8 * i)) & np.uint64(0xFF)).astype(np.uint8)
+    return pk, hdr, (np.sqrt(num2) / (np.sqrt(den2) or 1.0))
+
+
 def quantize(w, group=GROUP):
     """w: float32 [N, K] -> (packed uint8 [N, K/2], scales fp16 [N, G], err)"""
     N, K = w.shape
@@ -189,6 +248,9 @@ def main():
     ap.add_argument('--layout-out', default=None)
     ap.add_argument('--layout-tokens', type=int, default=2,
                     help='cuantos x sinteticos para el set de 5 archivos')
+    ap.add_argument('--scheme', default='g32', choices=['g32', 'kmin'],
+                    help='kmin = super-bloque 256 con minimo con signo (4,50 bpw, '
+                         '+2,2 puntos de BPC medidos en simulacion)')
     ap.add_argument('--clip-grid', default='',
                     help='factores k separados por coma para s = k*amax/7 por '
                          'grupo (vacio = amax/7). Ej: 0.70,0.80,0.90,1.0')
@@ -258,8 +320,13 @@ def main():
     try:
         for name, (N, K) in todo:
             w = st.tensor_f32(name)
-            packed, scales, err = quantize(w, GROUP)
+            if args.scheme == 'kmin':
+                packed, scales, err = quantize_kmin(w)
+            else:
+                packed, scales, err = quantize(w, GROUP)
             total_params += N * K
+            if args.scheme == 'kmin' and not splitted:
+                raise SystemExit('--scheme kmin exige --layout split')
 
             rb, sbb = K // 2, (K // GROUP) * 2
             if splitted:
@@ -267,11 +334,17 @@ def main():
                 fw.write(packed.tobytes())
                 os_ = align(fs.tell()); fs.write(b'\0' * (os_ - fs.tell()))
                 fs.write(scales.tobytes())
-                index[name] = {'N': int(N), 'K': int(K), 'groups': int(K // GROUP),
-                               'base_off': ow, 'stride': 0, 'scale_off': os_,
-                               'packed_bytes': int(packed.size),
-                               'scale_bytes': int(scales.size * 2),
-                               'quant_err': round(err, 6)}
+                if args.scheme == 'kmin':
+                    index[name] = {'N': int(N), 'K': int(K), 'kmin': True,
+                                   'base_off': ow, 'packed_bytes': int(packed.size),
+                                   'scale_off': os_, 'scale_bytes': int(scales.size),
+                                   'quant_err': round(err, 6)}
+                else:
+                    index[name] = {'N': int(N), 'K': int(K), 'groups': int(K // GROUP),
+                                   'base_off': ow, 'stride': 0, 'scale_off': os_,
+                                   'packed_bytes': int(packed.size),
+                                   'scale_bytes': int(scales.size * 2),
+                                   'quant_err': round(err, 6)}
             else:
                 if args.stride_align > 0:
                     a_ = args.stride_align
@@ -328,7 +401,10 @@ def main():
     # aux.bin   : todos los tensores 1-D (normas y biases) en float32
     lines = []
     for name, m in index.items():
-        if splitted:
+        if m.get('kmin'):
+            lines.append(f'LINEARK {name} {m["N"]} {m["K"]} {m["base_off"]} '
+                         f'{m["packed_bytes"]} {m["scale_off"]} {m["scale_bytes"]}')
+        elif splitted:
             lines.append(f'LINEAR {name} {m["N"]} {m["K"]} {m["base_off"]} '
                          f'{m["packed_bytes"]} {m["scale_off"]} {m["scale_bytes"]}')
         else:
