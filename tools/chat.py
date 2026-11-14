@@ -88,8 +88,8 @@ def main():
         return local_art
 
     ap = argparse.ArgumentParser(description="Chat interactivo en Aquifer Engine (Zero-Copy Paging, 5.00 bpw)")
-    ap.add_argument("--model", choices=["qwen", "qwen05", "coder", "r1", "tiny", "smol2"], default="qwen",
-                    help="Modelo: 'qwen' (1.5B), 'qwen05' (0.5B rápido), 'coder' (1.5B Coder), 'r1' (R1 Distill), 'tiny' (1.1B), 'smol2' (1.7B)")
+    ap.add_argument("--model", choices=["qwen", "qwen05", "qwen3", "coder", "r1", "tiny", "smol2"], default="qwen",
+                    help="Modelo: 'qwen' (1.5B), 'qwen05' (0.5B rápido), 'qwen3' (3B Instruct), 'coder' (1.5B Coder), 'r1' (R1 Distill), 'tiny' (1.1B), 'smol2' (1.7B)")
     ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_aquifer")
     ap.add_argument("--artifact", default=None, help="Ruta al artefacto cuantizado")
     ap.add_argument("--tokenizer", default=None, help="Ruta a tokenizer.json")
@@ -125,6 +125,19 @@ def main():
         model_title = "Qwen 2.5-0.5B Instruct (Ultra-Rápido ~52 tok/s)"
         bot_color = BLUE
         bot_label = "Qwen-0.5B"
+        eos_str = "151643,151645"
+    elif args.model == "qwen3":
+        if args.artifact is None:
+            args.artifact = resolve_artifact("qwen3b_affine")
+        if args.tokenizer is None:
+            args.tokenizer = "/home/marco/.cache/caudal/qwen3b/tokenizer.json"
+        if args.system is None:
+            args.system = "Eres un asistente servicial que responde siempre en español de forma concisa."
+        if args.n is None:
+            args.n = 512
+        model_title = "Qwen 2.5-3B Instruct (Aquifer Zero-Copy Paging)"
+        bot_color = CYAN
+        bot_label = "Qwen-3B"
         eos_str = "151643,151645"
     elif args.model == "coder":
         if args.artifact is None:

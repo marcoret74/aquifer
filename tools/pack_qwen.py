@@ -65,6 +65,11 @@ class _SingleSafeTensors:
         e = self.header[name]
         return e['dtype'], e['shape'], e['data_offsets']
 
+    def raw_bytes(self, name):
+        dtype, shape, (a, b) = self.info(name)
+        self.f.seek(self.data_start + a)
+        return self.f.read(b - a)
+
     def tensor_f32(self, name):
         """Devuelve float32 [..] desde BF16 o F16 o F32."""
         dtype, shape, (a, b) = self.info(name)
@@ -133,6 +138,10 @@ class SafeTensors:
     def info(self, name):
         sf = self.tensor_to_shard[name]
         return self.shards[sf].info(name)
+
+    def raw_bytes(self, name):
+        sf = self.tensor_to_shard[name]
+        return self.shards[sf].raw_bytes(name)
 
     def tensor_f32(self, name):
         sf = self.tensor_to_shard[name]
@@ -531,10 +540,8 @@ def main():
     # embed_tokens crudo en bf16 (lookup exacto, no cuantizado)
     if 'model.embed_tokens.weight' in st.header:
         e = st.header['model.embed_tokens.weight']
-        a, b = e['data_offsets']
-        st.f.seek(st.data_start + a)
         with open(os.path.join(args.out, 'embed.bf16'), 'wb') as fe:
-            fe.write(st.f.read(b - a))
+            fe.write(st.raw_bytes('model.embed_tokens.weight'))
         lines.append(f'EMBED model.embed_tokens.weight {e["shape"][0]} {e["shape"][1]}')
 
     # model.txt: hiperparametros en una linea, para que el C++ no parsee JSON
