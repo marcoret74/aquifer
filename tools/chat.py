@@ -97,7 +97,13 @@ def main():
     ap.add_argument("--n", type=int, default=None, help="Tokens máximos generados por turno")
     ap.add_argument("--ctx", type=int, default=1024, help="Ventana de contexto")
     ap.add_argument("--system", default=None, help="Prompt de sistema")
+    ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
+
+    if args.diamond is not None and args.bin == default_bin:
+        diamond_bin = os.path.join(repo_dir, "build", "generate_aquifer_diamond")
+        if os.path.exists(diamond_bin):
+            args.bin = diamond_bin
 
     # Configuraciones específicas por modelo
     if args.model == "r1":
@@ -214,6 +220,8 @@ def main():
         "--ctx", str(args.ctx),
         "--eos", eos_str
     ]
+    if args.diamond is not None:
+        cmd.extend(["--diamond", str(args.diamond)])
 
     proc = subprocess.Popen(
         cmd,
