@@ -328,6 +328,70 @@ Queda una diferencia conocida: en SmolLM2, `\n\n` seguido de dígito se parte en
 dos `Ċ` en vez de fusionarse (`(?!\S)` no backtracks igual en el crate `regex`
 de Rust que en el módulo `regex` de Python). No afecta a ningún prompt usado.
 
+## Día 17 — Contra llama.cpp: empate en tok/s, derrota por byte (2026-11-13)
+
+Hasta hoy la consigna del proyecto era explícita: **no usar llama.cpp, ni como
+baseline**. La pregunta por la comparación la levanta, así que se midió.
+
+Sin `cmake` en la máquina, se usó el binario prebuilt `b12374`
+(`llama-b12374-bin-ubuntu-x64`) y `llama-bench`, que mide generación pura
+(`tg128`) igual que nuestro `--n 128`.
+
+### Protocolo
+
+1. Reboot, y esperar a que baje el load (a los 2 min seguía en 2,15).
+2. Calentamiento descartado por motor y modelo.
+3. **Bloques consecutivos** por motor (5 corridas), no intercalado: `caudal`
+   hace `slurp` de 868 MB y **expulsa el GGUF de la caché de página**, así que
+   intercalar penalizaba a llama.cpp por un artefacto del protocolo, no por el
+   motor.
+4. `taskset -c 0-3`, 4 hilos, 128 tokens, mejor de 5.
+
+> ⚠️ **El ruido manda.** El mismo GGUF, mismo comando, dio **22,81 → 18,06 →
+> 13,47 tok/s** en tres corridas seguidas. Con governor en `powersave` y 15 W no
+> se puede resolver una diferencia de pocos puntos porcentuales. Los números de
+> abajo son *mejor de 5*, no promedios.
+
+### Resultados
+
+| modelo | motor | artefacto | bits/peso | tok/s | **GB/s** | % del techo |
+|---|---|---|---|---|---|---|
+| Qwen2.5-1.5B | caudal | 868 MB | **4,50** | 21,1 | 18,3 | 72 % |
+| Qwen2.5-1.5B | llama.cpp Q4_K_M | 1117 MB | 5,79 | 22,8 | 25,5 | 101 % |
+| Qwen2.5-1.5B | llama.cpp Q4_0 | 1006 MB | 4,50 | 19,3 | 19,4 | 77 % |
+| TinyLlama-1.1B | caudal | 582 MB | **4,50** | 30,9 | 18,0 | 71 % |
+| TinyLlama-1.1B | llama.cpp Q4_K_M | 667 MB | 5,16 | 30,9 | 20,6 | 81 % |
+
+El `Q4_0` con embedding a 4 bits se generó con `llama-quantize
+--token-embedding-type q4_0 --output-tensor-type q4_0` para emparejar bits/peso.
+
+### Lo que dice y lo que no
+
+- **En tok/s hay empate.** TinyLlama: 30,9 contra 30,86. Qwen: 21,1 contra 22,8,
+  pero con ±20 % de ruido, así que no es una diferencia.
+- **Por byte, llama.cpp gana.** 77–101 % del techo contra nuestro 71–72 %. El
+  kernel de `caudal` **deja entre 10 y 25 % de ancho de banda sin usar**.
+- **Nuestra paridad en tok/s no es gratis**: viene de guardar menos bits. Qwen:
+  4,50 contra 5,79; TinyLlama: 4,50 contra 5,16. Q4_K_M mantiene el embedding y
+  la salida en ~6 bits y nosotros los bajamos a 4, y ese tensor es el `lm_head`
+  atado — o sea, toca la calidad directamente. Nuestro ppl medido es 4,092
+  (+22,7 % sobre bf16); **el de ellos no se midió**, así que no se puede afirmar
+  «misma calidad, menos bytes».
+- Con bits/peso emparejados (Q4_0, 4,50), llama.cpp da 19,3 y nosotros 21,1,
+  otra vez dentro del ruido.
+
+### Conclusión honesta
+
+**No somos más rápidos que llama.cpp.** Somos comparables en tok/s con estos dos
+modelos, y ellos son más eficientes por byte. La lectura correcta del resultado
+es la inversa de la celebración: el motor propio está a la altura en velocidad,
+pero el kernel todavía tiene un 10–25 % de margen contra el techo de silicio, y
+la ventaja de bytes es una decisión de cuantización con coste de calidad no
+verificado.
+
+Lo accionable sale de la tabla, no del ranking: **18 GB/s contra 25,3 de techo**
+es el número a atacar (arena mmap, layout de escalas, kernels por grupo).
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
