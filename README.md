@@ -469,6 +469,59 @@ Lo aprendido: el `MADV_HUGEPAGE` después de `MAP_POPULATE` no hace nada (1,8 %
 de THP), y un probe de ancho de banda mal escrito produce números estables,
 reproducibles **y falsos**. La reproducibilidad no valida una medición.
 
+## Día 19 — Atribución con `perf`: el 16 % es el precio de `group=32` (2026-11-13)
+
+Se habilitó `perf` (`kernel.perf_event_paranoid=1`) y se midieron los dos
+motores con los mismos eventos, 4 hilos, 128 tokens:
+
+| | caudal | llama.cpp |
+|---|---|---|
+| instrucciones | 132,9 G | **93,6 G** |
+| ciclos | 83,1 G | 80,9 G |
+| **IPC** | **1,60** | **1,16** |
+| **instr/byte** | **1,05** | **0,65** |
+| **ciclos/byte** | **0,656** | **0,566** |
+
+Ejecutamos **60 % más instrucciones por byte**; el IPC mucho mejor (1,60 vs
+1,16) absorbe dos tercios del daño y quedan **16 % más ciclos por byte**. Ese
+es el hueco real frente a llama.cpp, y no es ni hardware ni sincronización.
+
+### De dónde salen las instrucciones
+
+Contando el bucle por cada 32 B de pesos (64 valores):
+
+| bloque | instrucciones |
+|---|---|
+| expandir nibbles (`and`/`srli`/`unpacklo`/`unpackhi`) | 6 |
+| producto (`maddubs`×2, `madd`×2, `add`) + loads de x | 7 |
+| corrección `−8·Σx` (`setr_epi32`) | ~5 |
+| **construir la escala del bloque** (`set_m128` + 2 `fp16→fp32` + 2 `mul` + `set1`) | **~8** |
+| `cvtepi32` + `fmadd` | 2 |
+
+Q4_K lee la escala **una vez por super-bloque de 256 valores** y aplica un
+solo `float` al acumulado. Nosotros la aplicamos **cada 32 valores**, con
+conversión fp16→fp32 incluida: 8 de 28 instrucciones por bloque.
+
+**Conclusión:** el 16 % de ciclos por byte es el precio de `group=32`. Esa
+granularidad se eligió por calidad (g64 costaba +31,7 % de ppl), así que ahora
+el canje está medido en las dos direcciones: **seis puntos de ppl por ~16 % de
+velocidad**.
+
+### Optimización pendiente (sin cambiar la matemática)
+
+Procesar **8 grupos (512 valores) por iteración**, acumular los 8 `int32` y
+convertir las 8 escalas fp16 en una sola `_mm256_cvtph_ps`, aplicándolas de
+golpe. Elimina la construcción por bloque y no toca la precisión.
+
+### Hipótesis refutadas por medición (no por argumento)
+
+| hipótesis | medida | veredicto |
+|---|---|---|
+| 113 barreras por token cuestan 2–4 ms | `pool.run` vacía = 0,55 µs → 62,5 µs/token | **0,13 %**. Falso |
+| THP en los pesos | 0 % → 100 % THP, A/B intercalado | sin efecto |
+| La división por elemento al cuantizar x | recíproco por grupo, A/B intercalado | sin efecto |
+| Layout intercalado sin relleno | 18,0 vs 19,4 tok/s | peor |
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |

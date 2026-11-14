@@ -45,6 +45,7 @@ static double g_bytes = 0.0;
 static bool g_probe = false;
 static bool g_no_thp = false;
 static bool g_bench_pool = false;
+static bool g_slow_quant = false;
 static bool g_time = false;
 
 namespace {
@@ -297,9 +298,18 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                     amax = std::max(amax, std::fabs(xm[b0 + i]));
                 const float sx = (amax > 0.0f ? amax / 127.0f : 1.0f);
                 sm[g] = sx;
-                for (std::size_t i = 0; i < grp; ++i)
-                    q[b0 + i] = static_cast<std::int8_t>(
-                        std::clamp(std::round(xm[b0 + i] / sx), -127.0f, 127.0f));
+                if (g_slow_quant) {
+                    // version vieja: una DIVISION por elemento (231k por token)
+                    for (std::size_t i = 0; i < grp; ++i)
+                        q[b0 + i] = static_cast<std::int8_t>(
+                            std::clamp(std::round(xm[b0 + i] / sx), -127.0f, 127.0f));
+                } else {
+                    // reciproco una vez por grupo: mismos valores, sin divides
+                    const float inv = (sx > 0.0f ? 1.0f / sx : 0.0f);
+                    for (std::size_t i = 0; i < grp; ++i)
+                        q[b0 + i] = static_cast<std::int8_t>(
+                            std::clamp(std::round(xm[b0 + i] * inv), -127.0f, 127.0f));
+                }
             }
             std::int8_t* qp = xqp.data() + std::size_t(m) * K;
             const std::size_t bloques = K / 64;
@@ -433,6 +443,7 @@ int main(int argc, char** argv) {
         else if (a == "--probe-read") g_probe = true;
         else if (a == "--no-thp") g_no_thp = true;
         else if (a == "--bench-pool") g_bench_pool = true;
+        else if (a == "--slow-quant") g_slow_quant = true;
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
