@@ -33,3 +33,11 @@ add_test(NAME test_morton COMMAND test_morton)
 add_executable(test_portero tests/test_portero.cpp)
 target_link_libraries(test_portero PRIVATE aquifer_flags)
 add_test(NAME test_portero COMMAND test_portero)
+
+add_executable(test_paging_rss tests/test_paging_rss.cpp)
+target_link_libraries(test_paging_rss PRIVATE aquifer_flags)
+add_test(NAME test_paging_rss COMMAND test_paging_rss)
+
+# --- Binarios de Inferencia Aquifer ---
+add_executable(generate_aquifer tools/generate_aquifer.cpp)
+target_link_libraries(generate_aquifer PRIVATE aquifer_flags)

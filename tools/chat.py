@@ -74,12 +74,23 @@ def format_prompt(history, model_type="qwen", system_prompt=None):
 
 def main():
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    default_bin = os.path.join(repo_dir, "build", "generate_qwen")
+    default_bin = os.path.join(repo_dir, "build", "generate_aquifer")
+    if not os.path.exists(default_bin):
+        default_bin = os.path.join(repo_dir, "build", "generate_qwen")
 
-    ap = argparse.ArgumentParser(description="Chat interactivo en Caudal Engine (5.00 bpw)")
+    def resolve_artifact(model_name):
+        local_art = os.path.join(repo_dir, "build", model_name)
+        if os.path.exists(local_art):
+            return local_art
+        caudal_art = os.path.join("/home/marco/source/repos/caudal/build", model_name)
+        if os.path.exists(caudal_art):
+            return caudal_art
+        return local_art
+
+    ap = argparse.ArgumentParser(description="Chat interactivo en Aquifer Engine (Zero-Copy Paging, 5.00 bpw)")
     ap.add_argument("--model", choices=["qwen", "qwen05", "coder", "r1", "tiny", "smol2"], default="qwen",
                     help="Modelo: 'qwen' (1.5B), 'qwen05' (0.5B rápido), 'coder' (1.5B Coder), 'r1' (R1 Distill), 'tiny' (1.1B), 'smol2' (1.7B)")
-    ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_qwen")
+    ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_aquifer")
     ap.add_argument("--artifact", default=None, help="Ruta al artefacto cuantizado")
     ap.add_argument("--tokenizer", default=None, help="Ruta a tokenizer.json")
     ap.add_argument("--threads", type=int, default=4, help="Número de hilos AVX2")
@@ -91,7 +102,7 @@ def main():
     # Configuraciones específicas por modelo
     if args.model == "r1":
         if args.artifact is None:
-            args.artifact = os.path.join(repo_dir, "build", "r1_affine")
+            args.artifact = resolve_artifact("r1_affine")
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/r1/tokenizer.json"
         if args.system is None:
@@ -104,7 +115,7 @@ def main():
         eos_str = "151643"
     elif args.model == "qwen05":
         if args.artifact is None:
-            args.artifact = os.path.join(repo_dir, "build", "qwen05_affine")
+            args.artifact = resolve_artifact("qwen05_affine")
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/qwen05/tokenizer.json"
         if args.system is None:
@@ -117,7 +128,7 @@ def main():
         eos_str = "151643,151645"
     elif args.model == "coder":
         if args.artifact is None:
-            args.artifact = os.path.join(repo_dir, "build", "coder15_affine")
+            args.artifact = resolve_artifact("coder15_affine")
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/coder15/tokenizer.json"
         if args.system is None:
@@ -130,7 +141,7 @@ def main():
         eos_str = "151643,151645"
     elif args.model == "tiny":
         if args.artifact is None:
-            args.artifact = os.path.join(repo_dir, "build", "tiny_affine")
+            args.artifact = resolve_artifact("tiny_affine")
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/tiny/tokenizer.json"
         if args.system is None:
@@ -143,7 +154,7 @@ def main():
         eos_str = "2"
     elif args.model == "smol2":
         if args.artifact is None:
-            args.artifact = os.path.join(repo_dir, "build", "smol2_affine")
+            args.artifact = resolve_artifact("smol2_affine")
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/smol2/tokenizer.json"
         if args.system is None:
@@ -156,7 +167,7 @@ def main():
         eos_str = "0,2"
     else:  # qwen
         if args.artifact is None:
-            args.artifact = os.path.join(repo_dir, "build", "qwen15_affine")
+            args.artifact = resolve_artifact("qwen15_affine")
         if args.tokenizer is None:
             args.tokenizer = "/home/marco/.cache/caudal/qwen15/tokenizer.json"
         if args.system is None:
@@ -178,7 +189,7 @@ def main():
         print(f"Error: Tokenizer no encontrado en {args.tokenizer}.")
         return 1
 
-    print(f"{BOLD}Iniciando Caudal Engine ({model_title} Afín 5.0 bpw)...{RESET}")
+    print(f"{BOLD}Iniciando Aquifer Paging Engine ({model_title} Afín 5.0 bpw · Zero-Copy HiperRAM)...{RESET}")
     tok = Tokenizer(args.tokenizer)
 
     cmd = [
