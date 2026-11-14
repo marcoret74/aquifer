@@ -43,6 +43,7 @@
 static double g_t_gemv = 0.0, g_t_attn = 0.0;
 static double g_bytes = 0.0;
 static bool g_probe = false;
+static bool g_no_thp = false;
 static bool g_time = false;
 
 namespace {
@@ -161,8 +162,69 @@ struct KvRings {
     }
 };
 
+// Buffer de pesos con mmap + MADV_HUGEPAGE. Medido: el vector de antes dejaba
+// los 828 MB en 0,0 % de THP (212k paginas de 4 KB) y cada fila pagaba TLB.
+struct Mapa {
+    std::uint8_t* p = nullptr;
+    std::size_t n = 0;
+    const std::uint8_t* data() const { return p; }
+    std::size_t size() const { return n; }
+};
+
+static std::size_t tam_archivo(const std::string& r) {
+    std::ifstream f(r, std::ios::binary | std::ios::ate);
+    return f ? std::size_t(f.tellg()) : 0;
+}
+
+static void leer_en(const std::string& ruta, std::uint8_t* dst) {
+    std::FILE* f = std::fopen(ruta.c_str(), "rb");
+    if (!f) { std::printf("no abrio %s\n", ruta.c_str()); std::exit(1); }
+    std::size_t leido = 0, n;
+    while ((n = std::fread(dst + leido, 1, std::size_t(1) << 20, f)) > 0) leido += n;
+    std::fclose(f);
+}
+
+static Mapa slurp_thp(const std::string& ruta) {
+    const std::size_t n = tam_archivo(ruta);
+    void* p = mmap(nullptr, n ? n : 1, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { std::printf("mmap fallo\n"); std::exit(1); }
+    madvise(p, n, MADV_HUGEPAGE);       // ANTES de tocar: con MAP_POPULATE no sirve
+    leer_en(ruta, static_cast<std::uint8_t*>(p));
+    return {static_cast<std::uint8_t*>(p), n};
+}
+
+static Mapa slurp_plain(const std::string& ruta) {
+    const std::size_t n = tam_archivo(ruta);
+    void* p = std::malloc(n ? n : 1);
+    if (!p) { std::printf("malloc fallo\n"); std::exit(1); }
+    leer_en(ruta, static_cast<std::uint8_t*>(p));
+    return {static_cast<std::uint8_t*>(p), n};
+}
+
+static Mapa slurp_plain2(const std::string& a, const std::string& b, std::size_t& base) {
+    const std::size_t na = tam_archivo(a), nb = tam_archivo(b);
+    void* p = std::malloc(na + nb);
+    if (!p) { std::printf("malloc fallo\n"); std::exit(1); }
+    auto* q = static_cast<std::uint8_t*>(p);
+    leer_en(a, q); base = na; leer_en(b, q + na);
+    return {q, na + nb};
+}
+
+static Mapa slurp_thp2(const std::string& a, const std::string& b, std::size_t& base) {
+    const std::size_t na = tam_archivo(a), nb = tam_archivo(b);
+    void* p = mmap(nullptr, na + nb, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { std::printf("mmap fallo\n"); std::exit(1); }
+    madvise(p, na + nb, MADV_HUGEPAGE);
+    auto* q = static_cast<std::uint8_t*>(p);
+    leer_en(a, q); base = na; leer_en(b, q + na);
+    return {q, na + nb};
+}
+
 struct Ctx {
-    std::vector<std::uint8_t> wbin, auxbin, embed;
+    Mapa wbin;                          // pesos: mmap + THP (0 % THP = TLB)
+    std::vector<std::uint8_t> auxbin, embed;
     std::size_t wbase{0};   // bytes de pesos; los offsets `so` del layout de dos
                             // arrays son relativos a scales.bin, no al buffer
                             // concatenado. Sin esto, las escalas se leian de
@@ -368,6 +430,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump") g_dump = true;
         else if (a == "--time") g_time = true;
         else if (a == "--probe-read") g_probe = true;
+        else if (a == "--no-thp") g_no_thp = true;
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
@@ -404,10 +467,28 @@ int main(int argc, char** argv) {
     }
 
     Ctx c;
-    if (std::ifstream t(A + "/w.bin"); t.good()) c.wbin = slurp(A + "/w.bin");
-    else { auto a1 = slurp(A + "/weights.bin"); auto a2 = slurp(A + "/scales.bin");
-           c.wbase = a1.size();
-           c.wbin = std::move(a1); c.wbin.insert(c.wbin.end(), a2.begin(), a2.end()); }
+    const bool con_thp = !g_no_thp;
+    if (std::ifstream t(A + "/w.bin"); t.good())
+        c.wbin = con_thp ? slurp_thp(A + "/w.bin") : slurp_plain(A + "/w.bin");
+    else
+        c.wbin = con_thp ? slurp_thp2(A + "/weights.bin", A + "/scales.bin", c.wbase)
+                         : slurp_plain2(A + "/weights.bin", A + "/scales.bin", c.wbase);
+    {   // En que paginas quedaron los pesos: si no son 2 MB, cada fila paga TLB
+        std::ifstream f("/proc/self/smaps_rollup");
+        std::string k;
+        while (f >> k) {
+            if (k == "AnonHugePages:") {
+                unsigned long long v = 0;
+                f >> v;
+                const double mb = double(c.wbin.size()) / (1024 * 1024);
+                std::printf("THP pesos: %.1f %% de %.0f MB (%llu KB en paginas gigantes)\n\n",
+                            100.0 * double(v) / 1024.0 / mb, mb, v);
+                break;
+            }
+            f.ignore(4096, '\n');
+        }
+    }
+
     c.auxbin = slurp(A + "/aux.bin");
     c.embed = slurp(A + "/embed.bf16");
 
