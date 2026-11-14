@@ -281,6 +281,7 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
     std::vector<std::int8_t> xq(M * K), xqp(M * K);
     std::vector<std::int32_t> xg(M * G);
     std::vector<float> xs(M * G);
+    std::vector<float> xms(M * G);
     pool.run([&](unsigned tid) {
         const unsigned T0 = pool.size();
         const unsigned a = unsigned(std::size_t(tid) * M / T0);
@@ -324,6 +325,9 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
             for (std::size_t i = bloques * 64; i < K; ++i) qp[i] = q[i];
             caudal::Shape s0; s0.N = 0; s0.K = K; s0.group = grp;
             caudal::compute_x_gsum(s0, q, xg.data() + std::size_t(m) * G);
+            for (std::size_t g = 0; g < G; ++g) {
+                xms[std::size_t(m) * G + g] = float(xg[std::size_t(m) * G + g]) * sm[g];
+            }
         }
     });
 
@@ -352,15 +356,16 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                 if (j.L->min) {
                     const _Float16* mn = j.L->min + n0 * j.L->G;
                     switch (M) {
-                        case 1: caudal::gemv_int4_affine_M<1>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        case 2: caudal::gemv_int4_affine_M<2>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        case 3: caudal::gemv_int4_affine_M<3>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        case 4: caudal::gemv_int4_affine_M<4>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        case 5: caudal::gemv_int4_affine_M<5>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        case 6: caudal::gemv_int4_affine_M<6>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        case 7: caudal::gemv_int4_affine_M<7>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        default: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 1: caudal::gemv_int4_affine_M<1>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 2: caudal::gemv_int4_affine_M<2>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 3: caudal::gemv_int4_affine_M<3>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 4: caudal::gemv_int4_affine_M<4>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 5: caudal::gemv_int4_affine_M<5>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 6: caudal::gemv_int4_affine_M<6>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 7: caudal::gemv_int4_affine_M<7>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        default: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     }
+                    continue;
                 } else if (j.L->kmin) {
                     const std::uint8_t* hp = j.L->kmin + n0 * (K / 256) * 16;
                     switch (M) {
@@ -643,16 +648,17 @@ int main(int argc, char** argv) {
                 rmsnorm(x.data() + i * cfg.H, c.aux_of(p + "input_layernorm.weight"),
                         h.data() + i * cfg.H, cfg.H, cfg.eps);
 
-            if (g_dump && g_stepn == 0 && L == 0)
-                std::printf("DUMP L0 |h_in|=%.5f\n", vnorm(h.data(), cfg.H));
+            if (g_dump && g_stepn == 0 && L <= 1)
+                std::printf("DUMP L%zu |h_in|=%.5f\n", L, vnorm(h.data(), cfg.H));
 
             const Job jq{&c.lin.at(p + "self_attn.q_proj.weight"), q.data()};
             const Job jk{&c.lin.at(p + "self_attn.k_proj.weight"), kt.data()};
             const Job jv{&c.lin.at(p + "self_attn.v_proj.weight"), vt.data()};
               gemv_group_M(pool, {jq, jk, jv}, m, h.data(), cfg.H);
 
-            if (g_dump && g_stepn == 0 && L == 0)
-                std::printf("DUMP L0 |q|=%.5f |k|=%.5f |v|=%.5f\n",
+            if (g_dump && g_stepn == 0 && L <= 1)
+                std::printf("DUMP L%zu |q|=%.5f |k|=%.5f |v|=%.5f\n",
+                            L,
                             vnorm(q.data(), cfg.NH * cfg.DH),
                             vnorm(kt.data(), cfg.NKV * cfg.DH),
                             vnorm(vt.data(), cfg.NKV * cfg.DH));
@@ -708,8 +714,10 @@ int main(int argc, char** argv) {
                 }
             }
 
-            if (g_dump && g_stepn == 0 && L == 0)
-                std::printf("DUMP L0 |o_attn|=%.5f\n", vnorm(o.data(), cfg.H));
+            if (g_dump && g_stepn == 0 && L <= 1) {
+                std::printf("DUMP L%zu |o_attn|=%.5f\n", L, vnorm(o.data(), cfg.H));
+                std::printf("DUMP o[0..5]: %f %f %f %f %f\n", o[0], o[1], o[2], o[3], o[4]);
+            }
 
             if (g_time)
                 g_t_attn += std::chrono::duration<double, std::milli>(
@@ -718,8 +726,8 @@ int main(int argc, char** argv) {
               const Job jo{&c.lin.at(p + "self_attn.o_proj.weight"), tmp.data()};
               gemv_group_M(pool, {jo}, m, o.data(), cfg.H);
 
-            if (g_dump && g_stepn == 0 && L == 0) {
-                std::printf("DUMP L0 |o_proj|=%.5f\n", vnorm(tmp.data(), cfg.H));
+            if (g_dump && g_stepn == 0 && L <= 1) {
+                std::printf("DUMP L%zu |o_proj|=%.5f\n", L, vnorm(tmp.data(), cfg.H));
                 std::printf("DUMP oproj[0..5]: %f %f %f %f %f\n", tmp[0], tmp[1], tmp[2], tmp[3], tmp[4]);
             }
 
@@ -728,13 +736,18 @@ int main(int argc, char** argv) {
             for (unsigned i = 0; i < m; ++i)
                 rmsnorm(x.data() + i * cfg.H, c.aux_of(p + "post_attention_layernorm.weight"),
                         h.data() + i * cfg.H, cfg.H, cfg.eps);
+
+            if (g_dump && g_stepn == 0 && L <= 1) {
+                std::printf("DUMP L%zu |h_mlp|=%.5f\n", L, vnorm(h.data(), cfg.H));
+                std::printf("DUMP h_mlp[0..5]: %f %f %f %f %f\n", h[0], h[1], h[2], h[3], h[4]);
+            }
             { const Job jg{&c.lin.at(p + "mlp.gate_proj.weight"), gate.data()};
               const Job ju{&c.lin.at(p + "mlp.up_proj.weight"), up.data()};
               gemv_group_M(pool, {jg, ju}, m, h.data(), cfg.H); }
 
-            if (g_dump && g_stepn == 0 && L == 0) {
-                std::printf("DUMP L0 |gate|=%.5f |up|=%.5f\n",
-                            vnorm(gate.data(), cfg.INTER), vnorm(up.data(), cfg.INTER));
+            if (g_dump && g_stepn == 0 && L <= 1) {
+                std::printf("DUMP L%zu |gate|=%.5f |up|=%.5f\n",
+                            L, vnorm(gate.data(), cfg.INTER), vnorm(up.data(), cfg.INTER));
                 std::printf("DUMP gate[0..5]: %f %f %f %f %f\n", gate[0], gate[1], gate[2], gate[3], gate[4]);
                 std::printf("DUMP up[0..5]: %f %f %f %f %f\n", up[0], up[1], up[2], up[3], up[4]);
             }
@@ -751,8 +764,8 @@ int main(int argc, char** argv) {
             { const Job jd{&c.lin.at(p + "mlp.down_proj.weight"), tmp.data()};
               gemv_group_M(pool, {jd}, m, gate.data(), cfg.INTER); }
 
-            if (g_dump && g_stepn == 0 && L == 0) {
-                std::printf("DUMP L0 |mlp_out|=%.5f\n", vnorm(tmp.data(), cfg.H));
+            if (g_dump && g_stepn == 0 && L <= 1) {
+                std::printf("DUMP L%zu |mlp_out|=%.5f\n", L, vnorm(tmp.data(), cfg.H));
                 std::printf("DUMP out[0..5]: %f %f %f %f %f\n", tmp[0], tmp[1], tmp[2], tmp[3], tmp[4]);
             }
 
@@ -852,7 +865,7 @@ int main(int argc, char** argv) {
             v.push_back(double(n) / 1e9 / (seg > 0 ? seg : 1e-9));
         }
         std::sort(v.begin(), v.end());
-        std::printf("READ in-process: %.2f GB/s (mediana de 4, mismo buffer, %zu hilos)\n",
+        std::printf("READ in-process: %.2f GB/s (mediana de 4, mismo buffer, %u hilos)\n",
                     v[2], pool.size());
     }
     std::printf("decode   : %.1f ms para %d pasos x %u secuencias\n", td1 - td0, steps, NS);

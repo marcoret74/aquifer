@@ -553,7 +553,7 @@ inline void gemv_int4_affine_M(const Shape& s,
                                const std::uint8_t* __restrict w,
                                const _Float16* __restrict wscale,
                                const _Float16* __restrict wmin,
-                               const std::int32_t* __restrict xgsum,
+                               const float* __restrict xmin_scale,
                                const std::int8_t* __restrict xperm,
                                const float* __restrict xscale,
                                float* __restrict y,
@@ -606,10 +606,9 @@ inline void gemv_int4_affine_M(const Shape& s,
                 const __m256 xs8 = _mm256_loadu_ps(xs_ptr);
                 const __m256 s8 = _mm256_mul_ps(w8, xs8);
 
-                const std::int32_t* xg_ptr = xgsum + std::size_t(m) * G + gbase;
-                const __m256 xg8 = _mm256_cvtepi32_ps(
-                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xg_ptr)));
-                minacc[m] = _mm256_fmadd_ps(_mm256_mul_ps(m8, xs8), xg8, minacc[m]);
+                const float* xms_ptr = xmin_scale + std::size_t(m) * G + gbase;
+                const __m256 xms8 = _mm256_loadu_ps(xms_ptr);
+                minacc[m] = _mm256_fmadd_ps(m8, xms8, minacc[m]);
 
                 const __m256 sv[4] = {_mm256_permutevar8x32_ps(s8, p0),
                                       _mm256_permutevar8x32_ps(s8, p1),
