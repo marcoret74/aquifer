@@ -941,7 +941,6 @@ int main(int argc, char** argv) {
                     int tok = out[0];
                     std::printf("TOKEN %d\n", tok);
                     std::fflush(stdout);
-                    cached_tokens.push_back(tok);
                     bool is_eos = false;
                     for (int e : eos_tokens) {
                         if (tok == e) { is_eos = true; break; }
@@ -949,6 +948,7 @@ int main(int argc, char** argv) {
                     if (is_eos) {
                         break;
                     }
+                    cached_tokens.push_back(tok);
                     last_tok = tok;
                     ++cur_pos;
                     if (cur_pos >= std::size_t(ctx)) break;
