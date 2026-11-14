@@ -41,6 +41,8 @@
 
 // Instrumentacion opcional (--time).
 static double g_t_gemv = 0.0, g_t_attn = 0.0;
+static double g_bytes = 0.0;
+static bool g_probe = false;
 static bool g_time = false;
 
 namespace {
@@ -286,9 +288,13 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
             off = hi;
         }
     });
-    if (g_time)
+    if (g_time) {
         g_t_gemv += std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count();
+        // bytes que este GEMV recorre de verdad: filas*(K/2) + filas*G*2
+        for (const auto& j : jobs)
+            g_bytes += double(j.L->N) * (double(j.L->K) / 2.0 + double(j.L->G) * 2.0);
+    }
 }
 
 void add_bias(float* y, const float* b, std::size_t n) {
@@ -361,6 +367,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec") spec = std::atoi(next().c_str());
         else if (a == "--dump") g_dump = true;
         else if (a == "--time") g_time = true;
+        else if (a == "--probe-read") g_probe = true;
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
@@ -656,10 +663,41 @@ int main(int argc, char** argv) {
     const double td1 = now_ms();
 
     std::printf("prefill  : %.1f ms (%u secuencias x %zu tokens)\n", tp1 - tp0, NS, plen);
+    if (g_probe) {
+        // Lectura pura, EN ESTE PROCESO y SOBRE EL MISMO BUFFER de pesos, justo
+        // despues del GEMV: es el unico denominador que comparte estado termico,
+        // politica de potencia y paginas fisicas con el motor.
+        std::vector<double> v;
+        for (int r = 0; r < 4; ++r) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::size_t n = c.wbin.size();
+            const std::uint64_t* w = reinterpret_cast<const std::uint64_t*>(c.wbin.data());
+            const std::size_t nw = n / 8;
+            std::uint64_t suma = 0;
+            pool.run([&](unsigned tid) {
+                const std::size_t T3 = pool.size();
+                const std::size_t a = std::size_t(tid) * nw / T3;
+                const std::size_t b = std::size_t(tid + 1) * nw / T3;
+                std::uint64_t s0 = 0, s1 = 0;
+                for (std::size_t i = a; i + 8 <= b; i += 8) { s0 += w[i]; s1 += w[i + 4]; }
+                for (std::size_t i = a; i < b; ++i) s0 += w[i] & 1u;
+                if (tid == 0) suma = s0 ^ s1; else suma ^= s0 ^ s1;
+            });
+            asm volatile("" : "+r"(suma));
+            const double seg = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            v.push_back(double(n) / 1e9 / (seg > 0 ? seg : 1e-9));
+        }
+        std::sort(v.begin(), v.end());
+        std::printf("READ in-process: %.2f GB/s (mediana de 4, mismo buffer, %zu hilos)\n",
+                    v[2], pool.size());
+    }
     std::printf("decode   : %.1f ms para %d pasos x %u secuencias\n", td1 - td0, steps, NS);
     if (g_time) {
         // El cierre de gemv_group_M no puede tocar g_t_gemv sin un objeto;
         // se acumula aqui con una lambda al salir de cada llamada.
+        std::printf("TIME bytes=%.1f MB/token  (%.1f GB/s reales)\n",
+                    g_bytes / 1e6 / double(steps), g_bytes / 1e6 / g_t_gemv);
         std::printf("TIME gemv=%.0f ms  attn=%.0f ms  (%.1f%% / %.1f%%)\n",
                     g_t_gemv, g_t_attn,
                     100.0 * g_t_gemv / (g_t_gemv + g_t_attn > 0 ? g_t_gemv + g_t_attn : 1),

@@ -418,6 +418,57 @@ que `split` (868,3 MB, 4,500 bits/peso), y volvió a perder:
 **No era el relleno: es el prefetcher**, que sigue dos streams densos mejor que
 uno intercalado aunque no tenga agujeros. El layout de dos arrays se queda.
 
+## Día 18 — La cacería del denominador: mis probes mentían (2026-11-13)
+
+Se consultó al panel (Claude, Gemini, Qwen) por la contradicción de los tres
+techos. Consenso: el 25,3 GB/s histórico **no puede ser denominador**; hace
+falta una lectura pura medida en la misma sesión, mismo buffer y mismo estado
+térmico. Disidencia de Qwen, que lo daba por válido; su propio protocolo
+(mediana, pasar PL2) implica lo mismo que los otros dos.
+
+Se construyó `bench/probe5_denominator.cpp` con el protocolo acordado.
+
+### Lo que se descartó, con datos
+
+| hipótesis | prueba | resultado |
+|---|---|---|
+| THP no aplicaba | `maps_rollup` | **1,8 % → 100 %** al hacer `MADV_HUGEPAGE` *antes* de tocar las páginas. El número **no cambió**: no era THP |
+| Ubicación física (Flex Mode 8+4) | mismo probe con `malloc` vs `mmap+THP` | 9,44 vs 9,12 GB/s → **no manda la ubicación** |
+| Hilos en hermanos SMT | afinidad explícita con `pthread_setaffinity_np` a CPU 0..h-1 | sin cambio |
+| Deriva de la máquina | probe y motor, 3 rondas intercaladas | probe **estable 9,0**; motor **estable 17,2**. No hay deriva: discrepan de verdad |
+| El motor no lee lo que creo | contador de bytes dentro del GEMV | **868 MB/token confirmados** (el 983 MB aparente era el prefill dividido por los pasos de decode) |
+
+### El experimento que lo cerró
+
+Lo que pidió Gemini: el probe **dentro del mismo proceso y sobre el mismo
+puntero**, justo después del GEMV.
+
+```
+READ in-process (uint64, 4 hilos, mismo buffer) :   5,66 GB/s
+GEMV sobre ese mismo buffer, mismos 4 hilos     :  18,3  GB/s
+```
+
+**El probe es el que miente, por 3×.** El de `uint64_t` es ALU-bound: dos
+acumuladores con dependencia en cadena, no llega ni a leer. Y la variante AVX2
+con 8 acumuladores independientes se queda en 9-13 GB/s sin que lograra aislar
+la causa.
+
+### Conclusión
+
+1. **Ninguno de mis probes sirve de denominador.** Un bucle ingenuo de lectura
+   no mide ancho de banda: mide el bucle.
+2. La única medida creíble que tengo es **el GEMV: 17–18 GB/s** sobre el mismo
+   buffer, mismos hilos y mismo estado. El motor está al ~97 % de eso.
+3. Por eso **se retira definitivamente la métrica «% del techo»**, y las
+   comparaciones con llama.cpp quedan como **ratios dentro del mismo bloque**.
+4. Para un denominador externo hace falta `STREAM` bien compilado o `MLC`/
+   `likwid-bench`. No están instalados; instalarlos es el paso pendiente si se
+   quiere volver a hablar de porcentajes.
+
+Lo aprendido: el `MADV_HUGEPAGE` después de `MAP_POPULATE` no hace nada (1,8 %
+de THP), y un probe de ancho de banda mal escrito produce números estables,
+reproducibles **y falsos**. La reproducibilidad no valida una medición.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
