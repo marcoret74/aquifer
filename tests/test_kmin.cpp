@@ -107,7 +107,8 @@ int main() {
                 for (std::size_t i = 0; i < 64; ++i)
                     xp[m * K + b * 64 + i] = x[m * K + b * 64 + caudal::kPerm[i]];
         std::vector<std::int32_t> xg(M * G);
-        std::vector<float> xs(M * G);
+        const std::size_t SBn2 = K / 256;
+        std::vector<float> xs(M * SBn2);        // una escala de x por super-bloque
         for (auto& v : xs) v = float(rng() % 100) / 4000.0f + 0.001f;
         for (unsigned m = 0; m < M; ++m)
             caudal::compute_x_gsum(s, x.data() + m * K, xg.data() + m * G);
@@ -122,13 +123,13 @@ int main() {
         for (unsigned m = 0; m < M; ++m)
             for (std::size_t n = 0; n < N; ++n) {
                 double acc = 0.0;
-                for (std::size_t g = 0; g < G; ++g) {
+                for (std::size_t sb = 0; sb < SBn2; ++sb) {
                     double sub = 0.0;
-                    for (std::size_t i = 0; i < 32; ++i) {
-                        const std::size_t k = g * 32 + i;
+                    for (std::size_t i = 0; i < 256; ++i) {
+                        const std::size_t k = sb * 256 + i;
                         sub += double(deq[n * K + k]) * double(x[m * K + k]);
                     }
-                    acc += double(xs[m * G + g]) * sub;
+                    acc += double(xs[m * SBn2 + sb]) * sub;
                 }
                 const double got = double(y[m * N + n]);
                 peor = std::max(peor, std::fabs(got - acc));

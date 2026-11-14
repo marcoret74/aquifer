@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from check_pack import dequant, dequant_kmin   # noqa: E402
+from check_pack import dequant, dequant_kmin, dequant_affine   # noqa: E402
 from oracle_qwen import Qwen, Tokenizer  # noqa: E402
 
 
@@ -29,7 +29,11 @@ class Artefacto:
             f = line.split()
             if not f:
                 continue
-            if f[0] == 'LINEARK' and len(f) == 8:      # kmin
+            if f[0] == 'LINEARA':                      # afin (escala fp16 + minimo fp16)
+                self.lin[f[1]] = dict(N=int(f[2]), K=int(f[3]), off=int(f[4]),
+                                      pb=int(f[5]), soff=int(f[6]), moff=int(f[7]),
+                                      affine=True)
+            elif f[0] == 'LINEARK' and len(f) == 8:      # kmin
                 self.lin[f[1]] = dict(N=int(f[2]), K=int(f[3]), off=int(f[4]),
                                       pb=int(f[5]), soff=int(f[6]), sb=int(f[7]),
                                       kmin=True)
@@ -62,6 +66,12 @@ class Artefacto:
             return torch.from_numpy(a)
         m = self.lin[nombre]
         N, K = m['N'], m['K']
+        if m.get('affine'):
+            G = K // 32
+            pk = np.frombuffer(self.W, np.uint8, N * (K // 2), m['off']).reshape(N, K // 2)
+            sp = np.frombuffer(self.S, np.uint8, N * G * 2, m['soff']).reshape(N, G * 2)
+            mn = np.frombuffer(self.S, np.uint8, N * G * 2, m['moff']).reshape(N, G * 2)
+            return torch.from_numpy(dequant_affine(pk, sp, mn, N, K, G))
         if m.get('kmin'):
             pk = np.frombuffer(self.W, np.uint8, N * (K // 2), m['off']).reshape(N, K // 2)
             hb = N * (K // 256) * 16

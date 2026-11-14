@@ -63,6 +63,7 @@ struct Lin {
     const std::uint8_t* packed{nullptr};
     const std::uint8_t* kmin{nullptr};      // headers de 16 B por super-bloque
     const _Float16* scale{nullptr};
+    const _Float16* min{nullptr};           // esquema afin (5.00 bpw)
     std::size_t row_bytes{0};
 };
 
@@ -348,7 +349,19 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                 const _Float16* sc = j.L->stride ? nullptr
                                                  : (j.L->scale + n0 * j.L->G);
                 float* yy = j.y;   // M*N, fila m en yy + m*N
-                if (j.L->kmin) {
+                if (j.L->min) {
+                    const _Float16* mn = j.L->min + n0 * j.L->G;
+                    switch (M) {
+                        case 1: caudal::gemv_int4_affine_M<1>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 2: caudal::gemv_int4_affine_M<2>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 3: caudal::gemv_int4_affine_M<3>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 4: caudal::gemv_int4_affine_M<4>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 5: caudal::gemv_int4_affine_M<5>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 6: caudal::gemv_int4_affine_M<6>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 7: caudal::gemv_int4_affine_M<7>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        default: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    }
+                } else if (j.L->kmin) {
                     const std::uint8_t* hp = j.L->kmin + n0 * (K / 256) * 16;
                     switch (M) {
                         case 1: caudal::gemv_int4_kmin_M<1>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
@@ -524,7 +537,19 @@ int main(int argc, char** argv) {
         std::ifstream fi(A + "/index.txt");
         std::string kind;
         while (fi >> kind) {
-            if (kind == "LINEARK") {              // super-bloque + minimo
+            if (kind == "LINEARA") {              // afin: escala fp16 + minimo fp16
+                std::string rest; std::getline(fi, rest);
+                std::istringstream is(rest);
+                std::string name; is >> name;
+                std::size_t N2, K2, off2, pb2, so2, mo2;
+                is >> N2 >> K2 >> off2 >> pb2 >> so2 >> mo2;
+                Lin L; L.N = N2; L.K = K2; L.row_bytes = K2 / 2;
+                L.packed = c.wbin.data() + off2;
+                L.scale = reinterpret_cast<const _Float16*>(c.wbin.data() + c.wbase + so2);
+                L.min = reinterpret_cast<const _Float16*>(c.wbin.data() + c.wbase + mo2);
+                L.stride = 0; L.G = K2 / 32;
+                c.lin[name] = L;
+            } else if (kind == "LINEARK") {              // super-bloque + minimo
                 std::string rest; std::getline(fi, rest);
                 std::istringstream is(rest);
                 std::string name; is >> name;
@@ -693,8 +718,10 @@ int main(int argc, char** argv) {
               const Job jo{&c.lin.at(p + "self_attn.o_proj.weight"), tmp.data()};
               gemv_group_M(pool, {jo}, m, o.data(), cfg.H);
 
-            if (g_dump && g_stepn == 0 && L == 0)
+            if (g_dump && g_stepn == 0 && L == 0) {
                 std::printf("DUMP L0 |o_proj|=%.5f\n", vnorm(tmp.data(), cfg.H));
+                std::printf("DUMP oproj[0..5]: %f %f %f %f %f\n", tmp[0], tmp[1], tmp[2], tmp[3], tmp[4]);
+            }
 
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j];
 
@@ -705,9 +732,12 @@ int main(int argc, char** argv) {
               const Job ju{&c.lin.at(p + "mlp.up_proj.weight"), up.data()};
               gemv_group_M(pool, {jg, ju}, m, h.data(), cfg.H); }
 
-            if (g_dump && g_stepn == 0 && L == 0)
+            if (g_dump && g_stepn == 0 && L == 0) {
                 std::printf("DUMP L0 |gate|=%.5f |up|=%.5f\n",
                             vnorm(gate.data(), cfg.INTER), vnorm(up.data(), cfg.INTER));
+                std::printf("DUMP gate[0..5]: %f %f %f %f %f\n", gate[0], gate[1], gate[2], gate[3], gate[4]);
+                std::printf("DUMP up[0..5]: %f %f %f %f %f\n", up[0], up[1], up[2], up[3], up[4]);
+            }
 
             {
                 const unsigned T2 = pool.size();
@@ -721,8 +751,10 @@ int main(int argc, char** argv) {
             { const Job jd{&c.lin.at(p + "mlp.down_proj.weight"), tmp.data()};
               gemv_group_M(pool, {jd}, m, gate.data(), cfg.INTER); }
 
-            if (g_dump && g_stepn == 0 && L == 0)
+            if (g_dump && g_stepn == 0 && L == 0) {
                 std::printf("DUMP L0 |mlp_out|=%.5f\n", vnorm(tmp.data(), cfg.H));
+                std::printf("DUMP out[0..5]: %f %f %f %f %f\n", tmp[0], tmp[1], tmp[2], tmp[3], tmp[4]);
+            }
 
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j];
 

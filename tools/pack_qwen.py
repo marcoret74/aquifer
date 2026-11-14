@@ -91,6 +91,43 @@ class SafeTensors:
 CLIP_GRID = ()
 
 
+def quantize_affine(w, group=32):
+    """Esquema afin directo: escala fp16 + minimo fp16 por grupo de 32 (5.00 bpw).
+
+    w = s * q + mn,  q in [0, 15] unsigned.
+    """
+    N, K = w.shape
+    if K % group:
+        raise SystemExit(f'K={K} no es multiplo de group={group}')
+    G = K // group
+    pk = np.empty((N, K // 2), dtype=np.uint8)
+    scales = np.empty((N, G), dtype=np.float16)
+    mins = np.empty((N, G), dtype=np.float16)
+    num2 = den2 = 0.0
+    filas = max(1, min(N, int(1.5e8 // max(1, K * 4))))
+    for r0 in range(0, N, filas):
+        r1 = min(N, r0 + filas)
+        x = np.ascontiguousarray(w[r0:r1]).reshape(r1 - r0, G, group)
+        lo = x.min(axis=2)
+        hi = x.max(axis=2)
+        sc = (hi - lo) / 15.0
+        sc16 = sc.astype(np.float16)
+        mn16 = lo.astype(np.float16)
+        scales[r0:r1] = sc16
+        mins[r0:r1] = mn16
+        s_eff = sc16.astype(np.float32)[:, :, None]
+        m_eff = mn16.astype(np.float32)[:, :, None]
+        inv_s = np.where(s_eff > 1e-8, 1.0 / s_eff, 0.0)
+        q = np.clip(np.rint((x - m_eff) * inv_s), 0, 15).astype(np.uint8)
+        deq = m_eff + s_eff * q
+        num2 += float(((x - deq) ** 2).sum())
+        den2 += float((x.astype(np.float64) ** 2).sum())
+        u = q.reshape(r1 - r0, K)
+        pk[r0:r1] = u[:, 0::2] | (u[:, 1::2] << 4)
+    rel_err = np.sqrt(num2 / max(den2, 1e-12))
+    return pk, scales, mins, rel_err
+
+
 def quantize_kmin(w):
     """Super-bloque de 256 con minimo CON SIGNO. 4,50 bpw exactos.
 
@@ -248,9 +285,9 @@ def main():
     ap.add_argument('--layout-out', default=None)
     ap.add_argument('--layout-tokens', type=int, default=2,
                     help='cuantos x sinteticos para el set de 5 archivos')
-    ap.add_argument('--scheme', default='g32', choices=['g32', 'kmin'],
-                    help='kmin = super-bloque 256 con minimo con signo (4,50 bpw, '
-                         '+2,2 puntos de BPC medidos en simulacion)')
+    ap.add_argument('--scheme', default='g32', choices=['g32', 'kmin', 'affine'],
+                    help='affine = escala fp16 + minimo fp16 por grupo de 32 (5,00 bpw); '
+                         'kmin = super-bloque 256 con minimo con signo (4,50 bpw)')
     ap.add_argument('--clip-grid', default='',
                     help='factores k separados por coma para s = k*amax/7 por '
                          'grupo (vacio = amax/7). Ej: 0.70,0.80,0.90,1.0')
@@ -320,13 +357,16 @@ def main():
     try:
         for name, (N, K) in todo:
             w = st.tensor_f32(name)
-            if args.scheme == 'kmin':
+            mins = None
+            if args.scheme == 'affine':
+                packed, scales, mins, err = quantize_affine(w, group=32)
+            elif args.scheme == 'kmin':
                 packed, scales, err = quantize_kmin(w)
             else:
                 packed, scales, err = quantize(w, GROUP)
             total_params += N * K
-            if args.scheme == 'kmin' and not splitted:
-                raise SystemExit('--scheme kmin exige --layout split')
+            if args.scheme in ('kmin', 'affine') and not splitted:
+                raise SystemExit(f'--scheme {args.scheme} exige --layout split')
 
             rb, sbb = K // 2, (K // GROUP) * 2
             if splitted:
@@ -334,7 +374,18 @@ def main():
                 fw.write(packed.tobytes())
                 os_ = align(fs.tell()); fs.write(b'\0' * (os_ - fs.tell()))
                 fs.write(scales.tobytes())
-                if args.scheme == 'kmin':
+                om_ = 0
+                if mins is not None:
+                    om_ = align(fs.tell()); fs.write(b'\0' * (om_ - fs.tell()))
+                    fs.write(mins.tobytes())
+
+                if args.scheme == 'affine':
+                    index[name] = {'N': int(N), 'K': int(K), 'affine': True,
+                                   'base_off': ow, 'packed_bytes': int(packed.size),
+                                   'scale_off': os_, 'scale_bytes': int(scales.size * 2),
+                                   'min_off': om_, 'min_bytes': int(mins.size * 2),
+                                   'quant_err': round(err, 6)}
+                elif args.scheme == 'kmin':
                     index[name] = {'N': int(N), 'K': int(K), 'kmin': True,
                                    'base_off': ow, 'packed_bytes': int(packed.size),
                                    'scale_off': os_, 'scale_bytes': int(scales.size),
@@ -401,7 +452,10 @@ def main():
     # aux.bin   : todos los tensores 1-D (normas y biases) en float32
     lines = []
     for name, m in index.items():
-        if m.get('kmin'):
+        if m.get('affine'):
+            lines.append(f'LINEARA {name} {m["N"]} {m["K"]} {m["base_off"]} '
+                         f'{m["packed_bytes"]} {m["scale_off"]} {m["min_off"]}')
+        elif m.get('kmin'):
             lines.append(f'LINEARK {name} {m["N"]} {m["K"]} {m["base_off"]} '
                          f'{m["packed_bytes"]} {m["scale_off"]} {m["scale_bytes"]}')
         elif splitted:

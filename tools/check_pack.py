@@ -19,6 +19,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from oracle_qwen import SafeTensors  # noqa: E402
 
 
+def dequant_affine(packed_u8, scales_u8, mins_u8, N, K, G):
+    """Esquema afin directo: w = s * q + mn, q in [0, 15]."""
+    q = np.empty((N, K), dtype=np.float32)
+    q[:, 0::2] = (packed_u8 & 0x0F).astype(np.float32)
+    q[:, 1::2] = ((packed_u8 >> 4) & 0x0F).astype(np.float32)
+    sw = scales_u8.view(np.float16).astype(np.float32).reshape(N, G, 1)
+    mn = mins_u8.view(np.float16).astype(np.float32).reshape(N, G, 1)
+    return (q.reshape(N, G, K // G) * sw + mn).reshape(N, K)
+
+
 def dequant_kmin(packed_u8, hdr_u8, N, K):
     """Esquema con minimo: w = d*sc_g*q + dmin*(m_g-32), q in [0,15]."""
     SBn = K // 256
