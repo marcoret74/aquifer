@@ -11,6 +11,7 @@ import os
 import readline  # habilita flechas arriba/abajo e historial en input()
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from oracle_qwen import Tokenizer
@@ -48,7 +49,7 @@ def main():
     ap.add_argument("--threads", type=int, default=4, help="Número de hilos AVX2")
     ap.add_argument("--n", type=int, default=256, help="Tokens máximos generados por turno")
     ap.add_argument("--ctx", type=int, default=1024, help="Ventana de contexto")
-    ap.add_argument("--system", default="Eres Qwen, un asistente inteligente y servicial. Responde siempre en español.",
+    ap.add_argument("--system", default="Eres un asistente servicial que responde siempre en español.",
                     help="Prompt de sistema")
     args = ap.parse_args()
 
@@ -90,6 +91,17 @@ def main():
         elif "THP" in line_clean:
             print(f"  {line_clean}")
 
+    # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
+    if args.system:
+        sys_str = f"<|im_start|>system\n{args.system}<|im_end|>\n"
+        sys_tokens = tok.encode(sys_str)
+        sys_tokens_str = ",".join(map(str, sys_tokens))
+        proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
+        proc.stdin.flush()
+        for line in proc.stdout:
+            if line.strip() == "PREWARMED":
+                break
+
     print(f"\n{BOLD}================================================================={RESET}")
     print(f"{BOLD}      Caudal Shell Interactiva · Qwen 1.5B (17.4 tok/s)         {RESET}")
     print(f"  Comandos especiales:                                           ")
@@ -114,7 +126,18 @@ def main():
                 break
             elif user_input.lower() in ("/reset", "/limpiar", "clear"):
                 history.clear()
-                print(f"{YELLOW}[Memoria de conversación reiniciada]{RESET}\n")
+                proc.stdin.write("RESET\n")
+                proc.stdin.flush()
+                for line in proc.stdout:
+                    if line.strip() == "RESET_OK":
+                        break
+                if args.system:
+                    proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
+                    proc.stdin.flush()
+                    for line in proc.stdout:
+                        if line.strip() == "PREWARMED":
+                            break
+                print(f"{YELLOW}[Memoria y KV-cache reiniciados]{RESET}\n")
                 continue
 
             history.append(("user", user_input))
@@ -127,6 +150,11 @@ def main():
                     history = history[-2:]
                     full_prompt = format_chatml(history, args.system)
                     tokens = tok.encode(full_prompt)
+                    proc.stdin.write("RESET\n")
+                    proc.stdin.flush()
+                    for line in proc.stdout:
+                        if line.strip() == "RESET_OK":
+                            break
 
             tokens_str = ",".join(map(str, tokens))
             proc.stdin.write(f"PROMPT {tokens_str}\n")
@@ -135,12 +163,16 @@ def main():
             sys.stdout.write(f"{CYAN}{BOLD}Qwen > {RESET}")
             sys.stdout.flush()
 
+            t_start = time.time()
+            ttft = None
             resp_tokens = []
             for line in proc.stdout:
                 line_str = line.strip()
                 if line_str == "DONE":
                     break
                 if line_str.startswith("TOKEN "):
+                    if ttft is None:
+                        ttft = time.time() - t_start
                     t_id = int(line_str.split()[1])
                     resp_tokens.append(t_id)
                     token_text = tok.decode([t_id])
@@ -150,7 +182,12 @@ def main():
                     sys.stdout.write(token_text)
                     sys.stdout.flush()
 
-            sys.stdout.write("\n\n")
+            t_end = time.time()
+            ttft_val = ttft if ttft is not None else 0.0
+            gen_time = (t_end - (t_start + ttft_val)) if len(resp_tokens) > 1 else max(0.001, t_end - t_start)
+            tok_s = (len(resp_tokens) - 1) / max(0.001, gen_time) if len(resp_tokens) > 1 else 0.0
+
+            sys.stdout.write(f"\n{BOLD}\033[90m[inicio: {ttft_val*1000:.0f}ms | {len(resp_tokens)} toks | {tok_s:.1f} tok/s]{RESET}\n\n")
             sys.stdout.flush()
 
             assistant_text = tok.decode(resp_tokens).replace("<|im_end|>", "").strip()

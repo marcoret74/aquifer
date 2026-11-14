@@ -816,6 +816,7 @@ int main(int argc, char** argv) {
     if (g_interactive) {
         std::printf("READY\n");
         std::fflush(stdout);
+        std::vector<int> cached_tokens;
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line.empty()) continue;
@@ -823,6 +824,29 @@ int main(int argc, char** argv) {
             std::stringstream ss(line);
             std::string cmd;
             ss >> cmd;
+            if (cmd == "RESET") {
+                cached_tokens.clear();
+                std::printf("RESET_OK\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "PREWARM") {
+                std::string ids_str;
+                ss >> ids_str;
+                std::vector<int> ptokens;
+                std::stringstream pss(ids_str);
+                std::string t;
+                while (std::getline(pss, t, ',')) {
+                    if (!t.empty()) ptokens.push_back(std::atoi(t.c_str()));
+                }
+                for (std::size_t i = 0; i < ptokens.size(); ++i) {
+                    (void)step({0u}, {ptokens[i]}, {i});
+                    cached_tokens.push_back(ptokens[i]);
+                }
+                std::printf("PREWARMED\n");
+                std::fflush(stdout);
+                continue;
+            }
             if (cmd == "PROMPT") {
                 std::string ids_str;
                 ss >> ids_str;
@@ -837,17 +861,34 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
-                // Prefill all tokens except the last one
-                for (std::size_t i = 0; i + 1 < ptokens.size(); ++i) {
+                // Encuentra prefijo ya presente en el KV cache
+                std::size_t common = 0;
+                while (common < cached_tokens.size() &&
+                       common + 1 < ptokens.size() &&
+                       cached_tokens[common] == ptokens[common]) {
+                    ++common;
+                }
+
+                // Prefill unicamente de los tokens nuevos (los anteriores ya estan en KV)
+                for (std::size_t i = common; i + 1 < ptokens.size(); ++i) {
                     (void)step({0u}, {ptokens[i]}, {i});
                 }
+
+                cached_tokens.resize(ptokens.size() - 1);
+                for (std::size_t i = common; i + 1 < ptokens.size(); ++i) {
+                    cached_tokens[i] = ptokens[i];
+                }
+
                 int last_tok = ptokens.back();
                 std::size_t cur_pos = ptokens.size() - 1;
+                cached_tokens.push_back(last_tok);
+
                 for (int step_idx = 0; step_idx < ngen; ++step_idx) {
                     auto out = step({0u}, {last_tok}, {cur_pos});
                     int tok = out[0];
                     std::printf("TOKEN %d\n", tok);
                     std::fflush(stdout);
+                    cached_tokens.push_back(tok);
                     if (tok == 151645 || tok == 151643) {
                         break;
                     }
