@@ -94,7 +94,7 @@ double now_ms() {
     return double(t.tv_sec) * 1e3 + double(t.tv_nsec) * 1e-6;
 }
 
-// --- barrera híbrida spin + sleep (latencia 0 en generación, 0% CPU en reposo) ---
+// --- barrera spin lock-free pura (cero syscalls, latencia 0 en GEMVs) ---
 class SpinBarrier {
 public:
     explicit SpinBarrier(unsigned t) : T_(t) {}
@@ -103,25 +103,15 @@ public:
         if (cnt_.fetch_add(1, std::memory_order_acq_rel) + 1 == T_) {
             cnt_.store(0, std::memory_order_relaxed);
             gen_.fetch_add(1, std::memory_order_release);
-            cv_.notify_all();
         } else {
-            // Spin corto (~30.000 iteraciones) para latencia cero durante generación
-            for (int spin = 0; spin < 30000; ++spin) {
-                if (gen_.load(std::memory_order_acquire) != g) return;
+            while (gen_.load(std::memory_order_acquire) == g) {
                 _mm_pause();
             }
-            // Si el modelo terminó de responder y espera input del usuario: ¡dormir de verdad!
-            std::unique_lock<std::mutex> lk(m_);
-            cv_.wait(lk, [&]() {
-                return gen_.load(std::memory_order_acquire) != g;
-            });
         }
     }
 private:
     unsigned T_;
     std::atomic<unsigned> cnt_{0}, gen_{0};
-    std::mutex m_;
-    std::condition_variable cv_;
 };
 
 class Pool {
@@ -129,13 +119,37 @@ public:
     explicit Pool(unsigned T) : T_(T ? T : 1), go_(T_), fin_(T_) {
         for (unsigned i = 1; i < T_; ++i)
             th_.emplace_back([this, i] {
-                for (;;) { go_.wait(); if (stop_) return; job_(i); fin_.wait(); }
+                for (;;) {
+                    if (sleeping_.load(std::memory_order_acquire)) {
+                        std::unique_lock<std::mutex> lk(sleep_m_);
+                        sleep_cv_.wait(lk, [this] {
+                            return !sleeping_.load(std::memory_order_acquire) || stop_;
+                        });
+                    }
+                    go_.wait();
+                    if (stop_) return;
+                    job_(i);
+                    fin_.wait();
+                }
             });
     }
-    ~Pool() { stop_ = true; go_.wait(); for (auto& t : th_) t.join(); }
+    ~Pool() { stop_ = true; resume(); go_.wait(); for (auto& t : th_) t.join(); }
     Pool(const Pool&) = delete;
     Pool& operator=(const Pool&) = delete;
     unsigned size() const { return T_; }
+
+    void pause() {
+        if (T_ <= 1 || sleeping_.load(std::memory_order_acquire)) return;
+        sleeping_.store(true, std::memory_order_release);
+        run([](unsigned) {}); // despierta workers de go_ para que entren en sleep
+    }
+
+    void resume() {
+        if (!sleeping_.load(std::memory_order_acquire)) return;
+        sleeping_.store(false, std::memory_order_release);
+        sleep_cv_.notify_all();
+    }
+
     void run(std::function<void(unsigned)> f) {
         job_ = std::move(f); go_.wait(); job_(0); fin_.wait();
     }
@@ -145,6 +159,9 @@ private:
     std::vector<std::thread> th_;
     std::function<void(unsigned)> job_;
     bool stop_ = false;
+    std::atomic<bool> sleeping_{false};
+    std::mutex sleep_m_;
+    std::condition_variable sleep_cv_;
 };
 
 // --- anillos de KV, uno por secuencia ---------------------------------------
@@ -921,7 +938,10 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         std::vector<int> cached_tokens;
         std::string line;
-        while (std::getline(std::cin, line)) {
+        for (;;) {
+            pool.pause(); // Pone los workers a dormir mientras espera comando (0% CPU, ventilador silencioso)
+            if (!std::getline(std::cin, line)) break;
+            pool.resume(); // Despierta workers para inferencia con latencia 0 y máxima velocidad
             if (line.empty()) continue;
             if (line == "QUIT" || line == "EXIT") break;
             std::stringstream ss(line);

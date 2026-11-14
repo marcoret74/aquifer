@@ -27,10 +27,16 @@ import os
 import struct
 import sys
 
-import numpy as np
+try:
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+except ImportError:
+    np = None
+    torch = None
+    F = None
+
 import regex
-import torch
-import torch.nn.functional as F
 
 
 # -----------------------------------------------------------------------------
@@ -48,7 +54,9 @@ class SafeTensors:
     def names(self):
         return self.header.keys()
 
-    def get(self, name, dtype=torch.bfloat16):
+    def get(self, name, dtype=None):
+        if dtype is None and torch is not None:
+            dtype = torch.bfloat16
         if name in self._cache:
             return self._cache[name]
         e = self.header[name]
