@@ -83,8 +83,14 @@ class SafeTensors:
 
 
 # -----------------------------------------------------------------------------
-#  Cuantización int4 por grupo de 64 (vectorizada)
+#  Cuantización int4 por grupo (vectorizada)
 # -----------------------------------------------------------------------------
+#  CLIP_GRID: factores k para probar s = k*amax/7 por grupo y quedarse con el
+#  que minimiza el error cuadratico. amax/7 (k=1) garantiza no clampear, pero
+#  no minimiza el error: a 4 bits el optimo suele estar por debajo de 1.
+CLIP_GRID = ()
+
+
 def quantize(w, group=GROUP):
     """w: float32 [N, K] -> (packed uint8 [N, K/2], scales fp16 [N, G], err)"""
     N, K = w.shape
@@ -93,13 +99,49 @@ def quantize(w, group=GROUP):
         raise SystemExit(f'K={K} no es multiplo de {GROUP}')
     G = K // GROUP
 
-    g = w.reshape(N, G, GROUP)
-    amax = np.abs(g).max(axis=2)
     # OJO: clampear en fp32 antes del cast NO alcanza. fp16 no representa 1e-8
     # (subnormal mínimo ~6e-8): 1e-8 -> 0 -> división por cero -> nan.
     # Hay grupos con amax==0 (canales muertos), así que el clamp va en dominio
     # fp16 y en el mínimo NORMAL, que sobrevive seguro.
     MIN_F16 = np.float16(6.103515625e-05)      # 2^-14, menor normal de fp16
+
+    if CLIP_GRID:
+        # Por bloques de filas: la busqueda guarda codes+escalas del mejor k y
+        # en el embedding (151936x1536) no cabe entero en RAM.
+        rows = max(1, min(N, int(2e8 // max(1, K * 4))))
+        packed = np.empty((N, K // 2), dtype=np.uint8)
+        sw16 = np.empty((N, G), dtype=np.float16)
+        num2 = 0.0
+        den2 = 0.0
+        for r0 in range(0, N, rows):
+            r1 = min(N, r0 + rows)
+            g = np.ascontiguousarray(w[r0:r1]).reshape(r1 - r0, G, GROUP)
+            amax = np.abs(g).max(axis=2)
+            mejor_e = np.full(amax.shape, np.inf, dtype=np.float32)
+            mejor_s = np.zeros(amax.shape, dtype=np.float32)
+            mejor_c = np.zeros(g.shape, dtype=np.int8)
+            for k in CLIP_GRID:
+                s16 = np.maximum(((amax * np.float32(k)) / np.float32(7.0)
+                                  ).astype(np.float16), MIN_F16)
+                sb = s16.astype(np.float32)
+                c = np.rint(g / sb[:, :, None])
+                np.clip(c, -8, 7, out=c)
+                e = ((g - c * sb[:, :, None]) ** 2).sum(axis=2)
+                mj = e < mejor_e
+                mejor_e = np.where(mj, e, mejor_e)
+                mejor_s = np.where(mj, sb, mejor_s)
+                mejor_c = np.where(mj[:, :, None], c.astype(np.int8), mejor_c)
+            num2 += float(((g - mejor_c.astype(np.float32)
+                            * mejor_s[:, :, None]) ** 2).sum())
+            den2 += float((g.astype(np.float64) ** 2).sum())
+            sw16[r0:r1] = np.maximum(mejor_s.astype(np.float16), MIN_F16)
+            u = (mejor_c.astype(np.int16) + 8).astype(np.uint8).reshape(r1 - r0, K)
+            packed[r0:r1] = u[:, 0::2] | (u[:, 1::2] << 4)
+        err = (np.sqrt(num2) / (np.sqrt(den2) or 1.0))
+        return packed, sw16, err
+
+    g = w.reshape(N, G, GROUP)
+    amax = np.abs(g).max(axis=2)
     sw16 = np.maximum((amax / 7.0).astype(np.float16), MIN_F16)
     sw_back = sw16.astype(np.float32)          # el valor REAL que leerá el kernel
 
@@ -147,6 +189,9 @@ def main():
     ap.add_argument('--layout-out', default=None)
     ap.add_argument('--layout-tokens', type=int, default=2,
                     help='cuantos x sinteticos para el set de 5 archivos')
+    ap.add_argument('--clip-grid', default='',
+                    help='factores k separados por coma para s = k*amax/7 por '
+                         'grupo (vacio = amax/7). Ej: 0.70,0.80,0.90,1.0')
     ap.add_argument('--stride-align', type=int, default=64,
                     help='alineacion del stride en layout inter (0 = exacto, sin '
                          'huecos: era el agujero que hundio el intercalado)')
@@ -156,6 +201,10 @@ def main():
     ap.add_argument('--group', type=int, default=64, choices=[16, 32, 64],
                     help='valores por escala (64 = 4.25 bits, 32 = 4.75 bits)')
     args = ap.parse_args()
+    global CLIP_GRID
+    if args.clip_grid:
+        CLIP_GRID = tuple(float(x) for x in args.clip_grid.split(','))
+        print(f'clip grid: {CLIP_GRID}')
     global GROUP
     GROUP = args.group
 

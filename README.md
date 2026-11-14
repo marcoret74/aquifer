@@ -647,6 +647,45 @@ nuestra**, así que la conclusión conserva su dirección.
 - Con 4,50 bpw empatados, ellos degradan menos: su esquema (super-bloques con
   sub-escalas de 6 bits) es mejor por bit que nuestro g32 uniforme.
 
+## Día 23 — Grilla de clipping: +0,3 % de BPC, no cierra el 5,5 % (2026-11-13)
+
+Opción A del roadmap: buscar por grupo el factor `k` en `s = k·amax/7` que
+minimiza el error, en vez de `amax/7` a secas. Implementado como
+`pack_qwen.py --clip-grid` (mismo formato, mismo kernel, mismas 4,50 bpw) y
+medido con `tools/ppl_artifact.py`, que calcula la perplejidad **del artefacto
+empaquetado** (el oráculo cuantiza al vuelo con su propia convención y no ve
+el cambio).
+
+### La trampa: las ventanas cortas mienten
+
+| ventana | baseline | clip {0,8·0,9·1,0} | ganancia |
+|---|---|---|---|
+| 512 tok | 27,27 | 24,95 | **−8,5 %** |
+| 1024 tok | 43,39 | 40,39 | −6,9 % |
+| **1710 tok (corpus completo)** | **34,89** | **34,57** | **−0,9 %** |
+
+Y con la grilla más conservadora {0,90·0,95·1,0}, en el corpus completo:
+34,53 (−1,0 % ppl, **−0,29 % BPC**).
+
+**La ganancia de las ventanas cortas era efecto de muestreo**: la mitad
+puntuada de una ventana de 512 tokens son 256 tokens de un tramo concreto, y
+el contenido manda. Es la segunda vez en el día que una medición "estable y
+reproducible" resulta falsa; la primera fue el probe de ancho de banda.
+
+### Conclusión
+
+- El criterio MSE por grupo **no es el correcto**: la grilla grande (con 0,7)
+  bajaba el error de cuantización a 9,15 % y **empeoraba** la perplejidad.
+- La ganancia real del clipping es **~0,3 % de BPC**, contra un hueco de 5,5 %.
+  **No lo cierra.**
+- Por lo tanto el hueco es **estructural**: es el esquema de K-quants
+  (super-bloques de 256 con sub-escalas de 6 bits) contra nuestro g32 uniforme,
+  y eso exige kernel nuevo, no packer.
+
+La Opción A queda **agotada como palanca barata**, con su número medido. Las
+dos que quedan: aceptar el canje documentado (22 % menos bytes por 5,5 % de
+calidad por bit), o ir a kernel con super-bloques.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
