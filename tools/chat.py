@@ -2,16 +2,20 @@
 """chat.py — Shell interactiva para conversar con modelos cuantizados en Caudal.
 
 Soporta:
-    - Qwen 2.5-1.5B Instruct     (--model qwen)
-    - DeepSeek-R1-Distill-1.5B    (--model r1)
-    - TinyLlama-1.1B Chat         (--model tiny)
-    - SmolLM2-1.7B Instruct       (--model smol2)
+    - Qwen 2.5-1.5B Instruct          (--model qwen)
+    - Qwen 2.5-0.5B Instruct (~52 t/s) (--model qwen05)
+    - Qwen 2.5-Coder-1.5B (Código)    (--model coder)
+    - DeepSeek-R1-Distill-1.5B        (--model r1)
+    - TinyLlama-1.1B Chat             (--model tiny)
+    - SmolLM2-1.7B Instruct           (--model smol2)
 
 Uso:
-    python3 tools/chat.py --model tiny
-    python3 tools/chat.py --model smol2
+    python3 tools/chat.py --model qwen05
+    python3 tools/chat.py --model coder
     python3 tools/chat.py --model qwen
     python3 tools/chat.py --model r1
+    python3 tools/chat.py --model tiny
+    python3 tools/chat.py --model smol2
 """
 
 import argparse
@@ -58,7 +62,7 @@ def format_prompt(history, model_type="qwen", system_prompt=None):
                 parts.append(f"<|assistant|>\n{text}</s>\n")
         parts.append("<|assistant|>\n")
         return "".join(parts)
-    else:  # qwen y smol2 usan ChatML
+    else:  # qwen, qwen05, coder y smol2 usan ChatML
         parts = []
         if system_prompt:
             parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>\n")
@@ -73,8 +77,8 @@ def main():
     default_bin = os.path.join(repo_dir, "build", "generate_qwen")
 
     ap = argparse.ArgumentParser(description="Chat interactivo en Caudal Engine (5.00 bpw)")
-    ap.add_argument("--model", choices=["qwen", "r1", "tiny", "smol2"], default="qwen",
-                    help="Modelo a usar: 'qwen' (Qwen2.5-1.5B), 'r1' (DeepSeek-R1-1.5B), 'tiny' (TinyLlama-1.1B), 'smol2' (SmolLM2-1.7B)")
+    ap.add_argument("--model", choices=["qwen", "qwen05", "coder", "r1", "tiny", "smol2"], default="qwen",
+                    help="Modelo: 'qwen' (1.5B), 'qwen05' (0.5B rápido), 'coder' (1.5B Coder), 'r1' (R1 Distill), 'tiny' (1.1B), 'smol2' (1.7B)")
     ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_qwen")
     ap.add_argument("--artifact", default=None, help="Ruta al artefacto cuantizado")
     ap.add_argument("--tokenizer", default=None, help="Ruta a tokenizer.json")
@@ -84,7 +88,7 @@ def main():
     ap.add_argument("--system", default=None, help="Prompt de sistema")
     args = ap.parse_args()
 
-    # Configuraciones específicas por arquitectura y modelo
+    # Configuraciones específicas por modelo
     if args.model == "r1":
         if args.artifact is None:
             args.artifact = os.path.join(repo_dir, "build", "r1_affine")
@@ -98,6 +102,32 @@ def main():
         bot_color = YELLOW
         bot_label = "DeepSeek-R1"
         eos_str = "151643"
+    elif args.model == "qwen05":
+        if args.artifact is None:
+            args.artifact = os.path.join(repo_dir, "build", "qwen05_affine")
+        if args.tokenizer is None:
+            args.tokenizer = "/home/marco/.cache/caudal/qwen05/tokenizer.json"
+        if args.system is None:
+            args.system = "Eres un asistente servicial que responde siempre en español de forma concisa."
+        if args.n is None:
+            args.n = 256
+        model_title = "Qwen 2.5-0.5B Instruct (Ultra-Rápido ~52 tok/s)"
+        bot_color = BLUE
+        bot_label = "Qwen-0.5B"
+        eos_str = "151643,151645"
+    elif args.model == "coder":
+        if args.artifact is None:
+            args.artifact = os.path.join(repo_dir, "build", "coder15_affine")
+        if args.tokenizer is None:
+            args.tokenizer = "/home/marco/.cache/caudal/coder15/tokenizer.json"
+        if args.system is None:
+            args.system = "Eres un asistente experto en programación de software, arquitectura de sistemas y algoritmos. Genera código limpio, moderno, tipado y bien explicado."
+        if args.n is None:
+            args.n = 512
+        model_title = "Qwen 2.5-Coder-1.5B Instruct (Código y Sistemas)"
+        bot_color = GREEN
+        bot_label = "Qwen-Coder"
+        eos_str = "151643,151645"
     elif args.model == "tiny":
         if args.artifact is None:
             args.artifact = os.path.join(repo_dir, "build", "tiny_affine")
@@ -179,7 +209,7 @@ def main():
 
     # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
     sys_tokens_str = ""
-    if args.system and args.model in ("qwen", "tiny", "smol2"):
+    if args.system and args.model in ("qwen", "qwen05", "coder", "tiny", "smol2"):
         if args.model == "tiny":
             sys_str = f"<|system|>\n{args.system}</s>\n"
         else:

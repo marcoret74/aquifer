@@ -631,6 +631,46 @@ inline void gemv_int4_affine_M(const Shape& s,
             }
         }
 
+        // --- cola (bloques restantes si blocks no es multiplo de 4, ej. Qwen-0.5B con K=896) ---
+        for (; bb < blocks; ++bb) {
+            const __m256i v = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(row + bb * 32));
+            const __m256i lo = _mm256_and_si256(v, m0f);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m0f);
+            const __m256i A_block = _mm256_unpacklo_epi8(lo, hi);
+            const __m256i B_block = _mm256_unpackhi_epi8(lo, hi);
+            const std::size_t g0 = 2 * bb, g1 = 2 * bb + 1;
+
+            const float w0 = static_cast<float>(sc[g0]);
+            const float w1 = static_cast<float>(sc[g1]);
+            const float mn0 = static_cast<float>(mn[g0]);
+            const float mn1 = static_cast<float>(mn[g1]);
+
+            const __m256 m_tail = _mm256_setr_ps(mn0, mn1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+#pragma GCC unroll 8
+            for (unsigned m = 0; m < M; ++m) {
+                const float s0 = w0 * xscale[std::size_t(m) * G + g0];
+                const float s1 = w1 * xscale[std::size_t(m) * G + g1];
+                const __m256 sv = _mm256_set_m128(_mm_set1_ps(s1), _mm_set1_ps(s0));
+
+                const float xms0 = xmin_scale[std::size_t(m) * G + g0];
+                const float xms1 = xmin_scale[std::size_t(m) * G + g1];
+                const __m256 xms_tail = _mm256_setr_ps(xms0, xms1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                minacc[m] = _mm256_fmadd_ps(m_tail, xms_tail, minacc[m]);
+
+                const std::int8_t* xm = xperm + std::size_t(m) * s.K + bb * 64;
+                const __m256i x0 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(xm));
+                const __m256i x1 = _mm256_loadu_si256(
+                    reinterpret_cast<const __m256i*>(xm + 32));
+                __m256i acc = _mm256_madd_epi16(_mm256_maddubs_epi16(A_block, x0), ones16);
+                acc = _mm256_add_epi32(
+                    acc, _mm256_madd_epi16(_mm256_maddubs_epi16(B_block, x1), ones16));
+                facc[m] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(acc), sv, facc[m]);
+            }
+        }
+
         auto hsum = [](__m256 v) {
             __m128 l = _mm256_castps256_ps128(v);
             __m128 h = _mm256_extractf128_ps(v, 1);
