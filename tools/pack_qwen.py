@@ -44,15 +44,15 @@ LINEAR_SUFFIX = ('q_proj.weight', 'k_proj.weight', 'v_proj.weight', 'o_proj.weig
 
 
 # -----------------------------------------------------------------------------
-#  Lectura de safetensors sin dependencias
+#  Lectura de safetensors (individual y multi-shard) sin dependencias
 # -----------------------------------------------------------------------------
-class SafeTensors:
+class _SingleSafeTensors:
     def __init__(self, path):
         self.path = path
         self.f = open(path, 'rb')
         raw = self.f.read(8)
         if len(raw) != 8:
-            raise SystemExit('archivo safetensors truncado')
+            raise SystemExit(f'archivo safetensors truncado: {path}')
         (hlen,) = struct.unpack('<Q', raw)
         self.header = json.loads(self.f.read(hlen).decode('utf-8'))
         self.data_start = 8 + hlen
@@ -80,6 +80,63 @@ class SafeTensors:
         else:
             raise SystemExit(f'dtype no soportado: {dtype}')
         return f.reshape(shape)
+
+
+class SafeTensors:
+    def __init__(self, path_or_dir):
+        if os.path.isdir(path_or_dir):
+            index_path = os.path.join(path_or_dir, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                with open(index_path, "r", encoding="utf-8") as f:
+                    idx_data = json.load(f)
+                weight_map = idx_data.get("weight_map", {})
+                shard_files = sorted(set(weight_map.values()))
+                self.shards = {}
+                self.header = {}
+                self.tensor_to_shard = {}
+                for sf in shard_files:
+                    s_path = os.path.join(path_or_dir, sf)
+                    st = _SingleSafeTensors(s_path)
+                    self.shards[sf] = st
+                    for k in st.header:
+                        self.header[k] = st.header[k]
+                        self.tensor_to_shard[k] = sf
+            else:
+                single_path = os.path.join(path_or_dir, "model.safetensors")
+                if os.path.exists(single_path):
+                    st = _SingleSafeTensors(single_path)
+                    self.shards = {"model.safetensors": st}
+                    self.header = st.header
+                    self.tensor_to_shard = {k: "model.safetensors" for k in st.header}
+                else:
+                    s_files = sorted([f for f in os.listdir(path_or_dir) if f.endswith(".safetensors")])
+                    if not s_files:
+                        raise SystemExit(f"No se encontraron archivos .safetensors en {path_or_dir}")
+                    self.shards = {}
+                    self.header = {}
+                    self.tensor_to_shard = {}
+                    for sf in s_files:
+                        st = _SingleSafeTensors(os.path.join(path_or_dir, sf))
+                        self.shards[sf] = st
+                        for k in st.header:
+                            self.header[k] = st.header[k]
+                            self.tensor_to_shard[k] = sf
+        else:
+            st = _SingleSafeTensors(path_or_dir)
+            self.shards = {path_or_dir: st}
+            self.header = st.header
+            self.tensor_to_shard = {k: path_or_dir for k in st.header}
+
+    def names(self):
+        return list(self.header.keys())
+
+    def info(self, name):
+        sf = self.tensor_to_shard[name]
+        return self.shards[sf].info(name)
+
+    def tensor_f32(self, name):
+        sf = self.tensor_to_shard[name]
+        return self.shards[sf].tensor_f32(name)
 
 
 # -----------------------------------------------------------------------------
@@ -307,10 +364,7 @@ def main():
     global GROUP
     GROUP = args.group
 
-    st_path = os.path.join(args.model, 'model.safetensors')
-    if not os.path.exists(st_path):
-        raise SystemExit(f'no existe {st_path}')
-    st = SafeTensors(st_path)
+    st = SafeTensors(args.model)
     cfg_path = os.path.join(args.model, 'config.json')
     cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
 
