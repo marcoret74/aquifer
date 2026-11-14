@@ -254,9 +254,9 @@ H 2048 / NLY 22 / NH 32 / NKV 4 / DH 64 / INTER 5632 / V 32000
 581,9 MB empaquetado · 155 lineales · 45 aux · 4,500 bits/param
 ```
 
-**Entró sin tocar una línea de motor.** Respondió
-`El país de Francia es la capital de Francia, y su nombre es París.` y cierra
-con `</s>`. La prosa es la de un 1.1B; el motor hizo su trabajo.
+**Entró sin tocar una línea de motor.** Con su prompt canónico (BOS incluido)
+respondió `El nombre de la capital de Francia es París.` y cierra con `</s>`.
+La prosa es la de un 1.1B; el motor hizo su trabajo.
 
 ### La ley de ancho de banda
 
@@ -267,7 +267,7 @@ interesante no es el ranking sino la constante:
 |---|---|---|---|---|
 | Qwen2.5-1.5B | 868,3 MB | 42,7 | 23,4 | 20,3 |
 | R1-Distill-1.5B | 868,3 MB | 43,3 | 23,1 | 20,1 |
-| TinyLlama-1.1B | 581,9 MB | 30,1 | **33,3** | 19,3 |
+| TinyLlama-1.1B | 581,9 MB | 29,6 | **33,8** | 19,7 |
 | SmolLM2-1.7B | 962,6 MB | 50,5 | 19,8 | 19,1 |
 
 **19,1 – 20,3 GB/s en los cuatro**, o sea 76–80 % del techo medido de
@@ -282,7 +282,7 @@ La métrica honesta para comparar modelos en `caudal` no es tok/s: es
 
 | modelo | 1 seq | 4 seq (agregado) | por secuencia |
 |---|---|---|---|
-| TinyLlama-1.1B | 31,4–33,3 | **58,2** | 14,6 |
+| TinyLlama-1.1B | 33,8 | **58,0** | 14,5 |
 | Qwen2.5-1.5B | 23,7 | 43,1 | 10,8 |
 | R1-Distill-1.5B | 23,1 | 39,9 | 10,0 |
 | SmolLM2-1.7B | 19,1–19,8 | 19,9 | 5,0 |
@@ -303,11 +303,30 @@ con `ByteFallback`). El tokenizer casero aprendió esa rama: BPE sobre el texto
 normalizado, `<0xXX>` para lo que no está en el vocabulario, y `U+2581` → espacio
 al decodificar. Ahora cubre Qwen2, SmolLM2 y Llama-2/Mistral.
 
-**Límite declarado:** al separar por tokens especiales, `_encode_plain` antepone
-un `U+2581` a cada segmento, así que tras `</s>` queda un `▁` que HF quizá no
-pondría. Los ids pueden diferir de los de HF en ese detalle. La prueba del motor
-sigue siendo válida porque **C++ y oráculo usan exactamente los mismos ids**; lo
-que no se puede afirmar es que la tokenización sea bit-idéntica a la de `transformers`.
+**Verificado contra `tokenizers`**, en un venv aparte (el motor C++ sigue con
+cero dependencias; esto es solo banco de pruebas). `tokenizers` 0.23.3:
+
+| modelo | prompt real (ids) | decode | 60 frases del README |
+|---|---|---|---|
+| Qwen2.5 | idénticos | idéntico | 60/60 |
+| R1-Distill | idénticos | idéntico | 60/60 |
+| TinyLlama | idénticos | idéntico | 60/60 |
+| SmolLM2 | idénticos | idéntico | 59/60 |
+
+Y el contraste encontró **dos bugs reales míos** que el roundtrip solo no veía:
+
+1. **Patrón equivocado para Qwen.** `_pretok_spec` tomaba el `Sequence` como
+   «usa GPT-2» y descartaba el `Split` propio del tokenizer. El `ByteLevel` de
+   Qwen lleva `use_regex=false` justamente porque el corte ya lo hizo el `Split`.
+   Con el patrón de GPT-2 se fusionaban mal los `\n\n`: **35 % de las frases
+   coincidían antes, 100 % después.**
+2. **Faltaba el `post_processor`.** TinyLlama declara un `TemplateProcessing`
+   que antepone `<s>`; sin leerlo, el prompt salía sin BOS. Ahora el prompt es
+   el canónico y la respuesta mejoró.
+
+Queda una diferencia conocida: en SmolLM2, `\n\n` seguido de dígito se parte en
+dos `Ċ` en vez de fusionarse (`(?!\S)` no backtracks igual en el crate `regex`
+de Rust que en el módulo `regex` de Python). No afecta a ningún prompt usado.
 
 ## Orden de construcción
 

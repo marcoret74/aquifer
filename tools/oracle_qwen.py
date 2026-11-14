@@ -105,11 +105,16 @@ def _pretok_spec(t):
     norm = json.dumps(t.get('normalizer') or {})
     if pt is None and '\\u2581' in norm:
         return 'sp', None, False
-    if pt and pt.get('type') == 'Sequence':
-        subs = pt.get('pretokenizers', [])
-        dig = any(x.get('type') == 'Digits' for x in subs)
-        return 'regex', regex.compile(GPT2_PAT), dig
-    return 'regex', regex.compile(pt['pretokenizers'][0]['pattern']['Regex']), False
+    subs = pt.get('pretokenizers', []) if pt else []
+    # El Split manda: Qwen trae su propio regex y su ByteLevel NO re-corta
+    # (use_regex=false). Usar el patron de GPT-2 ahi fusionaba mal los \n\n.
+    split = next((x for x in subs if x.get('type') == 'Split'), None)
+    dig = any(x.get('type') == 'Digits' for x in subs)
+    if split is not None:
+        pat = split['pattern']['Regex']
+    else:
+        pat = GPT2_PAT
+    return 'regex', regex.compile(pat), dig
 
 
 class Tokenizer:
@@ -122,6 +127,17 @@ class Tokenizer:
             self.rank[(a, b)] = i
         self.added = {a['content']: a['id'] for a in t.get('added_tokens', [])}
         self.mode, self.pat, self.digits_split = _pretok_spec(t)
+        # post_processor: TemplateProcessing dice que el texto lleva <s> al
+        # principio (TinyLlama) o nada (Qwen). Sin esto los ids no coinciden
+        # con los de `tokenizers` aunque el BPE sea correcto.
+        self.post = []
+        pp = t.get('post_processor') or {}
+        if pp.get('type') == 'TemplateProcessing':
+            for el in pp.get('single', []):
+                if 'SpecialToken' in el:
+                    self.post.append(('S', el['SpecialToken']['id']))
+                elif 'Sequence' in el:
+                    self.post.append(('Q', None))
         self.b2u = _bytes_to_unicode()
         self.u2b = {v: k for k, v in self.b2u.items()}
         # id -> str, para decodificar
@@ -211,6 +227,14 @@ class Tokenizer:
                 ids.append(self.added[part])
             else:
                 ids.extend(self._encode_plain(part))
+        if self.post:
+            out = []
+            for kind, val in self.post:
+                if kind == 'S':
+                    out.append(self.added.get(val, self.vocab.get(val)))
+                else:
+                    out.extend(ids)
+            return out
         return ids
 
     def decode(self, ids):
