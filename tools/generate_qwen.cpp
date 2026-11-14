@@ -44,6 +44,7 @@ static double g_t_gemv = 0.0, g_t_attn = 0.0;
 static double g_bytes = 0.0;
 static bool g_probe = false;
 static bool g_no_thp = false;
+static bool g_bench_pool = false;
 static bool g_time = false;
 
 namespace {
@@ -431,6 +432,7 @@ int main(int argc, char** argv) {
         else if (a == "--time") g_time = true;
         else if (a == "--probe-read") g_probe = true;
         else if (a == "--no-thp") g_no_thp = true;
+        else if (a == "--bench-pool") g_bench_pool = true;
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
@@ -525,6 +527,16 @@ int main(int argc, char** argv) {
 
     const unsigned T = reqT ? reqT : std::max(1u, std::thread::hardware_concurrency());
     Pool pool(T);
+    if (g_bench_pool) {
+        const int N = 20000;
+        for (int i = 0; i < 1000; ++i) pool.run([](unsigned) {});
+        const auto p0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < N; ++i) pool.run([](unsigned) {});
+        const double us = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - p0).count() / N;
+        std::printf("POOL: %.2f us por run vacia  ->  %.1f us/token con 113 llamadas\n",
+                    us, us * 113.0);
+    }
     const unsigned NS = unsigned(prompts.size());
     KvRings kv;
     kv.init(std::size_t(ctx), cfg.NLY, cfg.NKV, cfg.DH, NS);
