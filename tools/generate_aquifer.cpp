@@ -38,7 +38,11 @@
 #include <thread>
 #include <vector>
 
-#include <immintrin.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#  include <immintrin.h>
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#  include <arm_neon.h>
+#endif
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -105,7 +109,11 @@ public:
             gen_.fetch_add(1, std::memory_order_release);
         } else {
             while (gen_.load(std::memory_order_acquire) == g) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                asm volatile("yield");
+#else
                 _mm_pause();
+#endif
             }
         }
     }
@@ -300,7 +308,7 @@ inline float dot_f32(const float* __restrict a, const float* __restrict b, std::
     float r = _mm_cvtss_f32(t);
     for (; i < n; ++i) r += a[i] * b[i];
     return r;
-#else
+#elif defined(__x86_64__) || defined(_M_X64)
     __m128 a0 = _mm_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
     std::size_t i = 0;
     for (; i + 16 <= n; i += 16) {
@@ -313,6 +321,23 @@ inline float dot_f32(const float* __restrict a, const float* __restrict b, std::
     a0 = _mm_hadd_ps(a0, a0); a0 = _mm_hadd_ps(a0, a0);
     float r = _mm_cvtss_f32(a0);
     for (; i < n; ++i) r += a[i] * b[i];
+    return r;
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        a0 = vmlaq_f32(a0, vld1q_f32(a + i),      vld1q_f32(b + i));
+        a1 = vmlaq_f32(a1, vld1q_f32(a + i + 4),  vld1q_f32(b + i + 4));
+        a2 = vmlaq_f32(a2, vld1q_f32(a + i + 8),  vld1q_f32(b + i + 8));
+        a3 = vmlaq_f32(a3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+    }
+    a0 = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+    float r = vaddvq_f32(a0);
+    for (; i < n; ++i) r += a[i] * b[i];
+    return r;
+#else
+    float r = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) r += a[i] * b[i];
     return r;
 #endif
 }
@@ -805,7 +830,7 @@ int main(int argc, char** argv) {
                         for (std::size_t j = 0; j + 8 <= cfg.DH; j += 8)
                             _mm256_storeu_ps(oacc + j, _mm256_fmadd_ps(
                                 p, _mm256_loadu_ps(vs + j), _mm256_loadu_ps(oacc + j)));
-#else
+#elif defined(__x86_64__) || defined(_M_X64)
                         const __m128 p = _mm_set1_ps(arow[s] * inv);
                         const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
                         std::size_t j = 0;
@@ -816,6 +841,24 @@ int main(int argc, char** argv) {
                         }
                         for (; j < cfg.DH; ++j) {
                             oacc[j] += (arow[s] * inv) * vs[j];
+                        }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+                        const float32x4_t p = vdupq_n_f32(arow[s] * inv);
+                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                        std::size_t j = 0;
+                        for (; j + 4 <= cfg.DH; j += 4) {
+                            float32x4_t cur = vld1q_f32(oacc + j);
+                            float32x4_t v = vld1q_f32(vs + j);
+                            vst1q_f32(oacc + j, vmlaq_f32(cur, p, v));
+                        }
+                        for (; j < cfg.DH; ++j) {
+                            oacc[j] += (arow[s] * inv) * vs[j];
+                        }
+#else
+                        const float p = arow[s] * inv;
+                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                        for (std::size_t j = 0; j < cfg.DH; ++j) {
+                            oacc[j] += p * vs[j];
                         }
 #endif
                     }

@@ -46,6 +46,8 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #  include <immintrin.h>
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+#  include <arm_neon.h>
 #endif
 
 namespace caudal {
@@ -687,7 +689,7 @@ inline void gemv_int4_affine_M(const Shape& s,
             y[std::size_t(m) * ystride + n] = hsum(facc[m]) + hsum(minacc[m]);
         }
     }
-#else
+#elif defined(__x86_64__) || defined(_M_X64)
     // --- Implementación SSE4.1 / SSE4.2 (128 bits para Intel Pentium N3700 / Acer) ---
     const __m128i m0f = _mm_set1_epi8(0x0F);
     const __m128i ones16 = _mm_set1_epi16(1);
@@ -740,6 +742,70 @@ inline void gemv_int4_affine_M(const Shape& s,
 
                 const float dot0 = float(r0[0] + r0[1] + r0[2] + r0[3]);
                 const float dot1 = float(r1[0] + r1[1] + r1[2] + r1[3]);
+
+                facc[m] += dot0 * (w0 * xscale[std::size_t(m) * G + g0])
+                         + dot1 * (w1 * xscale[std::size_t(m) * G + g1])
+                         + mn0 * xmin_scale[std::size_t(m) * G + g0]
+                         + mn1 * xmin_scale[std::size_t(m) * G + g1];
+            }
+        }
+
+        for (unsigned m = 0; m < M; ++m) {
+            y[std::size_t(m) * ystride + n] = facc[m];
+        }
+    }
+#elif defined(__ARM_NEON) || defined(__aarch64__)
+    // --- Implementación ARM NEON (128 bits para ARMv8-A / Exynos / Galaxy Note 10 Lite) ---
+    const uint8x16_t m0f = vdupq_n_u8(0x0F);
+    const std::size_t G = s.groups();
+    const std::size_t blocks = s.K / 64;
+
+    for (std::size_t n = 0; n < s.N; ++n) {
+        const std::uint8_t* row = w + n * (s.K / 2);
+        const _Float16* sc = wscale + n * G;
+        const _Float16* mn = wmin + n * G;
+
+        float facc[M]{0.0f};
+
+        for (std::size_t bb = 0; bb < blocks; ++bb) {
+            const uint8x16_t v0 = vld1q_u8(row + bb * 32);
+            const uint8x16_t v1 = vld1q_u8(row + bb * 32 + 16);
+
+            const uint8x16_t lo0 = vandq_u8(v0, m0f);
+            const uint8x16_t hi0 = vandq_u8(vshrq_n_u8(v0, 4), m0f);
+            const uint8x16_t A0 = vzip1q_u8(lo0, hi0);
+            const uint8x16_t B0 = vzip2q_u8(lo0, hi0);
+
+            const uint8x16_t lo1 = vandq_u8(v1, m0f);
+            const uint8x16_t hi1 = vandq_u8(vshrq_n_u8(v1, 4), m0f);
+            const uint8x16_t A1 = vzip1q_u8(lo1, hi1);
+            const uint8x16_t B1 = vzip2q_u8(lo1, hi1);
+
+            const std::size_t g0 = 2 * bb, g1 = 2 * bb + 1;
+            const float w0 = static_cast<float>(sc[g0]);
+            const float w1 = static_cast<float>(sc[g1]);
+            const float mn0 = static_cast<float>(mn[g0]);
+            const float mn1 = static_cast<float>(mn[g1]);
+
+            for (unsigned m = 0; m < M; ++m) {
+                const std::int8_t* xm = xperm + std::size_t(m) * s.K + bb * 64;
+                const int8x16_t x0_0 = vld1q_s8(xm);
+                const int8x16_t x0_1 = vld1q_s8(xm + 16);
+                const int8x16_t x1_0 = vld1q_s8(xm + 32);
+                const int8x16_t x1_1 = vld1q_s8(xm + 48);
+
+                int16x8_t d0 = vmull_s8(vget_low_s8(vreinterpretq_s8_u8(A0)), vget_low_s8(x0_0));
+                d0 = vmlal_s8(d0, vget_high_s8(vreinterpretq_s8_u8(A0)), vget_high_s8(x0_0));
+                d0 = vmlal_s8(d0, vget_low_s8(vreinterpretq_s8_u8(B0)), vget_low_s8(x1_0));
+                d0 = vmlal_s8(d0, vget_high_s8(vreinterpretq_s8_u8(B0)), vget_high_s8(x1_0));
+
+                int16x8_t d1 = vmull_s8(vget_low_s8(vreinterpretq_s8_u8(A1)), vget_low_s8(x0_1));
+                d1 = vmlal_s8(d1, vget_high_s8(vreinterpretq_s8_u8(A1)), vget_high_s8(x0_1));
+                d1 = vmlal_s8(d1, vget_low_s8(vreinterpretq_s8_u8(B1)), vget_low_s8(x1_1));
+                d1 = vmlal_s8(d1, vget_high_s8(vreinterpretq_s8_u8(B1)), vget_high_s8(x1_1));
+
+                const float dot0 = float(vaddvq_s32(vpaddlq_s16(d0)));
+                const float dot1 = float(vaddvq_s32(vpaddlq_s16(d1)));
 
                 facc[m] += dot0 * (w0 * xscale[std::size_t(m) * G + g0])
                          + dot1 * (w1 * xscale[std::size_t(m) * G + g1])
