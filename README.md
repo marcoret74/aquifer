@@ -392,6 +392,37 @@ verificado.
 Lo accionable sale de la tabla, no del ranking: **18 GB/s contra 25,3 de techo**
 es el número a atacar (arena mmap, layout de escalas, kernels por grupo).
 
+### Calidad: el ppl **no** es comparable entre motores (intento fallido, documentado)
+
+Se intentó cerrar la duda de calidad con `llama-perplexity` sobre el mismo
+corpus (1200 tokens de prosa del README, ventana de 512):
+
+| medición | ppl |
+|---|---|
+| caudal bf16 (misma ventana, 511 transiciones) | 38,49 |
+| caudal int4 g32 (idem) | 47,05 |
+| llama.cpp Q4_K_M (`-c 512 --chunks 1`) | 27,06 ± 5,62 |
+
+**Esa tabla no se puede usar para comparar motores**, y queda escrito para que
+no se cite:
+
+1. **Tokenizadores distintos.** La perplejidad solo es comparable sobre la
+   *misma* secuencia de tokens; el mismo texto tokenizado por dos vocabularios
+   da secuencias y denominadores distintos.
+2. **`llama-perplexity` no puntúa todo lo que lee.** Usa la primera mitad del
+   contexto como calentamiento y evalúa la segunda. Nosotros promediamos las
+   511 transiciones completas. Y el corpus estaba duplicado para llegar a los
+   1024 tokens mínimos, así que su mitad puntuada era texto repetido: ppl
+   artificialmente baja.
+
+Lo único válido de esa corrida es **interno**: int4 g32 degrada **+22,2 %**
+sobre bf16 en la ventana idéntica (47,05 / 38,49), consistente con el +22,7 %
+ya documentado.
+
+La comparación honesta pendiente es **bits por carácter sobre el mismo texto**,
+que sí es invariante al tokenizador, o forzar la misma secuencia de ids en
+ambos motores (imposible sin re-tokenizar el GGUF).
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
