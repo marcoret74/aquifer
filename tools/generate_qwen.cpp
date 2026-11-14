@@ -28,6 +28,7 @@
 #include <ctime>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <algorithm>
 #include <map>
 #include <sstream>
@@ -463,6 +464,7 @@ int main(int argc, char** argv) {
     const std::string A = argv[1];
     int ngen = 32, ctx = 512, spec = 0;
     unsigned reqT = 0;
+    bool g_interactive = false;
     std::vector<std::vector<int>> prompts;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -477,20 +479,21 @@ int main(int argc, char** argv) {
         else if (a == "--no-thp") g_no_thp = true;
         else if (a == "--bench-pool") g_bench_pool = true;
         else if (a == "--slow-quant") g_slow_quant = true;
+        else if (a == "--interactive") g_interactive = true;
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
             if (!v.empty()) prompts.push_back(v);
         }
     }
-    if (prompts.empty()) { std::printf("falta --prompt\n"); return 1; }
+    if (prompts.empty() && !g_interactive) { std::printf("falta --prompt\n"); return 1; }
     if (prompts.size() > kMaxM) {
         std::printf("maximo %u secuencias, pediste %zu\n", kMaxM, prompts.size());
         return 1;
     }
     // Cada secuencia conserva SU longitud: truncar al minimo hacia que el
     // modelo recibiera prompts cortados a mitad de frase (y repitiera el texto).
-    std::size_t plen = prompts[0].size();
+    std::size_t plen = prompts.empty() ? 0 : prompts[0].size();
     for (auto& p : prompts) plen = std::max(plen, p.size());
 
     Cfg cfg;
@@ -605,7 +608,7 @@ int main(int argc, char** argv) {
         std::printf("POOL: %.2f us por run vacia  ->  %.1f us/token con 113 llamadas\n",
                     us, us * 113.0);
     }
-    const unsigned NS = unsigned(prompts.size());
+    const unsigned NS = g_interactive ? 1 : unsigned(prompts.size());
     KvRings kv;
     kv.init(std::size_t(ctx), cfg.NLY, cfg.NKV, cfg.DH, NS);
 
@@ -809,6 +812,55 @@ int main(int argc, char** argv) {
         ++g_stepn;
         return out;
     };
+
+    if (g_interactive) {
+        std::printf("READY\n");
+        std::fflush(stdout);
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line.empty()) continue;
+            if (line == "QUIT" || line == "EXIT") break;
+            std::stringstream ss(line);
+            std::string cmd;
+            ss >> cmd;
+            if (cmd == "PROMPT") {
+                std::string ids_str;
+                ss >> ids_str;
+                std::vector<int> ptokens;
+                std::stringstream pss(ids_str);
+                std::string t;
+                while (std::getline(pss, t, ',')) {
+                    if (!t.empty()) ptokens.push_back(std::atoi(t.c_str()));
+                }
+                if (ptokens.empty()) {
+                    std::printf("DONE\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                // Prefill all tokens except the last one
+                for (std::size_t i = 0; i + 1 < ptokens.size(); ++i) {
+                    (void)step({0u}, {ptokens[i]}, {i});
+                }
+                int last_tok = ptokens.back();
+                std::size_t cur_pos = ptokens.size() - 1;
+                for (int step_idx = 0; step_idx < ngen; ++step_idx) {
+                    auto out = step({0u}, {last_tok}, {cur_pos});
+                    int tok = out[0];
+                    std::printf("TOKEN %d\n", tok);
+                    std::fflush(stdout);
+                    if (tok == 151645 || tok == 151643) {
+                        break;
+                    }
+                    last_tok = tok;
+                    ++cur_pos;
+                    if (cur_pos >= std::size_t(ctx)) break;
+                }
+                std::printf("DONE\n");
+                std::fflush(stdout);
+            }
+        }
+        return 0;
+    }
 
     // --- prefill (una secuencia a la vez, M=1) -------------------------------
     const double tp0 = now_ms();
