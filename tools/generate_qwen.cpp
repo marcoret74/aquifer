@@ -465,6 +465,7 @@ int main(int argc, char** argv) {
     int ngen = 32, ctx = 512, spec = 0;
     unsigned reqT = 0;
     bool g_interactive = false;
+    std::vector<int> eos_tokens = {151643, 151645};
     std::vector<std::vector<int>> prompts;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -480,6 +481,11 @@ int main(int argc, char** argv) {
         else if (a == "--bench-pool") g_bench_pool = true;
         else if (a == "--slow-quant") g_slow_quant = true;
         else if (a == "--interactive") g_interactive = true;
+        else if (a == "--eos") {
+            eos_tokens.clear();
+            std::stringstream ss(next()); std::string t;
+            while (std::getline(ss, t, ',')) if (!t.empty()) eos_tokens.push_back(std::atoi(t.c_str()));
+        }
         else if (a == "--prompt") {
             std::vector<int> v; std::stringstream ss(next()); std::string t;
             while (std::getline(ss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
@@ -889,7 +895,11 @@ int main(int argc, char** argv) {
                     std::printf("TOKEN %d\n", tok);
                     std::fflush(stdout);
                     cached_tokens.push_back(tok);
-                    if (tok == 151645 || tok == 151643) {
+                    bool is_eos = false;
+                    for (int e : eos_tokens) {
+                        if (tok == e) { is_eos = true; break; }
+                    }
+                    if (is_eos) {
                         break;
                     }
                     last_tok = tok;

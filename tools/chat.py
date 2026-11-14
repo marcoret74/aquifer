@@ -21,19 +21,30 @@ from oracle_qwen import Tokenizer
 CYAN = "\033[1;36m"
 GREEN = "\033[1;32m"
 YELLOW = "\033[1;33m"
+DIM = "\033[90m\033[3m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
 
-def format_chatml(history, system_prompt=None):
-    """Genera la secuencia ChatML completa para Qwen."""
-    parts = []
-    if system_prompt:
-        parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>\n")
-    for role, text in history:
-        parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
-    parts.append("<|im_start|>assistant\n")
-    return "".join(parts)
+def format_prompt(history, model_type="qwen", system_prompt=None):
+    """Genera la secuencia de prompt adecuada para el modelo."""
+    if model_type == "r1":
+        parts = []
+        for role, text in history:
+            if role == "user":
+                parts.append(f"<｜User｜>{text}")
+            elif role == "assistant":
+                parts.append(f"<｜Assistant｜>{text}<｜end▁of▁sentence｜>")
+        parts.append("<｜Assistant｜><think>\n")
+        return "".join(parts)
+    else:
+        parts = []
+        if system_prompt:
+            parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>\n")
+        for role, text in history:
+            parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
+        parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
 
 
 def main():
@@ -97,6 +108,10 @@ def main():
         "--n", str(args.n),
         "--ctx", str(args.ctx)
     ]
+    if args.model == "r1":
+        cmd += ["--eos", "151643"]
+    else:
+        cmd += ["--eos", "151643,151645"]
 
     proc = subprocess.Popen(
         cmd,
@@ -115,7 +130,8 @@ def main():
             print(f"  {line_clean}")
 
     # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
-    if args.system:
+    sys_tokens_str = ""
+    if args.model == "qwen" and args.system:
         sys_str = f"<|im_start|>system\n{args.system}<|im_end|>\n"
         sys_tokens = tok.encode(sys_str)
         sys_tokens_str = ",".join(map(str, sys_tokens))
@@ -154,7 +170,7 @@ def main():
                 for line in proc.stdout:
                     if line.strip() == "RESET_OK":
                         break
-                if args.system:
+                if sys_tokens_str:
                     proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
                     proc.stdin.flush()
                     for line in proc.stdout:
@@ -164,14 +180,14 @@ def main():
                 continue
 
             history.append(("user", user_input))
-            full_prompt = format_chatml(history, args.system)
+            full_prompt = format_prompt(history, args.model, args.system)
             tokens = tok.encode(full_prompt)
 
             if len(tokens) >= args.ctx - args.n:
                 print(f"{YELLOW}[Aviso: Contexto largo ({len(tokens)} tokens), recortando historia]{RESET}")
                 if len(history) > 2:
                     history = history[-2:]
-                    full_prompt = format_chatml(history, args.system)
+                    full_prompt = format_prompt(history, args.model, args.system)
                     tokens = tok.encode(full_prompt)
                     proc.stdin.write("RESET\n")
                     proc.stdin.flush()
@@ -183,7 +199,11 @@ def main():
             proc.stdin.write(f"PROMPT {tokens_str}\n")
             proc.stdin.flush()
 
-            sys.stdout.write(f"{CYAN}{BOLD}Qwen > {RESET}")
+            in_thinking = (args.model == "r1")
+            if in_thinking:
+                sys.stdout.write(f"{YELLOW}[Pensando...]{RESET}\n{DIM}")
+            else:
+                sys.stdout.write(f"{CYAN}{BOLD}Qwen > {RESET}")
             sys.stdout.flush()
 
             t_start = time.time()
@@ -198,9 +218,16 @@ def main():
                         ttft = time.time() - t_start
                     t_id = int(line_str.split()[1])
                     resp_tokens.append(t_id)
+
+                    if t_id == 151649:  # </think>
+                        in_thinking = False
+                        sys.stdout.write(f"{RESET}\n\n{CYAN}{BOLD}Respuesta > {RESET}")
+                        sys.stdout.flush()
+                        continue
+
                     token_text = tok.decode([t_id])
                     # No imprimir etiquetas especiales
-                    if "<|im_end|>" in token_text or "<|endoftext|>" in token_text:
+                    if any(sp in token_text for sp in ["<|im_end|>", "<|endoftext|>", "<｜end", "<think>"]):
                         continue
                     sys.stdout.write(token_text)
                     sys.stdout.flush()
