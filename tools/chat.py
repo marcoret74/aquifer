@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""chat.py — Shell interactiva para conversar con Qwen cuantizado en Caudal.
+"""chat.py — Shell interactiva para conversar con modelos cuantizados en Caudal.
+
+Soporta:
+    - Qwen 2.5-1.5B Instruct     (--model qwen)
+    - DeepSeek-R1-Distill-1.5B    (--model r1)
+    - TinyLlama-1.1B Chat         (--model tiny)
+    - SmolLM2-1.7B Instruct       (--model smol2)
 
 Uso:
-    python3 tools/chat.py
-    python3 tools/chat.py --threads 4 --n 256
+    python3 tools/chat.py --model tiny
+    python3 tools/chat.py --model smol2
+    python3 tools/chat.py --model qwen
+    python3 tools/chat.py --model r1
 """
 
 import argparse
@@ -21,6 +29,8 @@ from oracle_qwen import Tokenizer
 CYAN = "\033[1;36m"
 GREEN = "\033[1;32m"
 YELLOW = "\033[1;33m"
+MAGENTA = "\033[1;35m"
+BLUE = "\033[1;34m"
 DIM = "\033[90m\033[3m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
@@ -37,7 +47,18 @@ def format_prompt(history, model_type="qwen", system_prompt=None):
                 parts.append(f"<｜Assistant｜>{text}<｜end▁of▁sentence｜>")
         parts.append("<｜Assistant｜><think>\n")
         return "".join(parts)
-    else:
+    elif model_type == "tiny":
+        parts = []
+        if system_prompt:
+            parts.append(f"<|system|>\n{system_prompt}</s>\n")
+        for role, text in history:
+            if role == "user":
+                parts.append(f"<|user|>\n{text}</s>\n")
+            elif role == "assistant":
+                parts.append(f"<|assistant|>\n{text}</s>\n")
+        parts.append("<|assistant|>\n")
+        return "".join(parts)
+    else:  # qwen y smol2 usan ChatML
         parts = []
         if system_prompt:
             parts.append(f"<|im_start|>system\n{system_prompt}<|im_end|>\n")
@@ -50,12 +71,10 @@ def format_prompt(history, model_type="qwen", system_prompt=None):
 def main():
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     default_bin = os.path.join(repo_dir, "build", "generate_qwen")
-    default_art = os.path.join(repo_dir, "build", "qwen15_affine")
-    default_tok = "/home/marco/.cache/caudal/qwen15/tokenizer.json"
 
-    ap = argparse.ArgumentParser(description="Chat interactivo con Qwen / DeepSeek-R1 en Caudal")
-    ap.add_argument("--model", choices=["qwen", "r1"], default="qwen",
-                    help="Modelo a usar: 'qwen' (Qwen2.5-1.5B) o 'r1' (DeepSeek-R1-Distill-1.5B)")
+    ap = argparse.ArgumentParser(description="Chat interactivo en Caudal Engine (5.00 bpw)")
+    ap.add_argument("--model", choices=["qwen", "r1", "tiny", "smol2"], default="qwen",
+                    help="Modelo a usar: 'qwen' (Qwen2.5-1.5B), 'r1' (DeepSeek-R1-1.5B), 'tiny' (TinyLlama-1.1B), 'smol2' (SmolLM2-1.7B)")
     ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_qwen")
     ap.add_argument("--artifact", default=None, help="Ruta al artefacto cuantizado")
     ap.add_argument("--tokenizer", default=None, help="Ruta a tokenizer.json")
@@ -65,7 +84,7 @@ def main():
     ap.add_argument("--system", default=None, help="Prompt de sistema")
     args = ap.parse_args()
 
-    # Configuración por modelo
+    # Configuraciones específicas por arquitectura y modelo
     if args.model == "r1":
         if args.artifact is None:
             args.artifact = os.path.join(repo_dir, "build", "r1_affine")
@@ -76,19 +95,51 @@ def main():
         if args.n is None:
             args.n = 512
         model_title = "DeepSeek-R1-Distill-1.5B (Razonamiento)"
-    else:
+        bot_color = YELLOW
+        bot_label = "DeepSeek-R1"
+        eos_str = "151643"
+    elif args.model == "tiny":
         if args.artifact is None:
-            args.artifact = default_art
+            args.artifact = os.path.join(repo_dir, "build", "tiny_affine")
         if args.tokenizer is None:
-            args.tokenizer = default_tok
+            args.tokenizer = "/home/marco/.cache/caudal/tiny/tokenizer.json"
+        if args.system is None:
+            args.system = "Eres un asistente servicial que responde siempre en español."
+        if args.n is None:
+            args.n = 256
+        model_title = "TinyLlama-1.1B Chat"
+        bot_color = MAGENTA
+        bot_label = "TinyLlama"
+        eos_str = "2"
+    elif args.model == "smol2":
+        if args.artifact is None:
+            args.artifact = os.path.join(repo_dir, "build", "smol2_affine")
+        if args.tokenizer is None:
+            args.tokenizer = "/home/marco/.cache/caudal/smol2/tokenizer.json"
+        if args.system is None:
+            args.system = "Eres un asistente servicial que responde siempre en español."
+        if args.n is None:
+            args.n = 256
+        model_title = "SmolLM2-1.7B Instruct"
+        bot_color = BLUE
+        bot_label = "SmolLM2"
+        eos_str = "0,2"
+    else:  # qwen
+        if args.artifact is None:
+            args.artifact = os.path.join(repo_dir, "build", "qwen15_affine")
+        if args.tokenizer is None:
+            args.tokenizer = "/home/marco/.cache/caudal/qwen15/tokenizer.json"
         if args.system is None:
             args.system = "Eres un asistente servicial que responde siempre en español."
         if args.n is None:
             args.n = 256
         model_title = "Qwen 2.5-1.5B Instruct"
+        bot_color = CYAN
+        bot_label = "Qwen"
+        eos_str = "151643,151645"
 
     if not os.path.exists(args.bin):
-        print(f"Error: Binario no encontrado en {args.bin}. Compílalo primero con make.")
+        print(f"Error: Binario no encontrado en {args.bin}. Compílalo primero.")
         return 1
     if not os.path.exists(args.artifact):
         print(f"Error: Artefacto no encontrado en {args.artifact}.")
@@ -97,7 +148,7 @@ def main():
         print(f"Error: Tokenizer no encontrado en {args.tokenizer}.")
         return 1
 
-    print(f"{BOLD}Iniciando Caudal Engine (Qwen 1.5B Afín 5.0 bpw)...{RESET}")
+    print(f"{BOLD}Iniciando Caudal Engine ({model_title} Afín 5.0 bpw)...{RESET}")
     tok = Tokenizer(args.tokenizer)
 
     cmd = [
@@ -106,12 +157,9 @@ def main():
         "--interactive",
         "--threads", str(args.threads),
         "--n", str(args.n),
-        "--ctx", str(args.ctx)
+        "--ctx", str(args.ctx),
+        "--eos", eos_str
     ]
-    if args.model == "r1":
-        cmd += ["--eos", "151643"]
-    else:
-        cmd += ["--eos", "151643,151645"]
 
     proc = subprocess.Popen(
         cmd,
@@ -131,8 +179,11 @@ def main():
 
     # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
     sys_tokens_str = ""
-    if args.model == "qwen" and args.system:
-        sys_str = f"<|im_start|>system\n{args.system}<|im_end|>\n"
+    if args.system and args.model in ("qwen", "tiny", "smol2"):
+        if args.model == "tiny":
+            sys_str = f"<|system|>\n{args.system}</s>\n"
+        else:
+            sys_str = f"<|im_start|>system\n{args.system}<|im_end|>\n"
         sys_tokens = tok.encode(sys_str)
         sys_tokens_str = ",".join(map(str, sys_tokens))
         proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
@@ -203,7 +254,7 @@ def main():
             if in_thinking:
                 sys.stdout.write(f"{YELLOW}[Pensando...]{RESET}\n{DIM}")
             else:
-                sys.stdout.write(f"{CYAN}{BOLD}Qwen > {RESET}")
+                sys.stdout.write(f"{bot_color}{BOLD}{bot_label} > {RESET}")
             sys.stdout.flush()
 
             t_start = time.time()
@@ -219,15 +270,15 @@ def main():
                     t_id = int(line_str.split()[1])
                     resp_tokens.append(t_id)
 
-                    if t_id == 151649:  # </think>
+                    if t_id == 151649:  # </think> de DeepSeek-R1
                         in_thinking = False
-                        sys.stdout.write(f"{RESET}\n\n{CYAN}{BOLD}Respuesta > {RESET}")
+                        sys.stdout.write(f"{RESET}\n\n{bot_color}{BOLD}Respuesta > {RESET}")
                         sys.stdout.flush()
                         continue
 
                     token_text = tok.decode([t_id])
                     # No imprimir etiquetas especiales
-                    if any(sp in token_text for sp in ["<|im_end|>", "<|endoftext|>", "<｜end", "<think>"]):
+                    if any(sp in token_text for sp in ["<|im_end|>", "<|endoftext|>", "<｜end", "<think>", "</s>", "<|user|>", "<|assistant|>"]):
                         continue
                     sys.stdout.write(token_text)
                     sys.stdout.flush()
@@ -240,7 +291,7 @@ def main():
             sys.stdout.write(f"\n{BOLD}\033[90m[inicio: {ttft_val*1000:.0f}ms | {len(resp_tokens)} toks | {tok_s:.1f} tok/s]{RESET}\n\n")
             sys.stdout.flush()
 
-            assistant_text = tok.decode(resp_tokens).replace("<|im_end|>", "").strip()
+            assistant_text = tok.decode(resp_tokens).replace("<|im_end|>", "").replace("</s>", "").strip()
             history.append(("assistant", assistant_text))
 
     finally:
