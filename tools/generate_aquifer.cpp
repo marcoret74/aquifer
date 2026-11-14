@@ -288,6 +288,79 @@ struct Ctx {
     }
 };
 
+class AsyncPrefetcher {
+public:
+    explicit AsyncPrefetcher(const Ctx& ctx) : ctx_(ctx) {
+        worker_ = std::thread([this]() { run(); });
+    }
+
+    ~AsyncPrefetcher() {
+        stop();
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) return;
+            stopped_ = true;
+            cv_.notify_one();
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    void prefetch(std::size_t layer_idx) {
+        if (layer_idx >= ctx_.layer_spans.size()) return;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            requested_layer_ = layer_idx;
+            cv_.notify_one();
+        }
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::size_t target = std::size_t(-1);
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [this]() { return stopped_ || requested_layer_ != std::size_t(-1); });
+                if (stopped_) break;
+                target = requested_layer_;
+                requested_layer_ = std::size_t(-1);
+            }
+
+            if (target < ctx_.layer_spans.size()) {
+                const auto& sp = ctx_.layer_spans[target];
+                if (sp.w_end > sp.w_start) {
+                    const std::size_t page_start = sp.w_start & ~4095UL;
+                    const std::size_t page_len = ((sp.w_end + 4095UL) & ~4095UL) - page_start;
+                    ::madvise(ctx_.w_file.ptr + page_start, page_len, MADV_WILLNEED);
+                    if (ctx_.w_file.fd >= 0) {
+                        ::posix_fadvise(ctx_.w_file.fd, page_start, page_len, POSIX_FADV_WILLNEED);
+                    }
+                }
+                if (sp.s_end > sp.s_start) {
+                    const std::size_t page_start = sp.s_start & ~4095UL;
+                    const std::size_t page_len = ((sp.s_end + 4095UL) & ~4095UL) - page_start;
+                    ::madvise(ctx_.s_file.ptr + page_start, page_len, MADV_WILLNEED);
+                    if (ctx_.s_file.fd >= 0) {
+                        ::posix_fadvise(ctx_.s_file.fd, page_start, page_len, POSIX_FADV_WILLNEED);
+                    }
+                }
+            }
+        }
+    }
+
+    const Ctx& ctx_;
+    std::thread worker_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::size_t requested_layer_{std::size_t(-1)};
+    bool stopped_{false};
+};
+
 // Producto punto AVX2/SSE4 float.
 inline float dot_f32(const float* __restrict a, const float* __restrict b, std::size_t n) {
 #if defined(__AVX2__)
@@ -730,6 +803,9 @@ int main(int argc, char** argv) {
     std::vector<float> gate(MB * cfg.INTER), up(MB * cfg.INTER);
     std::vector<float> logits(MB * cfg.V);
 
+    // Instancia el Portero Asíncrono (hilo de I/O desacoplado)
+    AsyncPrefetcher prefetcher(c);
+
     // Un paso para M secuencias en posiciones propias.
     auto step = [&](const std::vector<unsigned>& seq,
                    const std::vector<int>& toks,
@@ -744,23 +820,15 @@ int main(int argc, char** argv) {
             std::printf("DUMP m=%u tok0=%d pos0=%zu  x[0..3]=%.6f %.6f %.6f %.6f\n",
                         m, toks[0], std::size_t(pos[0]), x[0], x[1], x[2], x[3]);
 
-        // El Portero precarga la Capa 0 de inmediato
-        if (!c.layer_spans.empty()) {
-            const auto& sp0 = c.layer_spans[0];
-            if (sp0.w_end > sp0.w_start)
-                ::madvise(c.w_file.ptr + sp0.w_start, sp0.w_end - sp0.w_start, MADV_WILLNEED);
-            if (sp0.s_end > sp0.s_start)
-                ::madvise(c.s_file.ptr + sp0.s_start, sp0.s_end - sp0.s_start, MADV_WILLNEED);
-        }
+        // El Portero Asíncrono asegura la precarga de la Capa 0
+        prefetcher.prefetch(0);
 
         for (std::size_t L = 0; L < cfg.NLY; ++L) {
-            // El Portero dispara en segundo plano la precarga de la Capa L+1
-            if (L + 1 < cfg.NLY && L + 1 < c.layer_spans.size()) {
-                const auto& nxt = c.layer_spans[L + 1];
-                if (nxt.w_end > nxt.w_start)
-                    ::madvise(c.w_file.ptr + nxt.w_start, nxt.w_end - nxt.w_start, MADV_WILLNEED);
-                if (nxt.s_end > nxt.s_start)
-                    ::madvise(c.s_file.ptr + nxt.s_start, nxt.s_end - nxt.s_start, MADV_WILLNEED);
+            // El Portero Asíncrono precarga la Capa L+1 en background mientras AVX2 computa L
+            if (L + 1 < cfg.NLY) {
+                prefetcher.prefetch(L + 1);
+            } else {
+                prefetcher.prefetch(0); // Listo para el siguiente token
             }
             const std::string p = "model.layers." + std::to_string(L) + ".";
             for (unsigned i = 0; i < m; ++i)
@@ -922,13 +990,19 @@ int main(int argc, char** argv) {
 
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j];
 
-            // El Portero desaloja de inmediato la Capa L de la RAM fisica
+            // El Portero desaloja de inmediato la Capa L de la RAM fisica (alineado a pagina)
             if (L < c.layer_spans.size()) {
                 const auto& cur = c.layer_spans[L];
-                if (cur.w_end > cur.w_start)
-                    ::madvise(c.w_file.ptr + cur.w_start, cur.w_end - cur.w_start, MADV_DONTNEED);
-                if (cur.s_end > cur.s_start)
-                    ::madvise(c.s_file.ptr + cur.s_start, cur.s_end - cur.s_start, MADV_DONTNEED);
+                if (cur.w_end > cur.w_start) {
+                    const std::size_t p_start = cur.w_start & ~4095UL;
+                    const std::size_t p_len = ((cur.w_end + 4095UL) & ~4095UL) - p_start;
+                    ::madvise(c.w_file.ptr + p_start, p_len, MADV_DONTNEED);
+                }
+                if (cur.s_end > cur.s_start) {
+                    const std::size_t p_start = cur.s_start & ~4095UL;
+                    const std::size_t p_len = ((cur.s_end + 4095UL) & ~4095UL) - p_start;
+                    ::madvise(c.s_file.ptr + p_start, p_len, MADV_DONTNEED);
+                }
             }
 
             if (g_dump && g_stepn == 0) {
