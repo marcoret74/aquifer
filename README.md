@@ -605,6 +605,48 @@ Así que "más rápidos" no es una propiedad del motor: es una propiedad del
 **par motor+formato**. Y el formato más chico se paga en calidad, que sigue sin
 medirse de forma comparable.
 
+## Día 22 — Bits por carácter: el formato más chico se paga (2026-11-13)
+
+La deuda del Día 21. Se midió BPC (`NLL` en bits / caracteres del mismo texto)
+sobre 4797 caracteres de prosa técnica real (docs de `sg`, sin repetición).
+
+### El error que hubo que corregir primero
+
+La primera corrida dio PPL 1,02: el corpus era un párrafo **repetido 11 veces**
+y predecir la copia 11 es trivial. Con texto variado, y puntuando **la segunda
+mitad** (que es lo que hace `llama-perplexity`; promediar todas las
+transiciones castiga a los primeros tokens, que no tienen contexto) los números
+se vuelven comparables.
+
+### Dentro de cada motor (exacto: mismo tool, mismo tokenizer, mismo texto)
+
+| motor | de | a (4,50 bpw) | coste en ppl |
+|---|---|---|---|
+| llama.cpp | Q4_K_M 5,79 bpw · PPL 26,45 | Q4_0 4,50 bpw · PPL 28,84 | **+9,1 %** |
+| caudal | bf16 16 bpw · PPL 29,12 | g32 4,50 bpw · PPL 34,74 | **+19,3 %** |
+
+En BPC: ellos **1,729**, nosotros **1,824**. A igual 4,50 bpw, **su formato es
+un 5,5 % mejor que el nuestro**.
+
+### El sesgo que queda, declarado
+
+Nuestro **bf16** mide BPC 1,733 y su **Q4_K_M** (cuantizado) mide 1,685. Como
+bf16 es el techo del modelo, que mida peor es imposible: hay un **sesgo de
+~2,8 %** en la comparación cross-tokenizer (ventana de puntuación, BOS,
+tokenización). No se puede eliminar sin un GGUF de alta precisión de
+referencia, que requiere `convert_hf_to_gguf.py`. El sesgo va **en contra
+nuestra**, así que la conclusión conserva su dirección.
+
+### Conclusión
+
+- **Caudal con 4,50 bpw es más rápido en tok/s (Día 21) y peor en calidad por
+  bit.** Las dos cosas son ciertas y son la misma decisión vista desde dos
+  lados.
+- La ventaja de velocidad **no es del motor**: los ciclos por byte son paridad
+  (Día 20). Es del **formato**, y el formato se paga.
+- Con 4,50 bpw empatados, ellos degradan menos: su esquema (super-bloques con
+  sub-escalas de 6 bits) es mejor por bit que nuestro g32 uniforme.
+
 ## Orden de construcción
 
 | # | Artefacto | Gate |
