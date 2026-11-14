@@ -544,8 +544,8 @@ la misma data empaquetada, en G=16/48/64/256 con M=3. El kernel optimizado da
 | **después** | **100,59 G** (−24,4 %) | **72,10 G** (−4,7 %) | 1,40 | **0,569** |
 | llama.cpp Q4_K_M | 93,59 G | 80,89 G | 1,16 | **0,566** |
 
-**Paridad de ciclos por byte alcanzada**: 0,569 contra 0,566, moviendo un 25 %
-menos de bytes. El IPC baja de 1,76 a 1,40 porque se eliminó trabajo: quedamos
+**Paridad de ciclos por byte alcanzada**: 0,569 contra 0,566, moviendo un
+22,3 % menos de bytes (868 MB contra 1117 MB). El IPC baja de 1,76 a 1,40 porque se eliminó trabajo: quedamos
 más cerca de ser puramente memory-bound, que es donde queremos estar.
 
 En tok/s, A/B intercalado (mismo binario, macro `CAUDAL_LEGACY_SCALE`):
@@ -556,7 +556,7 @@ En tok/s, A/B intercalado (mismo binario, macro `CAUDAL_LEGACY_SCALE`):
 | 2 | **19,1** | 17,3 |
 | 3 | **22,5** | 20,7 |
 
-**+8,7 % a +14,4 %**, siempre a favor. El texto sigue correcto en los dos
+**+8,7 % a +14,4 %** (media ~+11 %), siempre a favor. El texto sigue correcto en los dos
 modelos (`La capital de Francia es París.`, `El nombre de la capital de Francia
 es París.`) y las dos suites pasan.
 
