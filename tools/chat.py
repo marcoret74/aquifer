@@ -42,16 +42,39 @@ def main():
     default_art = os.path.join(repo_dir, "build", "qwen15_affine")
     default_tok = "/home/marco/.cache/caudal/qwen15/tokenizer.json"
 
-    ap = argparse.ArgumentParser(description="Chat interactivo con Qwen en Caudal")
+    ap = argparse.ArgumentParser(description="Chat interactivo con Qwen / DeepSeek-R1 en Caudal")
+    ap.add_argument("--model", choices=["qwen", "r1"], default="qwen",
+                    help="Modelo a usar: 'qwen' (Qwen2.5-1.5B) o 'r1' (DeepSeek-R1-Distill-1.5B)")
     ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_qwen")
-    ap.add_argument("--artifact", default=default_art, help="Ruta al artefacto cuantizado")
-    ap.add_argument("--tokenizer", default=default_tok, help="Ruta a tokenizer.json")
+    ap.add_argument("--artifact", default=None, help="Ruta al artefacto cuantizado")
+    ap.add_argument("--tokenizer", default=None, help="Ruta a tokenizer.json")
     ap.add_argument("--threads", type=int, default=4, help="Número de hilos AVX2")
-    ap.add_argument("--n", type=int, default=256, help="Tokens máximos generados por turno")
+    ap.add_argument("--n", type=int, default=None, help="Tokens máximos generados por turno")
     ap.add_argument("--ctx", type=int, default=1024, help="Ventana de contexto")
-    ap.add_argument("--system", default="Eres un asistente servicial que responde siempre en español.",
-                    help="Prompt de sistema")
+    ap.add_argument("--system", default=None, help="Prompt de sistema")
     args = ap.parse_args()
+
+    # Configuración por modelo
+    if args.model == "r1":
+        if args.artifact is None:
+            args.artifact = os.path.join(repo_dir, "build", "r1_affine")
+        if args.tokenizer is None:
+            args.tokenizer = "/home/marco/.cache/caudal/r1/tokenizer.json"
+        if args.system is None:
+            args.system = ""
+        if args.n is None:
+            args.n = 512
+        model_title = "DeepSeek-R1-Distill-1.5B (Razonamiento)"
+    else:
+        if args.artifact is None:
+            args.artifact = default_art
+        if args.tokenizer is None:
+            args.tokenizer = default_tok
+        if args.system is None:
+            args.system = "Eres un asistente servicial que responde siempre en español."
+        if args.n is None:
+            args.n = 256
+        model_title = "Qwen 2.5-1.5B Instruct"
 
     if not os.path.exists(args.bin):
         print(f"Error: Binario no encontrado en {args.bin}. Compílalo primero con make.")
@@ -103,7 +126,7 @@ def main():
                 break
 
     print(f"\n{BOLD}================================================================={RESET}")
-    print(f"{BOLD}      Caudal Shell Interactiva · Qwen 1.5B (17.4 tok/s)         {RESET}")
+    print(f"{BOLD}      Caudal Shell Interactiva · {model_title}                  {RESET}")
     print(f"  Comandos especiales:                                           ")
     print(f"    {YELLOW}/reset{RESET}  -> Reiniciar memoria de la conversación           ")
     print(f"    {YELLOW}/salir{RESET}  -> Salir de la shell                             ")
