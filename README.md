@@ -20,8 +20,8 @@ A diferencia de los motores tradicionales (llama.cpp, Ollama, vLLM) que obligan 
 
 ### Los Pilares de Aquifer:
 1. **El Portero (Zero-Copy Kernel Ring-Buffer):** Mediante `mmap(MAP_SHARED)`, el modelo se proyecta en el espacio virtual ocupando **3 MB de RAM física**. Mientras se computa la capa $L$, un hilo desacoplado (`AsyncPrefetcher`) notifica al kernel con `madvise(..., MADV_WILLNEED)` para precalentar la capa $L+1$. Apenas la capa $L$ termina su GEMV vectorizado, el Portero ejecuta `madvise(..., MADV_DONTNEED)`, purgando de inmediato las páginas físicas. La memoria residente (**VmRSS**) permanece estrictamente acotada a **< 90 MB**, sin importar el tamaño del modelo.
-2. **Indexación Espacial 3D (Curva de Morton & BMI2 `_pdep_u64`):** Proyecta la topología de pesos en el hipercubo $[-1, 1]^3$, mapeando coordenadas euclidianas a claves contiguas de 64 bits en **~48 nanosegundos** directamente en silicio, alineando las neuronas con las líneas de caché L1/L2 de la CPU.
-3. **Mecánica Óptica del Diamante 3D (Sparse SwiGLU Beam):** En capas MLP intermedias, un cono de refracción óptica selecciona el 90% de las neuronas que transportan el 96% de la energía de activación, logrando **3.7x de aceleración** en decodificación con **isomorfismo matemático exacto** ($\Delta < 1.34 \times 10^{-9}$, similaridad coseno $= 1.0000000000$).
+2. **Indexación Espacial 3D (Curva de Morton & BMI2 `_pdep_u64`):** Proyecta la topología de pesos en el hipercubo $[-1, 1]^3$, mapeando coordenadas euclidianas a claves contiguas de 64 bits en **~48 nanosegundos** directamente en silicio. El reordenamiento espacial por Z-Order preserva la función matemática con **isomorfismo exacto** ($\Delta < 1.34 \times 10^{-9}$, similaridad coseno $= 1.0000000000$).
+3. **Mecánica Óptica del Diamante 3D (Sparse SwiGLU Beam Opcional):** En capas MLP intermedias (`--diamond 90`), un cono de refracción óptica en $[-1, 1]^3$ selecciona el 90% de las neuronas activas que concentran $>96\%$ de la energía espectral, disparando una aceleración de **3.7x en decodificación** (reduciendo la latencia de 608 ms a 163 ms por paso en Qwen 3B).
 
 ---
 
