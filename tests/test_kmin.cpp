@@ -108,7 +108,9 @@ int main() {
                     xp[m * K + b * 64 + i] = x[m * K + b * 64 + caudal::kPerm[i]];
         std::vector<std::int32_t> xg(M * G);
         const std::size_t SBn2 = K / 256;
-        std::vector<float> xs(M * SBn2);        // una escala de x por super-bloque
+        // El kernel indexa xscale por GRUPO (m*G + sb*8 + g), no por
+        // super-bloque. Reservar M*SBn2 producía un heap-buffer-overflow.
+        std::vector<float> xs(M * G);
         for (auto& v : xs) v = float(rng() % 100) / 4000.0f + 0.001f;
         for (unsigned m = 0; m < M; ++m)
             caudal::compute_x_gsum(s, x.data() + m * K, xg.data() + m * G);
@@ -124,12 +126,14 @@ int main() {
             for (std::size_t n = 0; n < N; ++n) {
                 double acc = 0.0;
                 for (std::size_t sb = 0; sb < SBn2; ++sb) {
-                    double sub = 0.0;
-                    for (std::size_t i = 0; i < 256; ++i) {
-                        const std::size_t k = sb * 256 + i;
-                        sub += double(deq[n * K + k]) * double(x[m * K + k]);
+                    for (std::size_t g = 0; g < 8; ++g) {
+                        double sub = 0.0;
+                        for (std::size_t i = 0; i < 32; ++i) {
+                            const std::size_t k = sb * 256 + g * 32 + i;
+                            sub += double(deq[n * K + k]) * double(x[m * K + k]);
+                        }
+                        acc += double(xs[m * G + sb * 8 + g]) * sub;
                     }
-                    acc += double(xs[m * SBn2 + sb]) * sub;
                 }
                 const double got = double(y[m * N + n]);
                 peor = std::max(peor, std::fabs(got - acc));

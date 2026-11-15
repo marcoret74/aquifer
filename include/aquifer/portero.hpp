@@ -15,9 +15,11 @@
 //    - Modelo 70B : de 35 GB en RAM  -> ~2.4 GB (¡corre en hardware modesto!).
 // =============================================================================
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <mutex>
