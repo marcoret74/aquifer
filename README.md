@@ -73,6 +73,14 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 
 Hasta entonces, `--diamond` queda como experimental y no se recomienda para producción.
 
+### Límites medidos (para no repetir el camino)
+
+- **Atención GQA online (experimental):** se implementó con chunks de posición y reducción `(max, sum)`. En 0.5B a ctx 2048 dio **47 ms vs 35 ms** del kernel por cabeza (26,6 % → 31,2 % del decode) y prefill 33,3 s vs 22,7 s. En este CPU la atención ya es compute-bound y el K/V de GQA vive en L2/L3; compartir K/V no reduce los MAC. Queda en la rama `perf/gqa-attn`, no se usa.
+- **Afín grupo 64 (4,5 bpw, experimental):** reduce 5,5–10 % los bytes, pero el kernel rinde **18,5 vs 20,9 GB/s** en 1.5B y la PPL sube **20,73 → 22,37 (+7,9 %)**; en 0.5B la PPL sube ~16 %. El balance neto en 1.5B es más lento. La capacidad de empaquetar/consumir grupo 64 quedó en la rama `perf/affine-g64` con `test_affine_g64`, pero **no es el default**.
+- **Diamante:** ver el triple check arriba; al 90 % queda neutral o más lento, y el 3,7× no es alcanzable.
+
+El camino que sí quedó en producción es el **fix de offsets del GEMV** + memoria adaptativa + prefill batcheado + atención paralela + KV fp16 + núcleos físicos.
+
 ### ¿Por qué claves Morton de 64 bits y no 128?
 
 - 3 ejes × 21 bits = **63 bits**. Con 21 bits por eje hay 2.097.152 vóxeles por dimensión; el tensor más grande del repo (`INTER=11.008`) usa ~0.5 % de ese rango. 128 bits darían 42 bits/eje (~4.4 billones por eje), una resolución que no compra nada.
