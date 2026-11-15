@@ -386,7 +386,7 @@ def main():
     ap.add_argument("--tokenizer", default=None, help="Ruta a tokenizer.json")
     ap.add_argument("--threads", type=int, default=4, help="Número de hilos AVX2")
     ap.add_argument("--n", type=int, default=None, help="Tokens máximos generados por turno")
-    ap.add_argument("--ctx", type=int, default=1024, help="Ventana de contexto")
+    ap.add_argument("--ctx", type=int, default=2048, help="Ventana de contexto (default: 2048)")
     ap.add_argument("--system", default=None, help="Prompt de sistema")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
@@ -503,18 +503,27 @@ def main():
             bot_label = mcfg["label"]
             gen_n = args.n if args.n is not None else mcfg["n"]
 
+            sys_text = args.system if args.system is not None else mcfg["system"]
             if len(tokens) >= args.ctx - gen_n:
-                print(f"{YELLOW}[Aviso: Contexto largo ({len(tokens)} tokens), recortando historia]{RESET}")
-                if len(history) > 2:
-                    history = history[-2:]
-                    full_prompt = format_prompt(history, args.model, args.system)
+                print(f"{YELLOW}[Aviso: Contexto largo ({len(tokens)} tokens), compactando historia]{RESET}")
+                while len(tokens) >= args.ctx - gen_n and len(history) > 1:
+                    history.pop(0)
+                    while len(history) > 1 and history[0][0] != "user":
+                        history.pop(0)
+                    full_prompt = format_prompt(history, args.model, sys_text)
                     tokens = tok.encode(full_prompt)
-                    proc.stdin.write("RESET\n")
-                    proc.stdin.flush()
-                    for line in proc.stdout:
-                        if line.strip() == "RESET_OK":
-                            break
 
+                proc.stdin.write("RESET\n")
+                proc.stdin.flush()
+                for rline in proc.stdout:
+                    if rline.strip() == "RESET_OK":
+                        break
+                if sys_tokens_str:
+                    proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
+                    proc.stdin.flush()
+                    for rline in proc.stdout:
+                        if rline.strip() == "PREWARMED":
+                            break
             tokens_str = ",".join(map(str, tokens))
             proc.stdin.write(f"PROMPT {tokens_str}\n")
             proc.stdin.flush()
