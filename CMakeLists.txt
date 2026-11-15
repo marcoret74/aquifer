@@ -38,6 +38,26 @@ add_executable(test_paging_rss tests/test_paging_rss.cpp)
 target_link_libraries(test_paging_rss PRIVATE aquifer_flags)
 add_test(NAME test_paging_rss COMMAND test_paging_rss)
 
+add_executable(test_sse_affine tests/test_sse_affine.cpp)
+target_link_libraries(test_sse_affine PRIVATE aquifer_flags)
+add_test(NAME test_sse_affine COMMAND test_sse_affine)
+
+add_executable(test_affine_g32 tests/test_affine_g32.cpp)
+target_link_libraries(test_affine_g32 PRIVATE aquifer_flags)
+add_test(NAME test_affine_g32 COMMAND test_affine_g32)
+
+add_executable(test_kmin tests/test_kmin.cpp)
+target_link_libraries(test_kmin PRIVATE aquifer_flags)
+add_test(NAME test_kmin COMMAND test_kmin)
+
+add_executable(test_doublemap tests/test_doublemap.cpp)
+target_link_libraries(test_doublemap PRIVATE aquifer_flags)
+add_test(NAME test_doublemap COMMAND test_doublemap)
+
+add_executable(check_g32M tests/check_g32M.cpp)
+target_link_libraries(check_g32M PRIVATE aquifer_flags)
+add_test(NAME check_g32M COMMAND check_g32M)
+
 # --- Binarios de Inferencia Aquifer ---
 add_executable(generate_aquifer tools/generate_aquifer.cpp)
 target_link_libraries(generate_aquifer PRIVATE aquifer_flags)
