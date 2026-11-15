@@ -68,7 +68,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 
 - A 90 % de neuronas activas el máximo teórico es **1.11×**; el 3.7× es físicamente imposible sin saltar al menos el 73 % de los pesos.
 - La máscara cuesta 4-6 ms/token (`nth_element` + proyección 3D) y genera **1.000-5.500 runs** por proyección; cada run es una llamada al kernel y el GEMV se fragmenta.
-- La selección por bloques contiguos Morton de 304 filas captura 76 % de la señal al 50 % de bloques y 88 % al 75 %; la selección dispersa de neuronas al 50 % captura 70-78 %. No alcanza para justificar el riesgo.
+- La selección por bloques contiguos Morton de 304 filas captura 76-79 % de la señal al 50 % de bloques, 88-89 % al 75 %, 94,3-94,6 % al 87,5 % y 97,0-97,4 % al 93,75 %. El techo de velocidad es 2×, 1,33×, 1,14× y 1,07× respectivamente; la selección dispersa al 50 % captura 70-78 %. No alcanza para justificar el riesgo de un reempaquetado completo.
 - Para que el cono acelere de verdad hay que **permutar las neuronas por alineación/Morton al empaquetar** y aceptar un prefijo contiguo (o varios haces ancla); eso es un cambio de packer + evaluación de calidad, no un flag.
 
 Hasta entonces, `--diamond` queda como experimental y no se recomienda para producción.
