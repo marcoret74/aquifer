@@ -155,6 +155,167 @@ def print_model_catalog(resolve_artifact):
     print(f"Diamond 3D : {BOLD}python3 tools/chat.py --model <key> --diamond 90{RESET}\n")
 
 
+def get_model_config(model_name, resolve_artifact):
+    cfg = {}
+    if model_name == "r1":
+        cfg["artifact"] = resolve_artifact("r1_affine")
+        cfg["tokenizer"] = "/home/marco/.cache/caudal/r1/tokenizer.json"
+        cfg["system"] = ""
+        cfg["n"] = 512
+        cfg["title"] = "DeepSeek-R1-Distill-1.5B (Razonamiento)"
+        cfg["color"] = YELLOW
+        cfg["label"] = "DeepSeek-R1"
+        cfg["eos"] = "151643"
+    elif model_name == "qwen05":
+        cfg["artifact"] = resolve_artifact("qwen05_affine")
+        cfg["tokenizer"] = "/home/marco/.cache/caudal/qwen05/tokenizer.json"
+        cfg["system"] = "You are a helpful assistant."
+        cfg["n"] = 256
+        cfg["title"] = "Qwen 2.5-0.5B Instruct (Ultra-Fast ~52 tok/s)"
+        cfg["color"] = BLUE
+        cfg["label"] = "Qwen-0.5B"
+        cfg["eos"] = "151643,151645"
+    elif model_name == "qwen3":
+        cfg["artifact"] = resolve_artifact("qwen3b_affine")
+        cfg["tokenizer"] = "/home/marco/.cache/caudal/qwen3b/tokenizer.json"
+        cfg["system"] = "You are a helpful assistant."
+        cfg["n"] = 512
+        cfg["title"] = "Qwen 2.5-3B Instruct (Aquifer Zero-Copy Paging)"
+        cfg["color"] = CYAN
+        cfg["label"] = "Qwen-3B"
+        cfg["eos"] = "151643,151645"
+    elif model_name == "coder":
+        cfg["artifact"] = resolve_artifact("coder15_affine")
+        cfg["tokenizer"] = "/home/marco/.cache/caudal/coder15/tokenizer.json"
+        cfg["system"] = "You are an expert assistant in software engineering, systems architecture, and algorithms. Write clean, modern, typed, and well-explained code."
+        cfg["n"] = 512
+        cfg["title"] = "Qwen 2.5-Coder-1.5B Instruct (Code & Systems)"
+        cfg["color"] = GREEN
+        cfg["label"] = "Qwen-Coder"
+        cfg["eos"] = "151643,151645"
+    elif model_name == "tiny":
+        cfg["artifact"] = resolve_artifact("tiny_affine")
+        cfg["tokenizer"] = "/home/marco/.cache/caudal/tiny/tokenizer.json"
+        cfg["system"] = "You are a helpful assistant."
+        cfg["n"] = 256
+        cfg["title"] = "TinyLlama-1.1B Chat"
+        cfg["color"] = MAGENTA
+        cfg["label"] = "TinyLlama"
+        cfg["eos"] = "2"
+    elif model_name == "smol2":
+        cfg["artifact"] = resolve_artifact("smol2_affine")
+        cfg["tokenizer"] = "/home/marco/.cache/caudal/smol2/tokenizer.json"
+        cfg["system"] = "You are a helpful assistant."
+        cfg["n"] = 256
+        cfg["title"] = "SmolLM2-1.7B Instruct"
+        cfg["color"] = BLUE
+        cfg["label"] = "SmolLM2"
+        cfg["eos"] = "0,2"
+    else:  # qwen
+        cfg["artifact"] = resolve_artifact("qwen15_affine")
+        cfg["tokenizer"] = "/home/marco/.cache/caudal/qwen15/tokenizer.json"
+        cfg["system"] = "You are a helpful assistant."
+        cfg["n"] = 256
+        cfg["title"] = "Qwen 2.5-1.5B Instruct"
+        cfg["color"] = CYAN
+        cfg["label"] = "Qwen"
+        cfg["eos"] = "151643,151645"
+    return cfg
+
+
+def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
+    bin_path = args.bin
+    if args.diamond is not None and bin_path == default_bin:
+        diamond_bin = os.path.join(repo_dir, "build", "generate_aquifer_diamond")
+        if os.path.exists(diamond_bin):
+            bin_path = diamond_bin
+
+    if not os.path.exists(bin_path):
+        print(f"Error: Binario no encontrado en {bin_path}. Compílalo primero.")
+        return None, None, ""
+
+    artifact_path = mcfg["artifact"]
+    if not os.path.exists(artifact_path):
+        print(f"\n{YELLOW}El modelo '{args.model}' no se encuentra en el disco local ({artifact_path}).{RESET}")
+        try:
+            resp = input(f"{BOLD}¿Deseas descargarlo ahora automáticamente? [S/n]: {RESET}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            resp = "n"
+        if resp in ("", "s", "si", "y", "yes"):
+            try:
+                from pull import pull_model
+                ok = pull_model(args.model)
+                if not ok:
+                    return None, None, ""
+                mcfg = get_model_config(args.model, resolve_artifact)
+                artifact_path = mcfg["artifact"]
+            except ImportError:
+                print("Error: No se pudo cargar tools/pull.py.")
+                return None, None, ""
+        else:
+            print("Operación cancelada.")
+            return None, None, ""
+
+    tok_path = mcfg["tokenizer"]
+    if not os.path.exists(tok_path):
+        local_tok = os.path.join(artifact_path, "tokenizer.json")
+        if os.path.exists(local_tok):
+            tok_path = local_tok
+        else:
+            print(f"Error: Tokenizer no encontrado en {tok_path}.")
+            return None, None, ""
+
+    print(f"{BOLD}Iniciando Aquifer Paging Engine ({mcfg['title']} Afín 5.0 bpw · Zero-Copy HiperRAM)...{RESET}")
+    tok = Tokenizer(tok_path)
+
+    gen_n = args.n if args.n is not None else mcfg["n"]
+    cmd = [
+        bin_path,
+        artifact_path,
+        "--interactive",
+        "--threads", str(args.threads),
+        "--n", str(gen_n),
+        "--ctx", str(args.ctx),
+        "--eos", mcfg["eos"]
+    ]
+    if args.diamond is not None:
+        cmd.extend(["--diamond", str(args.diamond)])
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        bufsize=1
+    )
+
+    # Esperar confirmación READY de Caudal/Aquifer
+    for line in proc.stdout:
+        line_clean = line.strip()
+        if line_clean == "READY":
+            break
+        elif "THP" in line_clean:
+            print(f"  {line_clean}")
+
+    # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
+    sys_tokens_str = ""
+    system_text = args.system if args.system is not None else mcfg["system"]
+    if system_text and args.model in ("qwen", "qwen05", "qwen3", "coder", "tiny", "smol2"):
+        if args.model == "tiny":
+            sys_str = f"<|system|>\n{system_text}</s>\n"
+        else:
+            sys_str = f"<|im_start|>system\n{system_text}<|im_end|>\n"
+        sys_tokens = tok.encode(sys_str)
+        sys_tokens_str = ",".join(map(str, sys_tokens))
+        proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
+        proc.stdin.flush()
+        for line in proc.stdout:
+            if line.strip() == "PREWARMED":
+                break
+
+    return proc, tok, sys_tokens_str
+
+
 def main():
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     default_bin = os.path.join(repo_dir, "build", "generate_aquifer")
@@ -188,191 +349,23 @@ def main():
         print_model_catalog(resolve_artifact)
         return 0
 
-    if args.diamond is not None and args.bin == default_bin:
-        diamond_bin = os.path.join(repo_dir, "build", "generate_aquifer_diamond")
-        if os.path.exists(diamond_bin):
-            args.bin = diamond_bin
+    mcfg = get_model_config(args.model, resolve_artifact)
+    if args.artifact:
+        mcfg["artifact"] = args.artifact
+    if args.tokenizer:
+        mcfg["tokenizer"] = args.tokenizer
 
-    # Configuraciones específicas por modelo
-    if args.model == "r1":
-        if args.artifact is None:
-            args.artifact = resolve_artifact("r1_affine")
-        if args.tokenizer is None:
-            args.tokenizer = "/home/marco/.cache/caudal/r1/tokenizer.json"
-        if args.system is None:
-            args.system = ""
-        if args.n is None:
-            args.n = 512
-        model_title = "DeepSeek-R1-Distill-1.5B (Razonamiento)"
-        bot_color = YELLOW
-        bot_label = "DeepSeek-R1"
-        eos_str = "151643"
-    elif args.model == "qwen05":
-        if args.artifact is None:
-            args.artifact = resolve_artifact("qwen05_affine")
-        if args.tokenizer is None:
-            args.tokenizer = "/home/marco/.cache/caudal/qwen05/tokenizer.json"
-        if args.system is None:
-            args.system = "You are a helpful assistant."
-        if args.n is None:
-            args.n = 256
-        model_title = "Qwen 2.5-0.5B Instruct (Ultra-Fast ~52 tok/s)"
-        bot_color = BLUE
-        bot_label = "Qwen-0.5B"
-        eos_str = "151643,151645"
-    elif args.model == "qwen3":
-        if args.artifact is None:
-            args.artifact = resolve_artifact("qwen3b_affine")
-        if args.tokenizer is None:
-            args.tokenizer = "/home/marco/.cache/caudal/qwen3b/tokenizer.json"
-        if args.system is None:
-            args.system = "You are a helpful assistant."
-        if args.n is None:
-            args.n = 512
-        model_title = "Qwen 2.5-3B Instruct (Aquifer Zero-Copy Paging)"
-        bot_color = CYAN
-        bot_label = "Qwen-3B"
-        eos_str = "151643,151645"
-    elif args.model == "coder":
-        if args.artifact is None:
-            args.artifact = resolve_artifact("coder15_affine")
-        if args.tokenizer is None:
-            args.tokenizer = "/home/marco/.cache/caudal/coder15/tokenizer.json"
-        if args.system is None:
-            args.system = "You are an expert assistant in software engineering, systems architecture, and algorithms. Write clean, modern, typed, and well-explained code."
-        if args.n is None:
-            args.n = 512
-        model_title = "Qwen 2.5-Coder-1.5B Instruct (Code & Systems)"
-        bot_color = GREEN
-        bot_label = "Qwen-Coder"
-        eos_str = "151643,151645"
-    elif args.model == "tiny":
-        if args.artifact is None:
-            args.artifact = resolve_artifact("tiny_affine")
-        if args.tokenizer is None:
-            args.tokenizer = "/home/marco/.cache/caudal/tiny/tokenizer.json"
-        if args.system is None:
-            args.system = "You are a helpful assistant."
-        if args.n is None:
-            args.n = 256
-        model_title = "TinyLlama-1.1B Chat"
-        bot_color = MAGENTA
-        bot_label = "TinyLlama"
-        eos_str = "2"
-    elif args.model == "smol2":
-        if args.artifact is None:
-            args.artifact = resolve_artifact("smol2_affine")
-        if args.tokenizer is None:
-            args.tokenizer = "/home/marco/.cache/caudal/smol2/tokenizer.json"
-        if args.system is None:
-            args.system = "You are a helpful assistant."
-        if args.n is None:
-            args.n = 256
-        model_title = "SmolLM2-1.7B Instruct"
-        bot_color = BLUE
-        bot_label = "SmolLM2"
-        eos_str = "0,2"
-    else:  # qwen
-        if args.artifact is None:
-            args.artifact = resolve_artifact("qwen15_affine")
-        if args.tokenizer is None:
-            args.tokenizer = "/home/marco/.cache/caudal/qwen15/tokenizer.json"
-        if args.system is None:
-            args.system = "You are a helpful assistant."
-        if args.n is None:
-            args.n = 256
-        model_title = "Qwen 2.5-1.5B Instruct"
-        bot_color = CYAN
-        bot_label = "Qwen"
-        eos_str = "151643,151645"
-
-    if not os.path.exists(args.bin):
-        print(f"Error: Binario no encontrado en {args.bin}. Compílalo primero.")
+    proc, tok, sys_tokens_str = start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact)
+    if proc is None:
         return 1
 
-    if not os.path.exists(args.artifact):
-        print(f"\n{YELLOW}El modelo '{args.model}' no se encuentra en el disco local.{RESET}")
-        try:
-            resp = input(f"{BOLD}¿Deseas descargarlo ahora automáticamente? [S/n]: {RESET}").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            resp = "n"
-        if resp in ("", "s", "si", "y", "yes"):
-            try:
-                from pull import pull_model
-                ok = pull_model(args.model)
-                if not ok:
-                    return 1
-                # Reintentar resolver ruta
-                for m in MODELS_CATALOG:
-                    if m["key"] == args.model:
-                        args.artifact = resolve_artifact(m["artifact"])
-            except ImportError:
-                print("Error: No se pudo cargar tools/pull.py.")
-                return 1
-        else:
-            print("Operación cancelada.")
-            return 1
-
-    if not os.path.exists(args.tokenizer):
-        local_tok = os.path.join(args.artifact, "tokenizer.json")
-        if os.path.exists(local_tok):
-            args.tokenizer = local_tok
-        else:
-            print(f"Error: Tokenizer no encontrado en {args.tokenizer}.")
-            return 1
-
-    print(f"{BOLD}Iniciando Aquifer Paging Engine ({model_title} Afín 5.0 bpw · Zero-Copy HiperRAM)...{RESET}")
-    tok = Tokenizer(args.tokenizer)
-
-    cmd = [
-        args.bin,
-        args.artifact,
-        "--interactive",
-        "--threads", str(args.threads),
-        "--n", str(args.n),
-        "--ctx", str(args.ctx),
-        "--eos", eos_str
-    ]
-    if args.diamond is not None:
-        cmd.extend(["--diamond", str(args.diamond)])
-
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
-
-    # Esperar confirmación READY de Caudal
-    for line in proc.stdout:
-        line_clean = line.strip()
-        if line_clean == "READY":
-            break
-        elif "THP" in line_clean:
-            print(f"  {line_clean}")
-
-    # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
-    sys_tokens_str = ""
-    if args.system and args.model in ("qwen", "qwen05", "qwen3", "coder", "tiny", "smol2"):
-        if args.model == "tiny":
-            sys_str = f"<|system|>\n{args.system}</s>\n"
-        else:
-            sys_str = f"<|im_start|>system\n{args.system}<|im_end|>\n"
-        sys_tokens = tok.encode(sys_str)
-        sys_tokens_str = ",".join(map(str, sys_tokens))
-        proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
-        proc.stdin.flush()
-        for line in proc.stdout:
-            if line.strip() == "PREWARMED":
-                break
-
     print(f"\n{BOLD}================================================================={RESET}")
-    print(f"{BOLD}      Aquifer Interactive Shell · {model_title}                  {RESET}")
+    print(f"{BOLD}      Aquifer Interactive Shell · {mcfg['title']}                  {RESET}")
     print(f"  Commands:                                                      ")
-    print(f"    {YELLOW}/models{RESET} (or {YELLOW}/list{RESET})   -> List all available models              ")
-    print(f"    {YELLOW}/reset{RESET}  (or {YELLOW}/clear{RESET})  -> Reset conversation history & KV cache  ")
-    print(f"    {YELLOW}/exit{RESET}   (or {YELLOW}/quit{RESET})   -> Exit interactive shell                 ")
+    print(f"    {YELLOW}/models{RESET} (or {YELLOW}/list{RESET})          -> List all available models              ")
+    print(f"    {YELLOW}/switch <model>{RESET} (or {YELLOW}/model{RESET}) -> Switch active model dynamically      ")
+    print(f"    {YELLOW}/reset{RESET}  (or {YELLOW}/clear{RESET})         -> Reset conversation history & KV cache  ")
+    print(f"    {YELLOW}/exit{RESET}   (or {YELLOW}/quit{RESET})          -> Exit interactive shell                 ")
     print(f"{BOLD}================================================================={RESET}\n")
 
     history = []
@@ -393,6 +386,51 @@ def main():
             elif user_input.lower() in ("/models", "/list", "models", "list", "/modelos", "modelos"):
                 print_model_catalog(resolve_artifact)
                 continue
+            elif user_input.lower().startswith(("/switch", "/model", "/use", "/select")):
+                parts = user_input.split()
+                target_key = parts[1] if len(parts) > 1 else None
+                if not target_key:
+                    print_model_catalog(resolve_artifact)
+                    try:
+                        target_key = input(f"{BOLD}Selecciona modelo [ej: qwen05, qwen, qwen3, coder, r1, smol2, tiny]: {RESET}").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        continue
+                if target_key in [str(i + 1) for i in range(len(MODELS_CATALOG))]:
+                    target_key = MODELS_CATALOG[int(target_key) - 1]["key"]
+                if target_key not in [m["key"] for m in MODELS_CATALOG]:
+                    print(f"{YELLOW}Modelo '{target_key}' no reconocido. Usa /models para ver las opciones.{RESET}\n")
+                    continue
+                if target_key == args.model:
+                    print(f"{YELLOW}Ya estás usando '{target_key}'.{RESET}\n")
+                    continue
+
+                print(f"\n{BOLD}Cambiando a modelo '{target_key}'...{RESET}")
+                try:
+                    proc.stdin.write("RESET\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+                args.model = target_key
+                mcfg = get_model_config(args.model, resolve_artifact)
+                new_proc, new_tok, new_sys_tokens_str = start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact)
+                if new_proc is None:
+                    print(f"Error al iniciar '{target_key}'. Restaurando qwen05...")
+                    args.model = "qwen05"
+                    mcfg = get_model_config(args.model, resolve_artifact)
+                    proc, tok, sys_tokens_str = start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact)
+                else:
+                    proc = new_proc
+                    tok = new_tok
+                    sys_tokens_str = new_sys_tokens_str
+                history.clear()
+                print(f"\n{GREEN}{BOLD}✓ Modelo activo cambiado a: {mcfg['title']}{RESET}\n")
+                continue
             elif user_input.lower() in ("/reset", "/clear", "clear", "/limpiar", "reset"):
                 history.clear()
                 proc.stdin.write("RESET\n")
@@ -410,10 +448,14 @@ def main():
                 continue
 
             history.append(("user", user_input))
-            full_prompt = format_prompt(history, args.model, args.system)
+            full_prompt = format_prompt(history, args.model, args.system if args.system is not None else mcfg["system"])
             tokens = tok.encode(full_prompt)
 
-            if len(tokens) >= args.ctx - args.n:
+            bot_color = mcfg["color"]
+            bot_label = mcfg["label"]
+            gen_n = args.n if args.n is not None else mcfg["n"]
+
+            if len(tokens) >= args.ctx - gen_n:
                 print(f"{YELLOW}[Aviso: Contexto largo ({len(tokens)} tokens), recortando historia]{RESET}")
                 if len(history) > 2:
                     history = history[-2:]
