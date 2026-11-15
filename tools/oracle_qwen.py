@@ -245,7 +245,7 @@ class Tokenizer:
             return out
         return ids
 
-    def decode(self, ids):
+    def decode(self, ids, strip_leading_space=None):
         if self.mode == 'sp':
             trozos, pend = [], bytearray()
             for i in ids:
@@ -265,7 +265,9 @@ class Tokenizer:
             if pend:
                 trozos.append(pend.decode('utf-8', 'replace'))
             txt = ''.join(trozos).replace('\u2581', ' ')
-            return txt[1:] if txt.startswith(' ') else txt
+            if strip_leading_space is True or (strip_leading_space is None and len(ids) > 1):
+                return txt[1:] if txt.startswith(' ') else txt
+            return txt
         raw = b''
         for i in ids:
             s = self.id2s.get(int(i))

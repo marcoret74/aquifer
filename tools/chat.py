@@ -484,6 +484,7 @@ def main():
             t_start = time.time()
             ttft = None
             resp_tokens = []
+            first_visible = True
             for line in proc.stdout:
                 line_str = line.strip()
                 if line_str == "DONE":
@@ -496,6 +497,7 @@ def main():
 
                     if t_id == 151649:  # </think> de DeepSeek-R1
                         in_thinking = False
+                        first_visible = True
                         sys.stdout.write(f"{RESET}\n\n{bot_color}{BOLD}Respuesta > {RESET}")
                         sys.stdout.flush()
                         continue
@@ -504,6 +506,10 @@ def main():
                     # No imprimir etiquetas especiales
                     if any(sp in token_text for sp in ["<|im_end|>", "<|endoftext|>", "<｜end", "<think>", "</s>", "<|user|>", "<|assistant|>"]):
                         continue
+                    if first_visible:
+                        if token_text.startswith(" "):
+                            token_text = token_text.lstrip(" ")
+                        first_visible = False
                     sys.stdout.write(token_text)
                     sys.stdout.flush()
 
