@@ -1,7 +1,34 @@
+# Build artifacts
 build/
 *.o
 *.a
+*.so
 compile_commands.json
+
+# Cache and Python
 .cache/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Models and large binaries (downloaded on-demand via pull.py)
+*.bin
+*.safetensors
+!docs/*.pdf
+
+# Security & Secrets protection
+*.env
+*.env.*
+*.key
+*.pem
+*.id_rsa
+*.id_ed25519
+*.token
+
+# System & Editor
+.DS_Store
+.vscode/
+.idea/
+*~
+*.swp
