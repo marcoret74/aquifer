@@ -289,12 +289,37 @@ def main():
     if not os.path.exists(args.bin):
         print(f"Error: Binario no encontrado en {args.bin}. Compílalo primero.")
         return 1
+
     if not os.path.exists(args.artifact):
-        print(f"Error: Artefacto no encontrado en {args.artifact}.")
-        return 1
+        print(f"\n{YELLOW}El modelo '{args.model}' no se encuentra en el disco local.{RESET}")
+        try:
+            resp = input(f"{BOLD}¿Deseas descargarlo ahora automáticamente? [S/n]: {RESET}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            resp = "n"
+        if resp in ("", "s", "si", "y", "yes"):
+            try:
+                from pull import pull_model
+                ok = pull_model(args.model)
+                if not ok:
+                    return 1
+                # Reintentar resolver ruta
+                for m in MODELS_CATALOG:
+                    if m["key"] == args.model:
+                        args.artifact = resolve_artifact(m["artifact"])
+            except ImportError:
+                print("Error: No se pudo cargar tools/pull.py.")
+                return 1
+        else:
+            print("Operación cancelada.")
+            return 1
+
     if not os.path.exists(args.tokenizer):
-        print(f"Error: Tokenizer no encontrado en {args.tokenizer}.")
-        return 1
+        local_tok = os.path.join(args.artifact, "tokenizer.json")
+        if os.path.exists(local_tok):
+            args.tokenizer = local_tok
+        else:
+            print(f"Error: Tokenizer no encontrado en {args.tokenizer}.")
+            return 1
 
     print(f"{BOLD}Iniciando Aquifer Paging Engine ({model_title} Afín 5.0 bpw · Zero-Copy HiperRAM)...{RESET}")
     tok = Tokenizer(args.tokenizer)
