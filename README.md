@@ -19,9 +19,9 @@
 A diferencia de los motores tradicionales (llama.cpp, Ollama, vLLM) que obligan a cargar varios gigabytes de pesos permanentemente en memoria física (RAM/VRAM), Aquifer demuestra que **la decodificación autorregresiva es un problema topológico y de física de silicio**.
 
 ### Los Pilares de Aquifer:
-1. **El Portero (Zero-Copy Kernel Ring-Buffer):** Mediante `mmap(MAP_SHARED)`, el modelo se proyecta en el espacio virtual ocupando **3 MB de RAM física**. Mientras se computa la capa $L$, un hilo desacoplado (`AsyncPrefetcher`) notifica al kernel con `madvise(..., MADV_WILLNEED)` para precalentar la capa $L+1$. Apenas la capa $L$ termina su GEMV vectorizado, el Portero ejecuta `madvise(..., MADV_DONTNEED)`, purgando de inmediato las páginas físicas. La memoria residente (**VmRSS**) permanece estrictamente acotada a **< 90 MB**, sin importar el tamaño del modelo.
+1. **El Portero (Zero-Copy Kernel Ring-Buffer):** Mediante `mmap(MAP_SHARED)`, el modelo se proyecta en el espacio virtual: la ventana activa son pocos MB y el resto vive en page cache. Mientras se computa la capa $L$, un hilo desacoplado (`AsyncPrefetcher`) notifica al kernel con `madvise(..., MADV_WILLNEED)` para precalentar la capa $L+1$. En modo `--mem-policy paged`, al terminar la capa $L$ el Portero ejecuta `madvise(..., MADV_DONTNEED)` y purga las páginas físicas; en `auto` las conserva si hay RAM libre (el kernel las reclama bajo presión). La memoria residente (**VmRSS**) queda en **< 90 MB en modo `paged` a ctx 512**; el KV cache crece linealmente con el contexto y `auto` puede retener el artefacto completo para evitar page faults.
 2. **Indexación Espacial 3D (Curva de Morton & BMI2 `_pdep_u64`):** Proyecta la topología de pesos en el hipercubo $[-1, 1]^3$, mapeando coordenadas euclidianas a claves contiguas de 64 bits en **~48 nanosegundos** directamente en silicio. El reordenamiento espacial por Z-Order preserva la función matemática con **isomorfismo exacto** ($\Delta < 1.34 \times 10^{-9}$, similaridad coseno $= 1.0000000000$).
-3. **Mecánica Óptica del Diamante 3D (Sparse SwiGLU Beam Opcional):** En capas MLP intermedias (`--diamond 90`), un cono de refracción óptica en $[-1, 1]^3$ selecciona el 90% de las neuronas activas que concentran $>96\%$ de la energía espectral, disparando una aceleración de **3.7x en decodificación** (reduciendo la latencia de 608 ms a 163 ms por paso en Qwen 3B).
+3. **Mecánica Óptica del Diamante 3D (Experimental):** En capas MLP intermedias, un cono de refracción óptica en $[-1, 1]^3$ selecciona las neuronas alineadas con el haz. El objetivo es saltar el 10 % de neuronas que concentra poca energía y acelerar la decodificación. La implementación actual (`--diamond N`) selecciona filas dispersas sin reordenarlas, así que **todavía no acelera** (ver nota de rendimiento); para que el cono sea un prefijo contiguo hay que permutar las neuronas por alineación al empaquetar.
 
 ---
 
@@ -37,7 +37,33 @@ Pruebas empíricas reproducibles en procesadores de consumo alimentados por bate
 | **Qwen 2.5-Coder-1.5B** | **1.54 B** | ~1.060 MB | **74.0 MB** | **-93.0 %** | **13.7 tok/s** | Denso Líquido |
 | **SmolLM2-1.7B Instruct** | **1.71 B** | ~1.150 MB | **78.0 MB** | **-93.2 %** | **15.4 tok/s** | Denso Líquido |
 | **TinyLlama-1.1B Chat** | **1.10 B** | ~850 MB | **45.0 MB** | **-94.7 %** | **22.5 tok/s** | SentencePiece |
-| **Latencia Morton 3D** | — | — | — | — | **48.5 ns/op** | Hardware BMI2 |
+| **Latencia Morton 3D** | — | — | — | — | **~54 ns/op** | Hardware BMI2 |
+
+> La tabla superior son las mejores cifras registradas por el autor en distintas condiciones. La sección siguiente es la mediana reproducible de este equipo, con el mismo `--prompt`, `--threads 4` y `--time`.
+>
+> Los valores de VmRSS corresponden a `--ctx 512`. El KV cache crece con el contexto (fp32: ~72 KB/token en 3B; fp16: ~36 KB/token), así que a 2k tokens el KV aporta 75 MB adicionales en 3B incluso en modo `paged`.
+
+### Perfil de latencia medido (i7-10510U · 4 núcleos / 8 hilos · 15 W · 4 hilos)
+
+Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Antes" es el motor previo a las optimizaciones de esta revisión; "después" usa `--mem-policy auto --prefill-batch 8 --kv-dtype fp16`.
+
+| Modelo | Prefill 24 tok (antes → después) | Decode (antes → después) | VmRSS `paged` / `auto` |
+| :--- | :---: | :---: | :---: |
+| Qwen 2.5-0.5B | 610 ms → **166 ms** (3.7×) | 37.4 → **45.9 tok/s** (+23 %) | 35 MB / 312 MB |
+| Qwen 2.5-1.5B | 1531 ms → **427 ms** (3.6×) | 15.3 → **16.9 tok/s** (+11 %) | 47 MB / 944 MB |
+| Qwen 2.5-3B | 4425 ms → **1044 ms** (4.2×) | 5.7 → **7.6 tok/s** (+33 %) | 59 MB / 1.86 GB |
+| Qwen 2.5-0.5B @ ctx 2048 | — | **20.6 tok/s** (29 % atención) | — |
+| Morton 3D | — | **54.2 ns/op** (este equipo) | — |
+
+**Qué cambió y por qué acelera:**
+
+- **`--mem-policy auto` (nuevo default).** Si el artefacto cabe en `MemAvailable` con holgura, no se llama `MADV_DONTNEED`: los pesos quedan en page cache y THP, sin 150k page faults por pasada. Si no cabe, se pagina como antes. `paged` conserva el VmRSS mínimo; `resident` fuerza page cache caliente. El tráfico real de DRAM no cambia; cambia cuántas veces se vuelve a tocar la misma página.
+- **`--prefill-batch 8`.** El prefill procesa hasta 8 tokens por pasada: cada byte de peso leído se reutiliza 8 veces. La causalidad se mantiene porque la atención de cada token corta en `pos[i]`, aunque el KV del bloque ya esté escrito. Solo se calculan los logits del último token del bloque.
+- **Atención paralelizada por (token, cabeza).** Antes corría en un hilo mientras los workers esperaban; ahora usa el pool. A ctx 512 la atención baja de ~19 ms/token a ~4 ms/token (4 hilos).
+- **KV en fp16 (default).** La mitad de memoria y de tráfico de KV; mismo texto generado en las pruebas de regresión. `--kv-dtype fp32` lo desactiva.
+- **Hilos = núcleos físicos por defecto.** Usar los 8 hilos lógicos de un 4C/8T calienta y compite por los puertos de memoria: en este equipo el default anterior (8) llegó a 104 ms/token contra 26 ms/token con 4. `--threads 0` deja elegir al motor.
+
+**Modo Diamante:** la implementación actual (`--diamond N`) selecciona neuronas dispersas sin reordenar las filas; eso fragmenta el GEMV y midió **más lento** que denso (6.0 vs 7.6 tok/s en 3B). Para que el cono óptico acelere de verdad, las neuronas deben reordenarse por alineación con el haz al empaquetar, de modo que el prefijo activo sea contiguo. Hasta entonces, no es un acelerador.
 
 ---
 
@@ -50,7 +76,8 @@ Aquifer es un proyecto C++23 header-only con un binario de inferencia ultraliger
 # Clonar y compilar la suite de silicio
 git clone https://github.com/marcoret74/aquifer.git
 cd aquifer
-make test
+make all       # binarios + tests
+make test      # suite completa
 ```
 
 ### 2. Descargar un Modelo (On-Demand)
@@ -71,11 +98,14 @@ python3 tools/pull.py qwen3
 Inicia una conversación interactiva en tiempo real:
 
 ```bash
-# Iniciar chat con Qwen 0.5B (~52 tok/s en 38 MB RAM)
+# Iniciar chat con Qwen 0.5B (usa RAM libre como caché y prefill por bloques)
 python3 tools/chat.py --model qwen05
 
-# Iniciar chat con Qwen 3B con acelerador de Diamante 3D
-python3 tools/chat.py --model qwen3 --diamond 90
+# Forzar VmRSS mínimo (paga page faults, pero no retiene pesos)
+python3 tools/chat.py --model qwen05 --mem-policy paged
+
+# Qwen 3B: 4 hilos físicos, prefill batcheado y KV fp16
+python3 tools/chat.py --model qwen3 --threads 4 --prefill-batch 8 --kv-dtype fp16
 ```
 
 #### Comandos dentro de la Shell:
@@ -96,18 +126,30 @@ El tratado científico completo con demostraciones matemáticas, dictamen del pa
 
 ## 🏛️ Arquitectura del Ecosistema (Open Core)
 
-Aquifer forma parte del ecosistema de **Semantic Geometry Chile**:
+**Open Core** describe el modelo de distribución, no una licencia distinta: **todo el código y la documentación de este repositorio son MIT**. Los componentes privados viven fuera de este repo y tienen su propia licencia.
 
-* **Aquifer (Público · Open Source):** Motor de paginado zero-copy en espacio de usuario, Ring-Buffer de kernel y shell interactiva en silicio.
-* **Caudal (Privado):** Compilador tensorial de alta precisión, calibrador de proyección SVD y empaquetador afín.
-* **Semantic Geometry Core (Privado):** Motor ontológico continuo en $[-1, 1]^3$, base de conocimiento formal de 2.06M de conceptos, 4.75M de enlaces semánticos y Merkle Ledger criptográfico BLAKE3.
+* **Aquifer (Público · MIT):** Motor de paginado zero-copy en espacio de usuario, Ring-Buffer de kernel y shell interactiva en silicio.
+* **Caudal Runtime (Público · MIT):** Los headers de `include/caudal/` (layout ABI, kernels GEMV int4) están en este repositorio y también son MIT.
+* **Caudal Compiler / Calibrador (Privado · fuera de este repo):** Compilador tensorial de alta precisión, calibrador de proyección SVD y empaquetador afín. No se distribuye aquí.
+* **Semantic Geometry Core (Privado · fuera de este repo):** Motor ontológico continuo en $[-1, 1]^3$, base de conocimiento formal y Merkle Ledger BLAKE3.
+* **Pesos de modelos (Terceros):** Se descargan on-demand con `tools/pull.py`; conservan su licencia original (Apache-2.0, MIT, etc.) y **no** se redistribuyen en este repositorio.
 
 ---
 
-## 📜 Licencia y Atribución
+## 📜 Licencia y Alcance
 
-Este proyecto está liberado bajo la licencia **MIT** con atribución obligatoria:
+Este repositorio está liberado bajo la licencia **MIT** (ver [LICENSE](LICENSE)). La licencia cubre el código, los headers, los tests y la documentación aquí presentes.
+
+No cubre:
+
+* el compilador/calibrador de Caudal ni Semantic Geometry Core (no están en este repositorio);
+* los pesos de modelos descargados desde el Hub (cada uno tiene su licencia);
+* las marcas **Aquifer**, **Caudal** y **Semantic Geometry Chile** (la licencia no concede derechos de marca).
+
+Se solicita conservar el aviso de copyright y la atribución:
 `⚡ Powered by Semantic Geometry Chile · Autor: Marco Retamales`
+
+Esa atribución es una solicitud de crédito, no una restricción adicional a los derechos que otorga MIT. El detalle de alcance está en [NOTICE](NOTICE).
 
 Para consultas de arquitectura, licenciamiento corporativo o auditoría ontológica:  
 **Semantic Geometry Chile** · Rancagua, Región de O'Higgins, Chile.

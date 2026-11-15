@@ -2,6 +2,9 @@ import sys, os, subprocess
 
 from build_treatise_pdf import PDFBuilder
 
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_PDF = os.path.join(REPO_DIR, "docs", "GEOMETRIA_SEMANTICA_Y_MEMORIA_TOPOLOGICA.pdf")
+
 pdf = PDFBuilder()
 
 # ==========================================
@@ -26,13 +29,13 @@ pdf.paragraph(
     "runtime de paginacion determinista de silicio (Aquifer / Caudal con llamadas de kernel MADV_DONTNEED y "
     "AsyncPrefetcher desacoplado). El resultado medido en silicio real demuestra que es posible ejecutar inferencia "
     "de 3.000 millones de parametros (Qwen 3B) de forma fluida manteniendo una huella de memoria residente (VmRSS) "
-    "estrictamente inferior a 100 MB y operando en procesadores convencionales a 15 Watts."
+    "inferior a 100 MB en modo paged a ctx 512, y operando en procesadores convencionales a 15 Watts."
 )
 
 pdf.callout("HITO DE SILICIO MEDIDO EN TIEMPO REAL", [
-    "Modelo Qwen 2.5-3B Instruct: VmRSS fijada en 75-89 MB (reduccion de 98.5% frente a 6 GB requeridos por llama.cpp).",
+    "Modelo Qwen 2.5-3B Instruct: VmRSS de 75-89 MB en modo paged a ctx 512 (reduccion de 98.5% frente a 6 GB de llama.cpp).",
     "Consumo energetico: 15W en CPU de consumo alimentada por bateria (reduccion de 46x frente a GPU dedicada).",
-    "Aceleracion Optica 3D (Haz de Diamante SwiGLU rho=90%): 3.7x de aceleracion en decodificacion (163 ms vs 608 ms).",
+    "Haz de Diamante SwiGLU: linea experimental; la seleccion dispersa actual no acelera hasta reordenar neuronas por alineacion.",
     "Isomorfismo de Morton 3D: Error maximo delta < 1.34e-9 y similaridad coseno = 1.0000000000."
 ])
 
@@ -104,7 +107,7 @@ pdf.paragraph(
 pdf.paragraph(
     "El isomorfismo demostrado es riguroso: un error de norma delta < 1.34e-9 y similaridad coseno exacta de 1.0000000000 "
     "demuestra que no existe corrupcion matematica alguna en el reordenamiento. Ademas, el Principio del Diamante 3D "
-    "aplica una intuicion analoga a la optica geometrica: la compresiï¿½n SwiGLU (SiLU(gate) * up) refracta la activacion "
+    "aplica una intuicion analoga a la optica geometrica: la compresion SwiGLU (SiLU(gate) * up) refracta la activacion "
     "en un cono de direcciones privilegiadas. Al disparar un rayo y seleccionar solo el 90% de los voxels activos, "
     "se captura mas del 96% de la energia espectral."
 )
@@ -137,9 +140,9 @@ pdf.separator()
 pdf.callout("TABLA COMPARATIVA DE RENDIMIENTO Y HUELLA", [
     "Metrica                    | Paradigma Tradicional (Ollama) | Semantic Geometry (Aquifer/Caudal)",
     "---------------------------+--------------------------------+------------------------------------",
-    "Memoria RAM Residente (3B) | 5.800 MB - 6.200 MB (VmRSS)    | 75 MB - 89 MB (VmRSS) [-98.5%]",
+    "Memoria RAM Residente (3B) | 5.800 MB - 6.200 MB (VmRSS)    | 75-89 MB paged, ctx 512 [-98.5%]",
     "Consumo Energetico         | 250W - 450W (GPU dedicada)     | 15W (CPU convencional) [-94%]",
-    "Latencia de Decodificacion | 600 ms / token (CPU baseline)  | 163 ms / token (Diamante 90%) [3.7x]",
+    "Latencia de Decodificacion | 600 ms / token (CPU baseline)  | 130-170 ms / token (denso, 4 hilos)",
     "Soberania y Offline        | Exige hardware industrial      | Corre en laptops y robots autonomos",
     "Preservacion Matematica    | N/A (cuantizaciones heuristicas)| Isomorfismo exacto delta < 1.34e-9"
 ])
@@ -154,9 +157,16 @@ pdf.paragraph(
     "eficientes, soberanos y accesibles para cualquier persona y dispositivo en el mundo."
 )
 
+pdf.heading("5. Licencia y Alcance")
+pdf.paragraph(
+    "El codigo y la documentacion de este repositorio se distribuyen bajo la licencia MIT. "
+    "Eso incluye los headers de include/aquifer y include/caudal, las herramientas, los tests y esta monografia. "
+    "No cubre el compilador/calibrador privado de Caudal, Semantic Geometry Core, los pesos de modelos descargados "
+    "on-demand (que conservan su licencia original) ni las marcas Aquifer, Caudal y Semantic Geometry Chile. "
+    "Se solicita conservar el aviso de copyright y la atribucion 'Powered by Semantic Geometry Chile'."
+)
+
 pdf.paragraph("Documento emitido y certificado por Semantic Geometry Chile · Rancagua, Región de O'Higgins, Chile · Noviembre 2026.", font="Helvetica-Oblique", size=9, color=(0.4, 0.4, 0.5))
 
-# Guardar en aquifer y caudal
-pdf.save_pdf("/home/marco/source/repos/aquifer/docs/GEOMETRIA_SEMANTICA_Y_MEMORIA_TOPOLOGICA.pdf")
-subprocess.run(["cp", "/home/marco/source/repos/aquifer/docs/GEOMETRIA_SEMANTICA_Y_MEMORIA_TOPOLOGICA.pdf", "/home/marco/source/repos/caudal/docs/GEOMETRIA_SEMANTICA_Y_MEMORIA_TOPOLOGICA.pdf"])
-print("PDFs generados en ambos repositorios.")
+pdf.save_pdf(OUT_PDF)
+print(f"PDF generado en: {OUT_PDF}")

@@ -1,0 +1,36 @@
+Aquifer — Zero-Copy HiperRAM Paging & 3D Morton Inference Engine
+Copyright (c) 2026 Marco Retamales · Semantic Geometry Chile (marcoret74)
+
+Licencia y alcance
+==================
+
+El código fuente, los headers, los tests y la documentación de este
+repositorio se distribuyen bajo la licencia MIT (ver LICENSE).
+
+Esto incluye, entre otros:
+  - include/aquifer/*.hpp
+  - include/caudal/*.hpp
+  - tools/*.cpp y tools/*.py
+  - tests/, bench/ y docs/
+
+Quedan fuera de esta licencia:
+
+  1. Caudal Compiler / Calibrador y Semantic Geometry Core: no forman
+     parte de este repositorio y tienen su propia licencia.
+  2. Los pesos de modelos descargados on-demand (Qwen, TinyLlama,
+     SmolLM2, DeepSeek-R1, etc.): conservan la licencia de su autor
+     original y no se redistribuyen aquí.
+  3. Las marcas "Aquifer", "Caudal" y "Semantic Geometry Chile": la
+     licencia MIT no concede derechos de marca ni de patente.
+
+Atribución solicitada
+=====================
+
+Se solicita conservar el aviso de copyright y la atribución:
+
+  ⚡ Powered by Semantic Geometry Chile · Autor: Marco Retamales
+
+Esta atribución es una solicitud de crédito y no una restricción
+adicional a los derechos otorgados por MIT.
+
+Contacto: Semantic Geometry Chile · Rancagua, Región de O'Higgins, Chile.

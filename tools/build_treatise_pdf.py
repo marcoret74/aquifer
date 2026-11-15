@@ -168,7 +168,7 @@ class PDFBuilder:
             footer_text_y = 30
             out.append(f"0.8 0.83 0.88 setrgbcolor\n0.5 setlinewidth\nnewpath\n{self.margin_x} {footer_line_y} moveto\n{self.width - self.margin_x} {footer_line_y} lineto\nstroke\n")
             out.append(f"/Helvetica findfont 7.5 scalefont setfont\n0.45 0.45 0.5 setrgbcolor\n")
-            out.append(f"{self.margin_x} {footer_text_y} moveto\n(Inferencia Tensorial de Silicio a 15W \\267 Arquitectura de Sistemas y Fisica del Computo) show\n")
+            out.append(f"{self.margin_x} {footer_text_y} moveto\n(Inferencia Tensorial de Silicio a 15W \\267 Arquitectura de Sistemas y Fisica del Computo \\267 MIT License) show\n")
             out.append(f"{self.width - self.margin_x - 65} {footer_text_y} moveto\n(Pagina {idx} de {total_pages}) show\n")
             out.append("showpage\n")
         out.append("%%EOF\n")
