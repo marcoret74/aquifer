@@ -835,6 +835,7 @@ int main(int argc, char** argv) {
 
     std::printf("\n=================================================================\n");
     std::printf("      Aquifer Paging Engine · HiperRAM & El Portero Activados     \n");
+    std::printf("      ⚡ Powered by Semantic Geometry Chile                       \n");
     if (crystal_loaded) {
         std::printf("      💎 MODO DIAMANTE CÚBICO ACTIVADO (Volumen Haz = %d%%)       \n", g_diamond_pct);
     }

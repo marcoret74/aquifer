@@ -694,6 +694,7 @@ int main(int argc, char** argv) {
 
     std::printf("\n=================================================================\n");
     std::printf("      Aquifer Paging Engine · HiperRAM & El Portero Activados     \n");
+    std::printf("      ⚡ Powered by Semantic Geometry Chile                       \n");
     std::printf("  Pesos en disco : %.1f MB (weights) + %.1f MB (scales)\n",
                 double(c.w_file.size) / (1024 * 1024), double(c.s_file.size) / (1024 * 1024));
     std::printf("  VmRSS Inicial  : %zu MB (¡Pesos NO cargados en RAM!)\n", get_vm_rss_mb());

@@ -141,6 +141,7 @@ MODELS_CATALOG = [
 
 def print_model_catalog(resolve_artifact):
     print(f"\n{BOLD}{CYAN}Available Models in Aquifer Engine (Zero-Copy HiperRAM Paging):{RESET}")
+    print(f"  {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}")
     print("=" * 95)
     print(f"{'Key':<8} {'Model Name':<26} {'Params':<8} {'RAM (VmRSS)':<12} {'Speed':<13} {'Status'}")
     print("-" * 95)
@@ -361,6 +362,7 @@ def main():
 
     print(f"\n{BOLD}================================================================={RESET}")
     print(f"{BOLD}      Aquifer Interactive Shell · {mcfg['title']}                  {RESET}")
+    print(f"      {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}")
     print(f"  Commands:                                                      ")
     print(f"    {YELLOW}/models{RESET} (or {YELLOW}/list{RESET})          -> List all available models              ")
     print(f"    {YELLOW}/switch <model>{RESET} (or {YELLOW}/model{RESET}) -> Switch active model dynamically      ")
@@ -429,7 +431,8 @@ def main():
                     tok = new_tok
                     sys_tokens_str = new_sys_tokens_str
                 history.clear()
-                print(f"\n{GREEN}{BOLD}✓ Modelo activo cambiado a: {mcfg['title']}{RESET}\n")
+                print(f"\n{GREEN}{BOLD}✓ Modelo activo cambiado a: {mcfg['title']}{RESET}")
+                print(f"  {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}\n")
                 continue
             elif user_input.lower() in ("/reset", "/clear", "clear", "/limpiar", "reset"):
                 history.clear()

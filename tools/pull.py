@@ -147,6 +147,7 @@ def pull_model(model_key, target_dir=None, hub_base=DEFAULT_HUB):
     os.makedirs(target_dir, exist_ok=True)
     print(f"\n{BOLD}================================================================={RESET}")
     print(f"{BOLD}  Aquifer Model Pull · {info['name']} ({info['params']}){RESET}")
+    print(f"  {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}")
     print(f"  Destino : {target_dir}")
     print(f"  Tamaño  : ~{info['size_mb']} MB (Cuantizado int4 afín / Zero-Copy)")
     print(f"{BOLD}================================================================={RESET}\n")
@@ -187,6 +188,7 @@ def main():
     
     if args.list or args.model is None:
         print(f"\n{BOLD}{CYAN}Catálogo de Modelos para Aquifer / Caudal Engine:{RESET}")
+        print(f"  {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}")
         print("=" * 85)
         print(f"{'Clave':<8} {'Nombre':<26} {'Params':<8} {'Descarga':<11} {'RAM (VmRSS)':<12} {'Velocidad'}")
         print("-" * 85)
