@@ -65,6 +65,7 @@ static std::size_t g_mem_reserve_mb = 512;
 static unsigned g_prefill_batch = 8;
 static bool g_evict_layers = true;   // lo decide la política en runtime
 static bool g_kv_fp16 = true;        // KV en fp16: mitad de tráfico en atención
+static bool g_attn_gqa = false;     // GQA online: experimento, más lento en Comet Lake
 
 namespace {
 
@@ -502,6 +503,155 @@ inline void axpy_f32_f16(float* __restrict o, const _Float16* __restrict v,
 #endif
 }
 
+// Carga un vector de KV (fp32 o fp16) a float, una sola vez por posición.
+inline void load_kv_vec(const std::uint8_t* p, float* dst, std::size_t n, bool fp16) {
+    if (!fp16) {
+        std::memcpy(dst, p, n * sizeof(float));
+        return;
+    }
+#if defined(__AVX2__) && defined(__F16C__)
+    const auto* h = reinterpret_cast<const _Float16*>(p);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(h + i))));
+    for (; i < n; ++i) dst[i] = static_cast<float>(h[i]);
+#else
+    const auto* h = reinterpret_cast<const _Float16*>(p);
+    for (std::size_t i = 0; i < n; ++i) dst[i] = static_cast<float>(h[i]);
+#endif
+}
+
+// Atención GQA con softmax online y chunks de posición.
+// Cada tarea (token, cabeza KV, chunk) comparte K/V entre las `rep` cabezas Q
+// del grupo. Luego se combinan los chunks con su (max, sum) parcial.
+//
+// Resultado medido (i7-10510U, ctx 2048, Qwen 0.5B): 47 ms vs 35 ms del
+// kernel por cabeza. En esta CPU la atención es compute-bound (K/V ya vive en
+// L2/L3), así que compartir K/V no compensa el estado online ni la reducción.
+// Se deja como experimento con --attn gqa; el default es --attn heads.
+inline void attention_gqa(Pool& pool, const KvRings& kv, const Cfg& cfg,
+                          const float* q, float* o,
+                          const std::vector<unsigned>& seq,
+                          const std::vector<std::size_t>& pos,
+                          unsigned m, std::size_t ctx, std::size_t L,
+                          std::vector<float>& acc_buf,
+                          std::vector<float>& mx_buf,
+                          std::vector<float>& sm_buf) {
+    const std::size_t DH = cfg.DH, NKV = cfg.NKV, NH = cfg.NH;
+    const std::size_t T = pool.size();
+    const std::size_t rep = NH / NKV;
+    const std::size_t rowb = NKV * DH * kv.elem;
+    const unsigned tasks = unsigned(m * NKV * T);
+
+    pool.run([&](unsigned tid) {
+        const unsigned t0 = unsigned(std::size_t(tid) * tasks / T);
+        const unsigned t1 = unsigned(std::size_t(tid + 1) * tasks / T);
+        for (unsigned task = t0; task < t1; ++task) {
+            const unsigned i = task / unsigned(NKV * T);
+            const std::size_t rem = task % (NKV * T);
+            const std::size_t kvi = rem / T;
+            const std::size_t chunk = rem % T;
+            const std::size_t n = std::min<std::size_t>(pos[i] + 1, ctx);
+            const std::size_t s0 = n * chunk / T;
+            const std::size_t s1 = n * (chunk + 1) / T;
+            const std::size_t base = (((std::size_t(i) * NKV + kvi) * T + chunk) * rep);
+            float* acc = acc_buf.data() + base * DH;
+            std::memset(acc, 0, rep * DH * sizeof(float));
+            float mh[16], lh[16];
+            for (std::size_t h = 0; h < rep; ++h) { mh[h] = -1e30f; lh[h] = 0.0f; }
+            if (s1 > s0) {
+                const std::uint8_t* kb = kv.slot(seq[i], L, false, 0);
+                const std::uint8_t* vb = kv.slot(seq[i], L, true, 0);
+                const std::size_t colb = kvi * DH * kv.elem;
+                float kbuf[160], vbuf[160];
+                for (std::size_t s = s0; s < s1; ++s) {
+                    load_kv_vec(kb + s * rowb + colb, kbuf, DH, kv.elem == sizeof(_Float16));
+                    load_kv_vec(vb + s * rowb + colb, vbuf, DH, kv.elem == sizeof(_Float16));
+                    for (std::size_t h = 0; h < rep; ++h) {
+                        const std::size_t hh = kvi * rep + h;
+                        const float score = dot_f32(q + (std::size_t(i) * NH + hh) * DH,
+                                                    kbuf, DH) * cfg.inv_sqrt_d;
+                        float* a = acc + h * DH;
+                        if (score > mh[h]) {
+                            const float corr = std::exp(mh[h] - score);
+                            lh[h] = lh[h] * corr + 1.0f;
+#if defined(__AVX2__)
+                            const __m256 c = _mm256_set1_ps(corr);
+                            for (std::size_t d = 0; d + 8 <= DH; d += 8)
+                                _mm256_storeu_ps(a + d, _mm256_add_ps(
+                                    _mm256_mul_ps(c, _mm256_loadu_ps(a + d)),
+                                    _mm256_loadu_ps(vbuf + d)));
+                            for (std::size_t d = DH & ~std::size_t(7); d < DH; ++d)
+                                a[d] = a[d] * corr + vbuf[d];
+#else
+                            for (std::size_t d = 0; d < DH; ++d) a[d] = a[d] * corr + vbuf[d];
+#endif
+                            mh[h] = score;
+                        } else {
+                            const float e = std::exp(score - mh[h]);
+                            lh[h] += e;
+#if defined(__AVX2__)
+                            const __m256 ev = _mm256_set1_ps(e);
+                            for (std::size_t d = 0; d + 8 <= DH; d += 8)
+                                _mm256_storeu_ps(a + d, _mm256_fmadd_ps(
+                                    _mm256_loadu_ps(vbuf + d), ev, _mm256_loadu_ps(a + d)));
+                            for (std::size_t d = DH & ~std::size_t(7); d < DH; ++d)
+                                a[d] += e * vbuf[d];
+#else
+                            for (std::size_t d = 0; d < DH; ++d) a[d] += e * vbuf[d];
+#endif
+                        }
+                    }
+                }
+            }
+            for (std::size_t h = 0; h < rep; ++h) {
+                mx_buf[base + h] = mh[h];
+                sm_buf[base + h] = lh[h];
+            }
+        }
+    });
+
+    const unsigned rtasks = unsigned(m * NH);
+    pool.run([&](unsigned tid) {
+        const unsigned t0 = unsigned(std::size_t(tid) * rtasks / T);
+        const unsigned t1 = unsigned(std::size_t(tid + 1) * rtasks / T);
+        for (unsigned task = t0; task < t1; ++task) {
+            const unsigned i = task / unsigned(NH);
+            const std::size_t hh = task % NH;
+            const std::size_t kvi = hh / rep;
+            const std::size_t r = hh % rep;
+            float M = -1e30f;
+            for (std::size_t c = 0; c < T; ++c) {
+                const std::size_t b = (((std::size_t(i) * NKV + kvi) * T + c) * rep) + r;
+                M = std::max(M, mx_buf[b]);
+            }
+            float den = 0.0f;
+            for (std::size_t c = 0; c < T; ++c) {
+                const std::size_t b = (((std::size_t(i) * NKV + kvi) * T + c) * rep) + r;
+                den += sm_buf[b] * std::exp(mx_buf[b] - M);
+            }
+            const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+            float* out = o + (std::size_t(i) * NH + hh) * DH;
+            std::memset(out, 0, DH * sizeof(float));
+            for (std::size_t c = 0; c < T; ++c) {
+                const std::size_t b = (((std::size_t(i) * NKV + kvi) * T + c) * rep) + r;
+                const float w = std::exp(mx_buf[b] - M) * inv;
+                const float* a = acc_buf.data() + b * DH;
+#if defined(__AVX2__)
+                const __m256 wv = _mm256_set1_ps(w);
+                for (std::size_t d = 0; d + 8 <= DH; d += 8)
+                    _mm256_storeu_ps(out + d, _mm256_fmadd_ps(
+                        wv, _mm256_loadu_ps(a + d), _mm256_loadu_ps(out + d)));
+                for (std::size_t d = DH & ~std::size_t(7); d < DH; ++d) out[d] += w * a[d];
+#else
+                for (std::size_t d = 0; d < DH; ++d) out[d] += w * a[d];
+#endif
+            }
+        }
+    });
+}
+
 void rmsnorm(const float* x, const float* w, float* out, std::size_t n, float eps) {
     double ss = 0.0;
     for (std::size_t i = 0; i < n; ++i) ss += double(x[i]) * double(x[i]);
@@ -743,6 +893,12 @@ int main(int argc, char** argv) {
             else if (v == "fp32") g_kv_fp16 = false;
             else { std::printf("kv-dtype invalido: %s (fp16|fp32)\n", v.c_str()); return 1; }
         }
+        else if (a == "--attn") {
+            const std::string v = next();
+            if (v == "gqa") g_attn_gqa = true;
+            else if (v == "heads") g_attn_gqa = false;
+            else { std::printf("attn invalido: %s (gqa|heads)\n", v.c_str()); return 1; }
+        }
         else if (a == "--eos") {
             eos_tokens.clear();
             std::stringstream ss(next()); std::string t;
@@ -925,6 +1081,12 @@ int main(int argc, char** argv) {
     std::vector<float> q(MB * cfg.NH * cfg.DH), kt(MB * cfg.NKV * cfg.DH), vt(MB * cfg.NKV * cfg.DH);
     // att por (token, cabeza): permite paralelizar la atención sin carreras.
     std::vector<float> att(std::size_t(MB) * cfg.NH * std::size_t(ctx)), o(MB * cfg.H);
+    // Estado de la atención GQA: (token, cabeza KV, chunk, cabeza Q, DH).
+    const std::size_t att_chunks = T;
+    const std::size_t att_rep = cfg.NH / cfg.NKV;
+    std::vector<float> att_acc(std::size_t(MB) * cfg.NKV * att_chunks * att_rep * cfg.DH);
+    std::vector<float> att_mx(std::size_t(MB) * cfg.NKV * att_chunks * att_rep);
+    std::vector<float> att_sm(std::size_t(MB) * cfg.NKV * att_chunks * att_rep);
     std::vector<float> gate(MB * cfg.INTER), up(MB * cfg.INTER);
     std::vector<float> logits(MB * cfg.V);
 
@@ -1002,82 +1164,87 @@ int main(int argc, char** argv) {
             }
 
             const auto ta = std::chrono::steady_clock::now();
-            const std::size_t rep = cfg.NH / cfg.NKV;
-            // La atención es O(ctx) por cabeza y antes corría en un solo hilo
-            // mientras los workers miraban. Se reparte por (token, cabeza):
-            // cada tarea escribe su propia fila de att y su propio vector o.
-            const unsigned atasks = m * unsigned(cfg.NH);
-            const unsigned aT = pool.size();
-            pool.run([&](unsigned tid) {
-                const unsigned t0 = unsigned(std::size_t(tid) * atasks / aT);
-                const unsigned t1 = unsigned(std::size_t(tid + 1) * atasks / aT);
-                for (unsigned task = t0; task < t1; ++task) {
-                    const unsigned i = task / unsigned(cfg.NH);
-                    const std::size_t hh = task % cfg.NH;
-                    const std::size_t kvi = hh / rep;
-                    const std::size_t n = std::min<std::size_t>(pos[i] + 1, std::size_t(ctx));
-                    const std::uint8_t* kb = kv.slot(seq[i], L, false, 0);
-                    const std::uint8_t* vb = kv.slot(seq[i], L, true, 0);
-                    const std::size_t rowb = cfg.NKV * cfg.DH * kv.elem;
-                    const std::size_t colb = kvi * cfg.DH * kv.elem;
-                    const float* qh = q.data() + (i * cfg.NH + hh) * cfg.DH;
-                    float* arow = att.data() + (std::size_t(i) * cfg.NH + hh) * std::size_t(ctx);
-                    float mx = -1e30f;
-                    for (std::size_t s = 0; s < n; ++s) {
-                        const std::uint8_t* ksb = kb + s * rowb + colb;
-                        const float d = (g_kv_fp16
-                            ? dot_f32_f16(qh, reinterpret_cast<const _Float16*>(ksb), cfg.DH)
-                            : dot_f32(qh, reinterpret_cast<const float*>(ksb), cfg.DH))
-                            * cfg.inv_sqrt_d;
-                        arow[s] = d;
-                        mx = std::max(mx, d);
-                    }
-                    float sum = 0.0f;
-                    for (std::size_t s = 0; s < n; ++s) {
-                        const float ex = std::exp(arow[s] - mx);
-                        arow[s] = ex;
-                        sum += ex;
-                    }
-                    const float inv = 1.0f / sum;
-                    float* oacc = o.data() + (i * cfg.NH + hh) * cfg.DH;
-                    std::fill(oacc, oacc + cfg.DH, 0.0f);
-                    for (std::size_t s = 0; s < n; ++s) {
-                        const float a = arow[s] * inv;
-                        const std::uint8_t* vsb = vb + s * rowb + colb;
-                        if (g_kv_fp16) {
-                            axpy_f32_f16(oacc, reinterpret_cast<const _Float16*>(vsb), a, cfg.DH);
-                            continue;
+            if (g_attn_gqa && cfg.DH <= 160 && att_rep <= 16) {
+                attention_gqa(pool, kv, cfg, q.data(), o.data(), seq, pos,
+                              m, std::size_t(ctx), L, att_acc, att_mx, att_sm);
+            } else {
+                const std::size_t rep = cfg.NH / cfg.NKV;
+                // La atención es O(ctx) por cabeza y antes corría en un solo hilo
+                // mientras los workers miraban. Se reparte por (token, cabeza):
+                // cada tarea escribe su propia fila de att y su propio vector o.
+                const unsigned atasks = m * unsigned(cfg.NH);
+                const unsigned aT = pool.size();
+                pool.run([&](unsigned tid) {
+                    const unsigned t0 = unsigned(std::size_t(tid) * atasks / aT);
+                    const unsigned t1 = unsigned(std::size_t(tid + 1) * atasks / aT);
+                    for (unsigned task = t0; task < t1; ++task) {
+                        const unsigned i = task / unsigned(cfg.NH);
+                        const std::size_t hh = task % cfg.NH;
+                        const std::size_t kvi = hh / rep;
+                        const std::size_t n = std::min<std::size_t>(pos[i] + 1, std::size_t(ctx));
+                        const std::uint8_t* kb = kv.slot(seq[i], L, false, 0);
+                        const std::uint8_t* vb = kv.slot(seq[i], L, true, 0);
+                        const std::size_t rowb = cfg.NKV * cfg.DH * kv.elem;
+                        const std::size_t colb = kvi * cfg.DH * kv.elem;
+                        const float* qh = q.data() + (i * cfg.NH + hh) * cfg.DH;
+                        float* arow = att.data() + (std::size_t(i) * cfg.NH + hh) * std::size_t(ctx);
+                        float mx = -1e30f;
+                        for (std::size_t s = 0; s < n; ++s) {
+                            const std::uint8_t* ksb = kb + s * rowb + colb;
+                            const float d = (g_kv_fp16
+                                ? dot_f32_f16(qh, reinterpret_cast<const _Float16*>(ksb), cfg.DH)
+                                : dot_f32(qh, reinterpret_cast<const float*>(ksb), cfg.DH))
+                                * cfg.inv_sqrt_d;
+                            arow[s] = d;
+                            mx = std::max(mx, d);
                         }
-                        const float* vs = reinterpret_cast<const float*>(vsb);
-#if defined(__AVX2__)
-                        const __m256 p = _mm256_set1_ps(a);
-                        for (std::size_t j = 0; j + 8 <= cfg.DH; j += 8)
-                            _mm256_storeu_ps(oacc + j, _mm256_fmadd_ps(
-                                p, _mm256_loadu_ps(vs + j), _mm256_loadu_ps(oacc + j)));
-#elif defined(__x86_64__) || defined(_M_X64)
-                        const __m128 p = _mm_set1_ps(a);
-                        std::size_t j = 0;
-                        for (; j + 4 <= cfg.DH; j += 4) {
-                            __m128 cur = _mm_loadu_ps(oacc + j);
-                            __m128 v = _mm_loadu_ps(vs + j);
-                            _mm_storeu_ps(oacc + j, _mm_add_ps(cur, _mm_mul_ps(p, v)));
+                        float sum = 0.0f;
+                        for (std::size_t s = 0; s < n; ++s) {
+                            const float ex = std::exp(arow[s] - mx);
+                            arow[s] = ex;
+                            sum += ex;
                         }
-                        for (; j < cfg.DH; ++j) oacc[j] += a * vs[j];
-#elif defined(__ARM_NEON) || defined(__aarch64__)
-                        const float32x4_t p = vdupq_n_f32(a);
-                        std::size_t j = 0;
-                        for (; j + 4 <= cfg.DH; j += 4) {
-                            float32x4_t cur = vld1q_f32(oacc + j);
-                            float32x4_t v = vld1q_f32(vs + j);
-                            vst1q_f32(oacc + j, vmlaq_f32(cur, p, v));
+                        const float inv = 1.0f / sum;
+                        float* oacc = o.data() + (i * cfg.NH + hh) * cfg.DH;
+                        std::fill(oacc, oacc + cfg.DH, 0.0f);
+                        for (std::size_t s = 0; s < n; ++s) {
+                            const float a = arow[s] * inv;
+                            const std::uint8_t* vsb = vb + s * rowb + colb;
+                            if (g_kv_fp16) {
+                                axpy_f32_f16(oacc, reinterpret_cast<const _Float16*>(vsb), a, cfg.DH);
+                                continue;
+                            }
+                            const float* vs = reinterpret_cast<const float*>(vsb);
+    #if defined(__AVX2__)
+                            const __m256 p = _mm256_set1_ps(a);
+                            for (std::size_t j = 0; j + 8 <= cfg.DH; j += 8)
+                                _mm256_storeu_ps(oacc + j, _mm256_fmadd_ps(
+                                    p, _mm256_loadu_ps(vs + j), _mm256_loadu_ps(oacc + j)));
+    #elif defined(__x86_64__) || defined(_M_X64)
+                            const __m128 p = _mm_set1_ps(a);
+                            std::size_t j = 0;
+                            for (; j + 4 <= cfg.DH; j += 4) {
+                                __m128 cur = _mm_loadu_ps(oacc + j);
+                                __m128 v = _mm_loadu_ps(vs + j);
+                                _mm_storeu_ps(oacc + j, _mm_add_ps(cur, _mm_mul_ps(p, v)));
+                            }
+                            for (; j < cfg.DH; ++j) oacc[j] += a * vs[j];
+    #elif defined(__ARM_NEON) || defined(__aarch64__)
+                            const float32x4_t p = vdupq_n_f32(a);
+                            std::size_t j = 0;
+                            for (; j + 4 <= cfg.DH; j += 4) {
+                                float32x4_t cur = vld1q_f32(oacc + j);
+                                float32x4_t v = vld1q_f32(vs + j);
+                                vst1q_f32(oacc + j, vmlaq_f32(cur, p, v));
+                            }
+                            for (; j < cfg.DH; ++j) oacc[j] += a * vs[j];
+    #else
+                            for (std::size_t j = 0; j < cfg.DH; ++j) oacc[j] += a * vs[j];
+    #endif
                         }
-                        for (; j < cfg.DH; ++j) oacc[j] += a * vs[j];
-#else
-                        for (std::size_t j = 0; j < cfg.DH; ++j) oacc[j] += a * vs[j];
-#endif
                     }
-                }
-            });
+                });
+            }
 
             if (g_dump && g_stepn == 0 && L <= 1) {
                 std::printf("DUMP L%zu |o_attn|=%.5f\n", L, vnorm(o.data(), cfg.H));
