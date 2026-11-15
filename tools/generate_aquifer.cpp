@@ -30,7 +30,6 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
-#include <algorithm>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -44,6 +43,7 @@
 #  include <arm_neon.h>
 #endif
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -52,10 +52,19 @@
 static double g_t_gemv = 0.0, g_t_attn = 0.0;
 static double g_bytes = 0.0;
 static bool g_probe = false;
-static bool g_no_thp = false;
 static bool g_bench_pool = false;
 static bool g_slow_quant = false;
 static bool g_time = false;
+// Política de residencia de pesos:
+//   paged    = MADV_DONTNEED por capa (VmRSS mínimo, pero paga page faults)
+//   resident = deja los pesos en page cache/RSS (máxima velocidad si hay RAM)
+//   auto     = resident si el modelo cabe con holgura; paged si no
+enum class MemPolicy { Auto, Paged, Resident };
+static MemPolicy g_mem_policy = MemPolicy::Auto;
+static std::size_t g_mem_reserve_mb = 512;
+static unsigned g_prefill_batch = 8;
+static bool g_evict_layers = true;   // lo decide la política en runtime
+static bool g_kv_fp16 = true;        // KV en fp16: mitad de tráfico en atención
 
 namespace {
 
@@ -176,12 +185,14 @@ private:
 struct KvRings {
     std::uint8_t* base{nullptr};
     std::size_t cap_tok{0}, per_seq{0}, stride{0};
+    std::size_t elem{sizeof(float)};
     // per_seq = layers*2*cap_bytes
 
     void init(std::size_t tokens, std::size_t layers, std::size_t nkv,
-              std::size_t dh, unsigned nseq) {
+              std::size_t dh, unsigned nseq, bool fp16) {
         cap_tok = tokens;
-        stride = nkv * dh * sizeof(float);
+        elem = fp16 ? sizeof(_Float16) : sizeof(float);
+        stride = nkv * dh * elem;
         const std::size_t cap_bytes = cap_tok * stride;
         per_seq = layers * 2 * cap_bytes;
         const std::size_t total = per_seq * nseq;
@@ -200,36 +211,17 @@ struct KvRings {
         ::madvise(base, 2 * total, MADV_COLLAPSE);
 #endif
     }
-    float* slot(unsigned seq, std::size_t layer, bool is_v, std::size_t t) const {
+    std::uint8_t* slot(unsigned seq, std::size_t layer, bool is_v, std::size_t t) const {
         const std::size_t cap_bytes = cap_tok * stride;
         std::uint8_t* b = base + std::size_t(seq) * per_seq
                         + layer * 2 * cap_bytes + (is_v ? cap_bytes : 0);
-        return reinterpret_cast<float*>(b) + (t % cap_tok) * (stride / 4);
+        return b + (t % cap_tok) * stride;
     }
 };
 
-// Buffer de pesos con mmap + MADV_HUGEPAGE. Medido: el vector de antes dejaba
-// los 828 MB en 0,0 % de THP (212k paginas de 4 KB) y cada fila pagaba TLB.
-struct Mapa {
-    std::uint8_t* p = nullptr;
-    std::size_t n = 0;
-    const std::uint8_t* data() const { return p; }
-    std::size_t size() const { return n; }
-};
-
-static std::size_t tam_archivo(const std::string& r) {
-    std::ifstream f(r, std::ios::binary | std::ios::ate);
-    return f ? std::size_t(f.tellg()) : 0;
-}
-
-static void leer_en(const std::string& ruta, std::uint8_t* dst) {
-    std::FILE* f = std::fopen(ruta.c_str(), "rb");
-    if (!f) { std::printf("no abrio %s\n", ruta.c_str()); std::exit(1); }
-    std::size_t leido = 0, n;
-    while ((n = std::fread(dst + leido, 1, std::size_t(1) << 20, f)) > 0) leido += n;
-    std::fclose(f);
-}
-
+// El buffer de pesos usa mmap + MADV_HUGEPAGE en MMapFile. Medido en este
+// kernel: FilePmdMapped sube a ~742 MB de 969 MB, así que las páginas grandes
+// sí se materializan para el mapping de archivo read-only.
 static std::size_t get_vm_rss_mb() {
     std::ifstream f("/proc/self/status");
     std::string k;
@@ -242,6 +234,43 @@ static std::size_t get_vm_rss_mb() {
         f.ignore(4096, '\n');
     }
     return 0;
+}
+
+// MemAvailable es la métrica que usa el kernel para decidir si puede
+// satisfacer una asignación sin empezar a reclamar. Si el modelo cabe ahí,
+// no tiene sentido expulsar páginas que el sistema puede cachear gratis.
+static std::size_t get_mem_available_mb() {
+    std::ifstream f("/proc/meminfo");
+    std::string k;
+    while (f >> k) {
+        if (k == "MemAvailable:") {
+            std::size_t v = 0;
+            f >> v;   // kB
+            return v / 1024;
+        }
+        f.ignore(4096, '\n');
+    }
+    return 0;
+}
+
+// Núcleos físicos, no hilos lógicos. En un 15 W con SMT, usar los 2T/core
+// agrega contención de puertos y calor sin comprar ancho de banda.
+static unsigned physical_cores() {
+    std::ifstream f("/proc/cpuinfo");
+    std::string line;
+    unsigned cores = 0, siblings = 0;
+    auto value_after_colon = [](const std::string& s) -> unsigned {
+        const auto p = s.find(':');
+        return p == std::string::npos ? 0u : unsigned(std::strtoul(s.c_str() + p + 1, nullptr, 10));
+    };
+    while (std::getline(f, line)) {
+        if (line.rfind("cpu cores", 0) == 0) cores = value_after_colon(line);
+        else if (line.rfind("siblings", 0) == 0) siblings = value_after_colon(line);
+        if (cores && siblings) break;
+    }
+    if (cores && (!siblings || cores <= siblings)) return cores;
+    const unsigned hc = std::thread::hardware_concurrency();
+    return hc ? std::max(1u, hc / 2) : 1u;
 }
 
 struct MMapFile {
@@ -412,6 +441,64 @@ inline float dot_f32(const float* __restrict a, const float* __restrict b, std::
     float r = 0.0f;
     for (std::size_t i = 0; i < n; ++i) r += a[i] * b[i];
     return r;
+#endif
+}
+
+// Producto punto float·fp16 para el KV. La mitad de bytes en atención es la
+// diferencia entre memory-bound y compute-bound a ctx largo.
+inline float dot_f32_f16(const float* __restrict a, const _Float16* __restrict b,
+                         std::size_t n) {
+#if defined(__AVX2__) && defined(__F16C__)
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+    std::size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 8))), a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 16))), a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i + 24))), a3);
+    }
+    for (; i + 8 <= n; i += 8)
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i),
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(b + i))), a0);
+    a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    __m128 lo = _mm256_castps256_ps128(a0), hi = _mm256_extractf128_ps(a0, 1);
+    __m128 t = _mm_add_ps(lo, hi);
+    t = _mm_hadd_ps(t, t); t = _mm_hadd_ps(t, t);
+    float r = _mm_cvtss_f32(t);
+    for (; i < n; ++i) r += a[i] * static_cast<float>(b[i]);
+    return r;
+#else
+    float r = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) r += a[i] * static_cast<float>(b[i]);
+    return r;
+#endif
+}
+
+// o += p * v, con v en fp16 (la mitad de tráfico en la fase de valores).
+inline void axpy_f32_f16(float* __restrict o, const _Float16* __restrict v,
+                         float p, std::size_t n) {
+#if defined(__AVX2__) && defined(__F16C__)
+    const __m256 pv = _mm256_set1_ps(p);
+    std::size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(pv,
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v + i))),
+            _mm256_loadu_ps(o + i)));
+        _mm256_storeu_ps(o + i + 8, _mm256_fmadd_ps(pv,
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v + i + 8))),
+            _mm256_loadu_ps(o + i + 8)));
+    }
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(pv,
+            _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v + i))),
+            _mm256_loadu_ps(o + i)));
+    for (; i < n; ++i) o[i] += p * static_cast<float>(v[i]);
+#else
+    for (std::size_t i = 0; i < n; ++i) o[i] += p * static_cast<float>(v[i]);
 #endif
 }
 
@@ -636,10 +723,24 @@ int main(int argc, char** argv) {
         else if (a == "--dump") g_dump = true;
         else if (a == "--time") g_time = true;
         else if (a == "--probe-read") g_probe = true;
-        else if (a == "--no-thp") g_no_thp = true;
         else if (a == "--bench-pool") g_bench_pool = true;
         else if (a == "--slow-quant") g_slow_quant = true;
         else if (a == "--interactive") g_interactive = true;
+        else if (a == "--prefill-batch") g_prefill_batch = unsigned(std::max(1, std::atoi(next().c_str())));
+        else if (a == "--mem-policy") {
+            const std::string v = next();
+            if (v == "paged") g_mem_policy = MemPolicy::Paged;
+            else if (v == "resident") g_mem_policy = MemPolicy::Resident;
+            else if (v == "auto") g_mem_policy = MemPolicy::Auto;
+            else { std::printf("mem-policy invalida: %s (auto|paged|resident)\n", v.c_str()); return 1; }
+        }
+        else if (a == "--keep-resident") g_mem_policy = MemPolicy::Resident;
+        else if (a == "--kv-dtype") {
+            const std::string v = next();
+            if (v == "fp16") g_kv_fp16 = true;
+            else if (v == "fp32") g_kv_fp16 = false;
+            else { std::printf("kv-dtype invalido: %s (fp16|fp32)\n", v.c_str()); return 1; }
+        }
         else if (a == "--eos") {
             eos_tokens.clear();
             std::stringstream ss(next()); std::string t;
@@ -656,10 +757,16 @@ int main(int argc, char** argv) {
         std::printf("maximo %u secuencias, pediste %zu\n", kMaxM, prompts.size());
         return 1;
     }
+    if (ctx < 1) { std::printf("--ctx tiene que ser >= 1\n"); return 1; }
+    g_prefill_batch = std::min(g_prefill_batch, unsigned(kMaxM));
     // Cada secuencia conserva SU longitud: truncar al minimo hacia que el
     // modelo recibiera prompts cortados a mitad de frase (y repitiera el texto).
     std::size_t plen = prompts.empty() ? 0 : prompts[0].size();
     for (auto& p : prompts) plen = std::max(plen, p.size());
+    if (plen > std::size_t(ctx)) {
+        std::printf("el prompt (%zu tokens) no cabe en --ctx %d\n", plen, ctx);
+        return 1;
+    }
 
     Cfg cfg;
     {
@@ -691,6 +798,20 @@ int main(int argc, char** argv) {
     c.s_file.open_ro(s_path);
     c.e_file.open_ro(A + "/embed.bf16");
     c.auxbin = slurp(A + "/aux.bin");
+
+    // Decisión de residencia: si el artefacto cabe en la RAM disponible con
+    // holgura, expulsar páginas solo agrega page faults y consumo de CPU.
+    {
+        const std::size_t model_mb = (c.w_file.size + c.s_file.size) >> 20;
+        const std::size_t avail_mb = get_mem_available_mb();
+        if (g_mem_policy == MemPolicy::Resident) g_evict_layers = false;
+        else if (g_mem_policy == MemPolicy::Paged) g_evict_layers = true;
+        else g_evict_layers = (model_mb + g_mem_reserve_mb > avail_mb);
+        std::printf("  Memoria        : %zu MB de pesos, %zu MB disponibles -> %s\n",
+                    model_mb, avail_mb,
+                    g_evict_layers ? "paged (MADV_DONTNEED)"
+                                   : "resident (page cache caliente)");
+    }
 
     std::printf("\n=================================================================\n");
     std::printf("      Aquifer Paging Engine · HiperRAM & El Portero Activados     \n");
@@ -769,7 +890,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    const unsigned T = reqT ? reqT : std::max(1u, std::thread::hardware_concurrency());
+    const unsigned T = reqT ? reqT : physical_cores();
     Pool pool(T);
     if (g_bench_pool) {
         const int N = 20000;
@@ -783,7 +904,7 @@ int main(int argc, char** argv) {
     }
     const unsigned NS = g_interactive ? 1 : unsigned(prompts.size());
     KvRings kv;
-    kv.init(std::size_t(ctx), cfg.NLY, cfg.NKV, cfg.DH, NS);
+    kv.init(std::size_t(ctx), cfg.NLY, cfg.NKV, cfg.DH, NS, g_kv_fp16);
 
     std::printf("\ncaudal · generate_qwen (batching)\n");
     std::printf("modelo   : H=%zu capas=%zu heads=%zu/%zu d=%zu inter=%zu\n",
@@ -800,7 +921,8 @@ int main(int argc, char** argv) {
     const unsigned MB = kMaxM;
     std::vector<float> x(MB * cfg.H), h(MB * cfg.H), tmp(MB * cfg.H);
     std::vector<float> q(MB * cfg.NH * cfg.DH), kt(MB * cfg.NKV * cfg.DH), vt(MB * cfg.NKV * cfg.DH);
-    std::vector<float> att(cfg.NH * std::size_t(ctx)), o(MB * cfg.H);
+    // att por (token, cabeza): permite paralelizar la atención sin carreras.
+    std::vector<float> att(std::size_t(MB) * cfg.NH * std::size_t(ctx)), o(MB * cfg.H);
     std::vector<float> gate(MB * cfg.INTER), up(MB * cfg.INTER);
     std::vector<float> logits(MB * cfg.V);
 
@@ -810,7 +932,8 @@ int main(int argc, char** argv) {
     // Un paso para M secuencias en posiciones propias.
     auto step = [&](const std::vector<unsigned>& seq,
                    const std::vector<int>& toks,
-                   const std::vector<std::size_t>& pos) {
+                   const std::vector<std::size_t>& pos,
+                   bool last_logits_only = false) {
         const unsigned m = unsigned(toks.size());
         const std::uint16_t* e = reinterpret_cast<const std::uint16_t*>(c.e_file.ptr);
         for (unsigned i = 0; i < m; ++i)
@@ -860,26 +983,50 @@ int main(int argc, char** argv) {
                     rope_one(q.data() + (i * cfg.NH + hh) * cfg.DH, pos[i], cfg);
                 for (std::size_t hh = 0; hh < cfg.NKV; ++hh)
                     rope_one(kt.data() + (i * cfg.NKV + hh) * cfg.DH, pos[i], cfg);
-                std::memcpy(kv.slot(seq[i], L, false, pos[i]), kt.data() + i * cfg.NKV * cfg.DH,
-                            cfg.NKV * cfg.DH * sizeof(float));
-                std::memcpy(kv.slot(seq[i], L, true, pos[i]), vt.data() + i * cfg.NKV * cfg.DH,
-                            cfg.NKV * cfg.DH * sizeof(float));
+                const std::size_t kn = cfg.NKV * cfg.DH;
+                if (g_kv_fp16) {
+                    auto* kd = reinterpret_cast<_Float16*>(kv.slot(seq[i], L, false, pos[i]));
+                    auto* vd = reinterpret_cast<_Float16*>(kv.slot(seq[i], L, true, pos[i]));
+                    const float* ks = kt.data() + i * kn;
+                    const float* vs = vt.data() + i * kn;
+                    for (std::size_t j = 0; j < kn; ++j) {
+                        kd[j] = _Float16(ks[j]);
+                        vd[j] = _Float16(vs[j]);
+                    }
+                } else {
+                    std::memcpy(kv.slot(seq[i], L, false, pos[i]), kt.data() + i * kn, kn * sizeof(float));
+                    std::memcpy(kv.slot(seq[i], L, true, pos[i]), vt.data() + i * kn, kn * sizeof(float));
+                }
             }
 
             const auto ta = std::chrono::steady_clock::now();
             const std::size_t rep = cfg.NH / cfg.NKV;
-            for (unsigned i = 0; i < m; ++i) {
-                const std::size_t n = pos[i] + 1;
-                for (std::size_t hh = 0; hh < cfg.NH; ++hh) {
+            // La atención es O(ctx) por cabeza y antes corría en un solo hilo
+            // mientras los workers miraban. Se reparte por (token, cabeza):
+            // cada tarea escribe su propia fila de att y su propio vector o.
+            const unsigned atasks = m * unsigned(cfg.NH);
+            const unsigned aT = pool.size();
+            pool.run([&](unsigned tid) {
+                const unsigned t0 = unsigned(std::size_t(tid) * atasks / aT);
+                const unsigned t1 = unsigned(std::size_t(tid + 1) * atasks / aT);
+                for (unsigned task = t0; task < t1; ++task) {
+                    const unsigned i = task / unsigned(cfg.NH);
+                    const std::size_t hh = task % cfg.NH;
                     const std::size_t kvi = hh / rep;
-                    const float* kb = kv.slot(seq[i], L, false, 0);
-                    const float* vb = kv.slot(seq[i], L, true, 0);
+                    const std::size_t n = std::min<std::size_t>(pos[i] + 1, std::size_t(ctx));
+                    const std::uint8_t* kb = kv.slot(seq[i], L, false, 0);
+                    const std::uint8_t* vb = kv.slot(seq[i], L, true, 0);
+                    const std::size_t rowb = cfg.NKV * cfg.DH * kv.elem;
+                    const std::size_t colb = kvi * cfg.DH * kv.elem;
                     const float* qh = q.data() + (i * cfg.NH + hh) * cfg.DH;
-                    float* arow = att.data() + hh * std::size_t(ctx);
+                    float* arow = att.data() + (std::size_t(i) * cfg.NH + hh) * std::size_t(ctx);
                     float mx = -1e30f;
                     for (std::size_t s = 0; s < n; ++s) {
-                        const float* ks = kb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
-                        const float d = dot_f32(qh, ks, cfg.DH) * cfg.inv_sqrt_d;
+                        const std::uint8_t* ksb = kb + s * rowb + colb;
+                        const float d = (g_kv_fp16
+                            ? dot_f32_f16(qh, reinterpret_cast<const _Float16*>(ksb), cfg.DH)
+                            : dot_f32(qh, reinterpret_cast<const float*>(ksb), cfg.DH))
+                            * cfg.inv_sqrt_d;
                         arow[s] = d;
                         mx = std::max(mx, d);
                     }
@@ -893,46 +1040,42 @@ int main(int argc, char** argv) {
                     float* oacc = o.data() + (i * cfg.NH + hh) * cfg.DH;
                     std::fill(oacc, oacc + cfg.DH, 0.0f);
                     for (std::size_t s = 0; s < n; ++s) {
+                        const float a = arow[s] * inv;
+                        const std::uint8_t* vsb = vb + s * rowb + colb;
+                        if (g_kv_fp16) {
+                            axpy_f32_f16(oacc, reinterpret_cast<const _Float16*>(vsb), a, cfg.DH);
+                            continue;
+                        }
+                        const float* vs = reinterpret_cast<const float*>(vsb);
 #if defined(__AVX2__)
-                        const __m256 p = _mm256_set1_ps(arow[s] * inv);
-                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                        const __m256 p = _mm256_set1_ps(a);
                         for (std::size_t j = 0; j + 8 <= cfg.DH; j += 8)
                             _mm256_storeu_ps(oacc + j, _mm256_fmadd_ps(
                                 p, _mm256_loadu_ps(vs + j), _mm256_loadu_ps(oacc + j)));
 #elif defined(__x86_64__) || defined(_M_X64)
-                        const __m128 p = _mm_set1_ps(arow[s] * inv);
-                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                        const __m128 p = _mm_set1_ps(a);
                         std::size_t j = 0;
                         for (; j + 4 <= cfg.DH; j += 4) {
                             __m128 cur = _mm_loadu_ps(oacc + j);
                             __m128 v = _mm_loadu_ps(vs + j);
                             _mm_storeu_ps(oacc + j, _mm_add_ps(cur, _mm_mul_ps(p, v)));
                         }
-                        for (; j < cfg.DH; ++j) {
-                            oacc[j] += (arow[s] * inv) * vs[j];
-                        }
+                        for (; j < cfg.DH; ++j) oacc[j] += a * vs[j];
 #elif defined(__ARM_NEON) || defined(__aarch64__)
-                        const float32x4_t p = vdupq_n_f32(arow[s] * inv);
-                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
+                        const float32x4_t p = vdupq_n_f32(a);
                         std::size_t j = 0;
                         for (; j + 4 <= cfg.DH; j += 4) {
                             float32x4_t cur = vld1q_f32(oacc + j);
                             float32x4_t v = vld1q_f32(vs + j);
                             vst1q_f32(oacc + j, vmlaq_f32(cur, p, v));
                         }
-                        for (; j < cfg.DH; ++j) {
-                            oacc[j] += (arow[s] * inv) * vs[j];
-                        }
+                        for (; j < cfg.DH; ++j) oacc[j] += a * vs[j];
 #else
-                        const float p = arow[s] * inv;
-                        const float* vs = vb + s * (cfg.NKV * cfg.DH) + kvi * cfg.DH;
-                        for (std::size_t j = 0; j < cfg.DH; ++j) {
-                            oacc[j] += p * vs[j];
-                        }
+                        for (std::size_t j = 0; j < cfg.DH; ++j) oacc[j] += a * vs[j];
 #endif
                     }
                 }
-            }
+            });
 
             if (g_dump && g_stepn == 0 && L <= 1) {
                 std::printf("DUMP L%zu |o_attn|=%.5f\n", L, vnorm(o.data(), cfg.H));
@@ -991,8 +1134,8 @@ int main(int argc, char** argv) {
 
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j];
 
-            // El Portero desaloja de inmediato la Capa L de la RAM fisica (alineado a pagina)
-            if (L < c.layer_spans.size()) {
+            // El Portero desaloja la Capa L si la política es paged (alineado a pagina)
+            if (g_evict_layers && L < c.layer_spans.size()) {
                 const auto& cur = c.layer_spans[L];
                 if (cur.w_end > cur.w_start) {
                     const std::size_t p_start = cur.w_start & ~4095UL;
@@ -1014,28 +1157,35 @@ int main(int argc, char** argv) {
             }
         }
 
-        for (unsigned i = 0; i < m; ++i)
+        // En prefill solo los logits del último token importan: calcular los
+        // demás cuesta M-1 pasadas completas por lm_head (116 MB en Qwen).
+        const unsigned l0 = last_logits_only ? (m - 1) : 0;
+        for (unsigned i = l0; i < m; ++i)
             rmsnorm(x.data() + i * cfg.H, c.aux_of("model.norm.weight"),
-                    h.data() + i * cfg.H, cfg.H, cfg.eps);
+                    h.data() + std::size_t(i - l0) * cfg.H, cfg.H, cfg.eps);
           // lm_head puede tener nombre propio (tie_word_embeddings=False).
           const std::string lmn = c.lin.count("lm_head.weight") ? "lm_head.weight"
                                                               : "model.embed_tokens.weight";
           const Job jh{&c.lin.at(lmn), logits.data()};
-          gemv_group_M(pool, {jh}, m, h.data(), cfg.H);
+          gemv_group_M(pool, {jh}, m - l0, h.data(), cfg.H);
 
-          // El Portero desaloja lm_head tras calcular los logits
-          if (c.lin.count(lmn)) {
+          // El Portero desaloja lm_head tras calcular los logits, con la
+          // dirección alineada a página (madvise devuelve EINVAL si no).
+          if (g_evict_layers && c.lin.count(lmn)) {
               const auto& Lhead = c.lin.at(lmn);
-              ::madvise(const_cast<std::uint8_t*>(Lhead.packed), Lhead.row_bytes * Lhead.N, MADV_DONTNEED);
+              const std::uintptr_t a0 = reinterpret_cast<std::uintptr_t>(Lhead.packed) & ~std::uintptr_t(4095);
+              const std::uintptr_t a1 = (reinterpret_cast<std::uintptr_t>(Lhead.packed)
+                                         + Lhead.row_bytes * Lhead.N + 4095) & ~std::uintptr_t(4095);
+              ::madvise(reinterpret_cast<void*>(a0), a1 - a0, MADV_DONTNEED);
           }
 
 
-        std::vector<int> out(m);
-        for (unsigned i = 0; i < m; ++i) {
+        std::vector<int> out(m, -1);
+        for (unsigned i = 0; i < m - l0; ++i) {
             const float* lg = logits.data() + std::size_t(i) * cfg.V;
             std::size_t best = 0;
             for (std::size_t j = 1; j < cfg.V; ++j) if (lg[j] > lg[best]) best = j;
-            out[i] = int(best);
+            out[l0 + i] = int(best);
         }
         if (g_dump && g_stepn == 0) {
             const float* lg = logits.data();
@@ -1049,6 +1199,23 @@ int main(int argc, char** argv) {
         }
         ++g_stepn;
         return out;
+    };
+
+    // Prefill por bloques: cada token del bloque usa el mismo peso leído una
+    // vez. La causalidad se mantiene porque la atención de cada token corta en
+    // su propia posición pos[i], aunque el KV del bloque ya esté escrito.
+    auto prefill_range = [&](unsigned s, const std::vector<int>& toks,
+                             std::size_t begin, std::size_t end) {
+        const unsigned B = std::max(1u, std::min(g_prefill_batch, unsigned(kMaxM)));
+        for (std::size_t i = begin; i < end; i += B) {
+            const std::size_t n = std::min<std::size_t>(B, end - i);
+            std::vector<unsigned> sq(n, s);
+            std::vector<int> tt(toks.begin() + std::ptrdiff_t(i),
+                                toks.begin() + std::ptrdiff_t(i + n));
+            std::vector<std::size_t> pp(n);
+            for (std::size_t j = 0; j < n; ++j) pp[j] = i + j;
+            (void)step(sq, tt, pp, true);
+        }
     };
 
     if (g_interactive) {
@@ -1080,10 +1247,13 @@ int main(int argc, char** argv) {
                 while (std::getline(pss, t, ',')) {
                     if (!t.empty()) ptokens.push_back(std::atoi(t.c_str()));
                 }
-                for (std::size_t i = 0; i < ptokens.size(); ++i) {
-                    (void)step({0u}, {ptokens[i]}, {i});
-                    cached_tokens.push_back(ptokens[i]);
+                if (ptokens.size() > std::size_t(ctx)) {
+                    std::fprintf(stderr, "PREWARM: %zu tokens > ctx %d, se trunca\n",
+                                 ptokens.size(), ctx);
+                    ptokens.resize(std::size_t(ctx));
                 }
+                prefill_range(0, ptokens, 0, ptokens.size());
+                cached_tokens = ptokens;
                 std::printf("PREWARMED\n");
                 std::fflush(stdout);
                 continue;
@@ -1110,10 +1280,16 @@ int main(int argc, char** argv) {
                     ++common;
                 }
 
-                // Prefill unicamente de los tokens nuevos (los anteriores ya estan en KV)
-                for (std::size_t i = common; i + 1 < ptokens.size(); ++i) {
-                    (void)step({0u}, {ptokens[i]}, {i});
+                if (ptokens.size() > std::size_t(ctx)) {
+                    std::fprintf(stderr, "PROMPT: %zu tokens > ctx %d\n",
+                                 ptokens.size(), ctx);
+                    std::printf("DONE\n");
+                    std::fflush(stdout);
+                    continue;
                 }
+
+                // Prefill unicamente de los tokens nuevos (los anteriores ya estan en KV)
+                prefill_range(0, ptokens, common, ptokens.size() - 1);
 
                 cached_tokens.resize(ptokens.size() - 1);
                 for (std::size_t i = common; i + 1 < ptokens.size(); ++i) {
@@ -1125,6 +1301,7 @@ int main(int argc, char** argv) {
                 cached_tokens.push_back(last_tok);
 
                 for (int step_idx = 0; step_idx < ngen; ++step_idx) {
+                    if (cur_pos >= std::size_t(ctx)) break;
                     auto out = step({0u}, {last_tok}, {cur_pos});
                     int tok = out[0];
                     std::printf("TOKEN %d\n", tok);
@@ -1133,13 +1310,20 @@ int main(int argc, char** argv) {
                     for (int e : eos_tokens) {
                         if (tok == e) { is_eos = true; break; }
                     }
-                    if (is_eos) {
-                        break;
+                    if (is_eos) break;
+                    // El cliente puede cortar un bucle degenerado sin matar el
+                    // proceso: al llegar STOP se deja de generar y se emite DONE.
+                    {
+                        struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
+                        if (::poll(&pfd, 1, 0) > 0) {
+                            std::string ctl;
+                            std::getline(std::cin, ctl);
+                            if (ctl == "STOP") break;
+                        }
                     }
                     cached_tokens.push_back(tok);
                     last_tok = tok;
                     ++cur_pos;
-                    if (cur_pos >= std::size_t(ctx)) break;
                 }
                 std::printf("DONE\n");
                 std::fflush(stdout);
@@ -1148,13 +1332,16 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // --- prefill (una secuencia a la vez, M=1) -------------------------------
+    // --- prefill batcheado (una secuencia a la vez, B tokens por pasada) ------
     const double tp0 = now_ms();
     for (unsigned s = 0; s < NS; ++s) {
         const std::size_t n_s = prompts[s].size();
-        for (std::size_t i = 0; i + 1 < n_s; ++i) (void)step({s}, {prompts[s][i]}, {i});
+        prefill_range(s, prompts[s], 0, n_s - 1);
     }
     const double tp1 = now_ms();
+    // --time debe medir SOLO decode: el prefill tiene otra mezcla de M y de
+    // tráfico, y sumarlo inflaba los bytes/token reportados.
+    if (g_time) { g_t_gemv = 0.0; g_t_attn = 0.0; g_bytes = 0.0; }
 
     // --- decode batcheado ----------------------------------------------------
     std::vector<unsigned> seqids(NS);
@@ -1217,7 +1404,10 @@ int main(int argc, char** argv) {
                     100.0 * g_t_gemv / (g_t_gemv + g_t_attn > 0 ? g_t_gemv + g_t_attn : 1),
                     100.0 * g_t_attn / (g_t_gemv + g_t_attn > 0 ? g_t_gemv + g_t_attn : 1));
     }
-    std::printf("AQUIFER  : VmRSS real en silicio = %zu MB  (¡Pesos no residentes desalojados!)\n", get_vm_rss_mb());
+    std::printf("AQUIFER  : VmRSS real en silicio = %zu MB  (%s)\n",
+                get_vm_rss_mb(),
+                g_evict_layers ? "paged: pesos desalojados"
+                               : "resident: pesos en page cache/RSS");
     std::printf("           %.2f ms/paso  ->  %.1f tok/s AGREGADOS  (%.1f por secuencia)\n\n",
                 (td1 - td0) / steps,
                 1000.0 * steps * NS / (td1 - td0),

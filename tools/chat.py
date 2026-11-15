@@ -322,9 +322,14 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
         "--threads", str(args.threads),
         "--n", str(gen_n),
         "--ctx", str(args.ctx),
-        "--eos", mcfg["eos"]
+        "--eos", mcfg["eos"],
+        "--prefill-batch", str(args.prefill_batch),
+        "--mem-policy", args.mem_policy,
+        "--kv-dtype", args.kv_dtype
     ]
     if args.diamond is not None:
+        print(f"{YELLOW}[Experimental] El modo Diamante actual selecciona neuronas "
+              f"dispersas sin reordenar filas: midió más lento que denso.{RESET}")
         cmd.extend(["--diamond", str(args.diamond)])
 
     proc = subprocess.Popen(
@@ -384,10 +389,15 @@ def main():
     ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_aquifer")
     ap.add_argument("--artifact", default=None, help="Ruta al artefacto cuantizado")
     ap.add_argument("--tokenizer", default=None, help="Ruta a tokenizer.json")
-    ap.add_argument("--threads", type=int, default=4, help="Número de hilos AVX2")
+    ap.add_argument("--threads", type=int, default=0, help="Hilos AVX2 (0 = núcleos físicos)")
     ap.add_argument("--n", type=int, default=None, help="Tokens máximos generados por turno")
     ap.add_argument("--ctx", type=int, default=2048, help="Ventana de contexto (default: 2048)")
     ap.add_argument("--system", default=None, help="Prompt de sistema")
+    ap.add_argument("--prefill-batch", type=int, default=8, help="Tokens prellenados por pasada (1-8; default: 8)")
+    ap.add_argument("--mem-policy", choices=["auto", "paged", "resident"], default="auto",
+                    help="auto usa RAM libre como caché y pagina bajo presión; paged fuerza VmRSS mínimo; resident nunca desaloja")
+    ap.add_argument("--kv-dtype", choices=["fp16", "fp32"], default="fp16",
+                    help="Precisión del KV cache (fp16 = mitad de memoria y tráfico)")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
 
@@ -564,6 +574,17 @@ def main():
                                 has_loop = True
                                 break
                     if has_loop:
+                        # Cortar el generador y drenar hasta DONE. Si no, los
+                        # TOKEN que el hijo siga emitiendo se leerían como la
+                        # respuesta del turno siguiente.
+                        try:
+                            proc.stdin.write("STOP\n")
+                            proc.stdin.flush()
+                        except Exception:
+                            pass
+                        for extra in proc.stdout:
+                            if extra.strip() == "DONE":
+                                break
                         break
 
                     token_text = streamer.decode(t_id)
