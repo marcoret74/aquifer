@@ -40,6 +40,51 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 
+
+class StreamDecoder:
+    """Decodificador streaming con soporte incremental de multi-byte UTF-8 y SentencePiece."""
+    def __init__(self, tok):
+        self.tok = tok
+        self.first_token = True
+        if tok.mode == 'sp':
+            self.pend = bytearray()
+        else:
+            import codecs
+            self.utf8 = codecs.getincrementaldecoder('utf-8')(errors='replace')
+
+    def decode(self, t_id):
+        s = self.tok.id2s.get(int(t_id))
+        if s is None:
+            return ''
+        if self.tok.mode == 'sp':
+            if len(s) == 6 and s.startswith('<0x') and s.endswith('>'):
+                try:
+                    self.pend.append(int(s[3:5], 16))
+                    return ''
+                except ValueError:
+                    pass
+            prefix = ''
+            if self.pend:
+                prefix = self.pend.decode('utf-8', 'replace')
+                self.pend = bytearray()
+            txt = (prefix + s).replace('▁', ' ')
+            if self.first_token and txt.startswith(' '):
+                txt = txt.lstrip(' ')
+            if txt:
+                self.first_token = False
+            return txt
+        else:
+            if s in self.tok.added:
+                b = s.encode('utf-8')
+            else:
+                b = bytes(self.tok.u2b.get(c, 63) for c in s)
+            chunk = self.utf8.decode(b, final=False)
+            if self.first_token and chunk.startswith(' '):
+                chunk = chunk.lstrip(' ')
+            if chunk:
+                self.first_token = False
+            return chunk
+
 def format_prompt(history, model_type="qwen", system_prompt=None):
     """Genera la secuencia de prompt adecuada para el modelo."""
     if model_type == "r1":
@@ -375,7 +420,7 @@ def main():
     try:
         while True:
             try:
-                user_input = input(f"{GREEN}{BOLD}You > {RESET}").strip()
+                user_input = input(f"\001{GREEN}{BOLD}\002You > \001{RESET}\002").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\nExiting...")
                 break
@@ -484,7 +529,7 @@ def main():
             t_start = time.time()
             ttft = None
             resp_tokens = []
-            first_visible = True
+            streamer = StreamDecoder(tok)
             for line in proc.stdout:
                 line_str = line.strip()
                 if line_str == "DONE":
@@ -497,22 +542,27 @@ def main():
 
                     if t_id == 151649:  # </think> de DeepSeek-R1
                         in_thinking = False
-                        first_visible = True
                         sys.stdout.write(f"{RESET}\n\n{bot_color}{BOLD}Respuesta > {RESET}")
                         sys.stdout.flush()
+                        streamer.first_token = True
                         continue
 
-                    token_text = tok.decode([t_id])
+                    # Detección temprana de bucle degenerativo de repetición (ej: TinyLlama en español)
+                    has_loop = False
+                    for L in range(3, 20):
+                        if len(resp_tokens) >= L * 3:
+                            if resp_tokens[-L:] == resp_tokens[-2*L:-L] == resp_tokens[-3*L:-2*L]:
+                                has_loop = True
+                                break
+                    if has_loop:
+                        break
+
+                    token_text = streamer.decode(t_id)
                     # No imprimir etiquetas especiales
                     if any(sp in token_text for sp in ["<|im_end|>", "<|endoftext|>", "<｜end", "<think>", "</s>", "<|user|>", "<|assistant|>"]):
                         continue
-                    if first_visible:
-                        if token_text.startswith(" "):
-                            token_text = token_text.lstrip(" ")
-                        first_visible = False
                     sys.stdout.write(token_text)
                     sys.stdout.flush()
-
             t_end = time.time()
             ttft_val = ttft if ttft is not None else 0.0
             gen_time = (t_end - (t_start + ttft_val)) if len(resp_tokens) > 1 else max(0.001, t_end - t_start)
