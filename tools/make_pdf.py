@@ -9,7 +9,7 @@ pdf = PDFBuilder()
 # ==========================================
 pdf.title("Geometria Semantica y Memoria Topologica")
 pdf.subtitle("Superando el Muro de Von Neumann en la Inferencia Tensorial de Silicio a 15W")
-pdf.paragraph("Marco Retamales & Semantic Geometry Chile · Noviembre 2026", font="Helvetica-Bold", size=10, color=(0.3, 0.3, 0.4))
+pdf.paragraph("Marco Retamales & Semantic Geometry Chile · Rancagua, Región de O'Higgins, Chile · Noviembre 2026", font="Helvetica-Bold", size=10, color=(0.3, 0.3, 0.4))
 pdf.separator()
 
 pdf.heading("1. Resumen Ejecutivo del Hito Tecnologico")
@@ -154,7 +154,7 @@ pdf.paragraph(
     "eficientes, soberanos y accesibles para cualquier persona y dispositivo en el mundo."
 )
 
-pdf.paragraph("Documento emitido y certificado por Semantic Geometry Chile · Noviembre 2026.", font="Helvetica-Oblique", size=9, color=(0.4, 0.4, 0.5))
+pdf.paragraph("Documento emitido y certificado por Semantic Geometry Chile · Rancagua, Región de O'Higgins, Chile · Noviembre 2026.", font="Helvetica-Oblique", size=9, color=(0.4, 0.4, 0.5))
 
 # Guardar en aquifer y caudal
 pdf.save_pdf("/home/marco/source/repos/aquifer/docs/GEOMETRIA_SEMANTICA_Y_MEMORIA_TOPOLOGICA.pdf")

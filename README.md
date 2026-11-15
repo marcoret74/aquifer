@@ -110,4 +110,4 @@ Este proyecto está liberado bajo la licencia **MIT** con atribución obligatori
 `⚡ Powered by Semantic Geometry Chile · Autor: Marco Retamales`
 
 Para consultas de arquitectura, licenciamiento corporativo o auditoría ontológica:  
-**Semantic Geometry Chile** · Santiago, Chile.
+**Semantic Geometry Chile** · Rancagua, Región de O'Higgins, Chile.
