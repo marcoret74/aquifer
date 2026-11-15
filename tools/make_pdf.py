@@ -9,7 +9,7 @@ pdf = PDFBuilder()
 # ==========================================
 pdf.title("Geometria Semantica y Memoria Topologica")
 pdf.subtitle("Superando el Muro de Von Neumann en la Inferencia Tensorial de Silicio a 15W")
-pdf.paragraph("Marco Retamal & Semantic Geometry Chile · Noviembre 2026", font="Helvetica-Bold", size=10, color=(0.3, 0.3, 0.4))
+pdf.paragraph("Marco Retamales & Semantic Geometry Chile · Noviembre 2026", font="Helvetica-Bold", size=10, color=(0.3, 0.3, 0.4))
 pdf.separator()
 
 pdf.heading("1. Resumen Ejecutivo del Hito Tecnologico")

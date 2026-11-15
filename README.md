@@ -8,7 +8,7 @@
 [![Memory: <100MB VmRSS](https://img.shields.io/badge/Memory-Sub--100MB%20VmRSS-purple.svg)]()
 
 > *"Caudal corre a la velocidad de la luz; Aquifer es la reserva profunda que dosifica el flujo."*  
-> **⚡ Powered by Semantic Geometry Chile** · Autor: Marco Retamal
+> **⚡ Powered by Semantic Geometry Chile** · Autor: Marco Retamales
 
 ---
 
@@ -107,7 +107,7 @@ Aquifer forma parte del ecosistema de **Semantic Geometry Chile**:
 ## 📜 Licencia y Atribución
 
 Este proyecto está liberado bajo la licencia **MIT** con atribución obligatoria:
-`⚡ Powered by Semantic Geometry Chile · Autor: Marco Retamal`
+`⚡ Powered by Semantic Geometry Chile · Autor: Marco Retamales`
 
 Para consultas de arquitectura, licenciamiento corporativo o auditoría ontológica:  
 **Semantic Geometry Chile** · Santiago, Chile.
