@@ -142,7 +142,7 @@ pdf.callout("TABLA COMPARATIVA DE RENDIMIENTO Y HUELLA", [
     "---------------------------+--------------------------------+------------------------------------",
     "Memoria RAM Residente (3B) | 5.800 MB - 6.200 MB (VmRSS)    | 75-89 MB paged, ctx 512 [-98.5%]",
     "Consumo Energetico         | 250W - 450W (GPU dedicada)     | 15W (CPU convencional) [-94%]",
-    "Latencia de Decodificacion | 600 ms / token (CPU baseline)  | 130-170 ms / token (denso, 4 hilos)",
+    "Latencia de Decodificacion | 600 ms / token (CPU baseline)  | 95-140 ms / token (denso, 4 hilos)",
     "Soberania y Offline        | Exige hardware industrial      | Corre en laptops y robots autonomos",
     "Preservacion Matematica    | N/A (cuantizaciones heuristicas)| Isomorfismo exacto delta < 1.34e-9"
 ])
@@ -164,6 +164,14 @@ pdf.paragraph(
     "No cubre el compilador/calibrador privado de Caudal, Semantic Geometry Core, los pesos de modelos descargados "
     "on-demand (que conservan su licencia original) ni las marcas Aquifer, Caudal y Semantic Geometry Chile. "
     "Se solicita conservar el aviso de copyright y la atribucion 'Powered by Semantic Geometry Chile'."
+)
+
+pdf.paragraph(
+    "Auditoria de particion (Noviembre 2026): se detecto que las ramas affine/kmin del GEMV "
+    "no avanzaban el offset entre jobs, reprocesando gate/up 1.5x y escribiendo las mismas filas "
+    "desde dos hilos. Corregido el offset, el decode denso de 3B paso de ~139-173 ms/token a ~95 ms/token "
+    "en el motor nuevo, con tokens identicos. El modo Diamante disperso, medido con el denso corregido, "
+    "queda neutral o mas lento al 90% y solo gana ~3% al 50% perdiendo 22-30% de la senal SwiGLU."
 )
 
 pdf.paragraph("Documento emitido y certificado por Semantic Geometry Chile · Rancagua, Región de O'Higgins, Chile · Noviembre 2026.", font="Helvetica-Oblique", size=9, color=(0.4, 0.4, 0.5))

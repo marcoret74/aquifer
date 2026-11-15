@@ -45,25 +45,43 @@ Pruebas empíricas reproducibles en procesadores de consumo alimentados por bate
 
 ### Perfil de latencia medido (i7-10510U · 4 núcleos / 8 hilos · 15 W · 4 hilos)
 
-Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Antes" es el motor previo a las optimizaciones de esta revisión; "después" usa `--mem-policy auto --prefill-batch 8 --kv-dtype fp16`.
+Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Antes" es el motor previo a las optimizaciones de esta revisión; "después" usa `--mem-policy auto --prefill-batch 8 --kv-dtype fp16` y el GEMV con offsets correctos entre jobs.
 
 | Modelo | Prefill 24 tok (antes → después) | Decode (antes → después) | VmRSS `paged` / `auto` |
 | :--- | :---: | :---: | :---: |
-| Qwen 2.5-0.5B | 610 ms → **166 ms** (3.7×) | 37.4 → **45.9 tok/s** (+23 %) | 35 MB / 312 MB |
-| Qwen 2.5-1.5B | 1531 ms → **427 ms** (3.6×) | 15.3 → **16.9 tok/s** (+11 %) | 47 MB / 944 MB |
-| Qwen 2.5-3B | 4425 ms → **1044 ms** (4.2×) | 5.7 → **7.6 tok/s** (+33 %) | 59 MB / 1.86 GB |
-| Qwen 2.5-0.5B @ ctx 2048 | — | **20.6 tok/s** (29 % atención) | — |
+| Qwen 2.5-0.5B | 610 ms → **108 ms** (5.6×) | 37.4 → **58.4 tok/s** (+56 %) | 35 MB / 312 MB |
+| Qwen 2.5-1.5B | 1531 ms → **272 ms** (5.6×) | 15.3 → **22.6 tok/s** (+48 %) | 47 MB / 944 MB |
+| Qwen 2.5-3B | 4425 ms → **557 ms** (7.9×) | 5.7 → **10.5 tok/s** (+84 %) | 59 MB / 1.86 GB |
+| Qwen 2.5-0.5B @ ctx 2048 | 35.7 s → **16.1 s** | **43.4 tok/s** (24.5 % atención) | — |
 | Morton 3D | — | **54.2 ns/op** (este equipo) | — |
 
 **Qué cambió y por qué acelera:**
 
+- **Corrección del offset entre jobs en el GEMV afín.** Las ramas `affine` y `kmin` hacían `continue` sin avanzar `off = hi`. El job siguiente (por ejemplo `up_proj`) arrancaba en offset 0 y **reprocesaba filas ya calculadas**: gate/up se leía 1.5× y dos hilos escribían las mismas filas de `up` (data race). Medido con contadores: 42.7M filas procesadas donde correspondían 32.0M. Corregirlo da el salto grande (~1.5× en MLP) y además balancea q/k/v. Los tokens generados son idénticos antes y después.
 - **`--mem-policy auto` (nuevo default).** Si el artefacto cabe en `MemAvailable` con holgura, no se llama `MADV_DONTNEED`: los pesos quedan en page cache y THP, sin 150k page faults por pasada. Si no cabe, se pagina como antes. `paged` conserva el VmRSS mínimo; `resident` fuerza page cache caliente. El tráfico real de DRAM no cambia; cambia cuántas veces se vuelve a tocar la misma página.
 - **`--prefill-batch 8`.** El prefill procesa hasta 8 tokens por pasada: cada byte de peso leído se reutiliza 8 veces. La causalidad se mantiene porque la atención de cada token corta en `pos[i]`, aunque el KV del bloque ya esté escrito. Solo se calculan los logits del último token del bloque.
 - **Atención paralelizada por (token, cabeza).** Antes corría en un hilo mientras los workers esperaban; ahora usa el pool. A ctx 512 la atención baja de ~19 ms/token a ~4 ms/token (4 hilos).
 - **KV en fp16 (default).** La mitad de memoria y de tráfico de KV; mismo texto generado en las pruebas de regresión. `--kv-dtype fp32` lo desactiva.
 - **Hilos = núcleos físicos por defecto.** Usar los 8 hilos lógicos de un 4C/8T calienta y compite por los puertos de memoria: en este equipo el default anterior (8) llegó a 104 ms/token contra 26 ms/token con 4. `--threads 0` deja elegir al motor.
 
-**Modo Diamante:** la implementación actual (`--diamond N`) selecciona neuronas dispersas sin reordenar las filas; eso fragmenta el GEMV y midió **más lento** que denso (6.0 vs 7.6 tok/s en 3B). Para que el cono óptico acelere de verdad, las neuronas deben reordenarse por alineación con el haz al empaquetar, de modo que el prefijo activo sea contiguo. Hasta entonces, no es un acelerador.
+**Modo Diamante (triple check):** el aparente 12 % de mejora era el bug de offsets del GEMV, no el diamante. Con el denso corregido, en 3B: denso **138.7 ms/token**, Diamante 90 % **142.0 ms** (2.5 % más lento), Diamante 50 % **134.4 ms** (3 % más rápido). Además:
+
+- A 90 % de neuronas activas el máximo teórico es **1.11×**; el 3.7× es físicamente imposible sin saltar al menos el 73 % de los pesos.
+- La máscara cuesta 4-6 ms/token (`nth_element` + proyección 3D) y genera **1.000-5.500 runs** por proyección; cada run es una llamada al kernel y el GEMV se fragmenta.
+- La selección por bloques contiguos Morton de 304 filas captura 76 % de la señal al 50 % de bloques y 88 % al 75 %; la selección dispersa de neuronas al 50 % captura 70-78 %. No alcanza para justificar el riesgo.
+- Para que el cono acelere de verdad hay que **permutar las neuronas por alineación/Morton al empaquetar** y aceptar un prefijo contiguo (o varios haces ancla); eso es un cambio de packer + evaluación de calidad, no un flag.
+
+Hasta entonces, `--diamond` queda como experimental y no se recomienda para producción.
+
+### ¿Por qué claves Morton de 64 bits y no 128?
+
+- 3 ejes × 21 bits = **63 bits**. Con 21 bits por eje hay 2.097.152 vóxeles por dimensión; el tensor más grande del repo (`INTER=11.008`) usa ~0.5 % de ese rango. 128 bits darían 42 bits/eje (~4.4 billones por eje), una resolución que no compra nada.
+- `_pdep_u64` / `_pext_u64` de BMI2 son **de 64 bits**. Una clave de 128 bits exige dos `pdep` por eje, shifts/ors extra y **duplica el tamaño de las claves** en índices y comparaciones: más bytes y peor caché en un motor que ya está memory-bound.
+- La arquitectura es **x86-64**, con AVX2 de **256 bits** para los kernels. Bajar a SIMD de 128 bits (SSE) reduce el ancho de banda de cómputo; subir a AVX-512 no es posible en este i7-10510U (Comet Lake) y en 15 W provocaría downclocking.
+- La arena virtual reserva 1 TiB (40 bits de dirección); los 64 bits de dirección sobran. El “64 bits” de Aquifer es la **clave Morton**, no el ancho de la ISA.
+- Si algún día hiciera falta más resolución, la salida correcta es una clave de dos niveles (64 bits calientes + offset de hoja), no `__int128` en el camino caliente.
+
+
 
 ---
 
