@@ -176,16 +176,47 @@ def quantize_affine(w, group=32):
         x = np.ascontiguousarray(w[r0:r1]).reshape(r1 - r0, G, group)
         lo = x.min(axis=2)
         hi = x.max(axis=2)
-        sc = (hi - lo) / 15.0
-        sc16 = sc.astype(np.float16)
-        mn16 = lo.astype(np.float16)
-        scales[r0:r1] = sc16
-        mins[r0:r1] = mn16
-        s_eff = sc16.astype(np.float32)[:, :, None]
-        m_eff = mn16.astype(np.float32)[:, :, None]
-        inv_s = np.where(s_eff > 1e-8, 1.0 / s_eff, 0.0)
-        q = np.clip(np.rint((x - m_eff) * inv_s), 0, 15).astype(np.uint8)
-        deq = m_eff + s_eff * q
+        if CLIP_GRID:
+            # Busca, por grupo, el factor k que minimiza el error cuadratico.
+            # sc = k*(hi-lo)/15, mn = mid - 7.5*sc  (k=1 equivale a min/max).
+            mid = (hi + lo) * 0.5
+            half = (hi - lo) * 0.5
+            best_err = np.full(lo.shape, np.inf, dtype=np.float32)
+            best_sc = np.empty(lo.shape, dtype=np.float16)
+            best_mn = np.empty(lo.shape, dtype=np.float16)
+            best_q = np.empty(x.shape, dtype=np.uint8)
+            for k in CLIP_GRID:
+                sc = (k * (hi - lo) / 15.0).astype(np.float32)
+                mn = mid - 7.5 * sc
+                sc16 = sc.astype(np.float16)
+                mn16 = mn.astype(np.float16)
+                sc_f = sc16.astype(np.float32)[:, :, None]
+                mn_f = mn16.astype(np.float32)[:, :, None]
+                inv_s = np.where(sc_f > 1e-8, 1.0 / sc_f, 0.0)
+                q = np.clip(np.rint((x - mn_f) * inv_s), 0, 15).astype(np.uint8)
+                err = ((x - (mn_f + sc_f * q)) ** 2).sum(axis=2)
+                take = err < best_err
+                best_err[take] = err[take]
+                best_sc[take] = sc16[take]
+                best_mn[take] = mn16[take]
+                best_q[take] = q[take]
+            scales[r0:r1] = best_sc
+            mins[r0:r1] = best_mn
+            s_eff = best_sc.astype(np.float32)[:, :, None]
+            m_eff = best_mn.astype(np.float32)[:, :, None]
+            deq = m_eff + s_eff * best_q
+            q = best_q
+        else:
+            sc = (hi - lo) / 15.0
+            sc16 = sc.astype(np.float16)
+            mn16 = lo.astype(np.float16)
+            scales[r0:r1] = sc16
+            mins[r0:r1] = mn16
+            s_eff = sc16.astype(np.float32)[:, :, None]
+            m_eff = mn16.astype(np.float32)[:, :, None]
+            inv_s = np.where(s_eff > 1e-8, 1.0 / s_eff, 0.0)
+            q = np.clip(np.rint((x - m_eff) * inv_s), 0, 15).astype(np.uint8)
+            deq = m_eff + s_eff * q
         num2 += float(((x - deq) ** 2).sum())
         den2 += float((x.astype(np.float64) ** 2).sum())
         u = q.reshape(r1 - r0, K)
@@ -399,7 +430,7 @@ def main():
             todo.sort()
             print('  (lm_head atado -> se empaqueta embed_tokens como lineal)')
 
-    total_bits = 4.0 + 16.0 / GROUP
+    total_bits = (4.0 + 32.0 / GROUP) if args.scheme == 'affine' else (4.0 + 16.0 / GROUP)
     print(f'modelo : {args.model}   (grupo {GROUP} -> {total_bits:.2f} bits/param)')
     print(f'tensores lineales: {len(todo)}')
     print(f'{"nombre":<44}{"N":>6}{"K":>6}{"bits":>7}{"err%":>9}')
@@ -422,7 +453,7 @@ def main():
             w = st.tensor_f32(name)
             mins = None
             if args.scheme == 'affine':
-                packed, scales, mins, err = quantize_affine(w, group=32)
+                packed, scales, mins, err = quantize_affine(w, group=GROUP)
             elif args.scheme == 'kmin':
                 packed, scales, err = quantize_kmin(w)
             else:
@@ -517,7 +548,7 @@ def main():
     for name, m in index.items():
         if m.get('affine'):
             lines.append(f'LINEARA {name} {m["N"]} {m["K"]} {m["base_off"]} '
-                         f'{m["packed_bytes"]} {m["scale_off"]} {m["min_off"]}')
+                         f'{m["packed_bytes"]} {m["scale_off"]} {m["min_off"]} {GROUP}')
         elif m.get('kmin'):
             lines.append(f'LINEARK {name} {m["N"]} {m["K"]} {m["base_off"]} '
                          f'{m["packed_bytes"]} {m["scale_off"]} {m["scale_bytes"]}')

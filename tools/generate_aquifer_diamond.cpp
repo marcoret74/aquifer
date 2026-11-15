@@ -509,6 +509,20 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                 float* yy = j.y;   // M*N, fila m en yy + m*N
                 if (j.L->min) {
                     const _Float16* mn = j.L->min + n0 * j.L->G;
+                    if (grp == 64 && j.L->stride == 0) {
+                        switch (M) {
+                            case 1: caudal::gemv_int4_affine_g64_M<1>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                            case 2: caudal::gemv_int4_affine_g64_M<2>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                            case 3: caudal::gemv_int4_affine_g64_M<3>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                            case 4: caudal::gemv_int4_affine_g64_M<4>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                            case 5: caudal::gemv_int4_affine_g64_M<5>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                            case 6: caudal::gemv_int4_affine_g64_M<6>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                            case 7: caudal::gemv_int4_affine_g64_M<7>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                            default: caudal::gemv_int4_affine_g64_M<8>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        }
+                        off = hi;
+                        continue;
+                    }
                     switch (M) {
                         case 1: caudal::gemv_int4_affine_M<1>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                         case 2: caudal::gemv_int4_affine_M<2>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
@@ -680,9 +694,16 @@ void gemv_group_diamond_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                     const _Float16* sc = j.L->stride ? nullptr : (j.L->scale + r0 * j.L->G);
                     if (j.L->min) {
                         const _Float16* mn = j.L->min + r0 * j.L->G;
-                        switch (M) {
-                            case 1: caudal::gemv_int4_affine_M<1>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + r0, j.L->N); break;
-                            default: caudal::gemv_int4_affine_M<2>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + r0, j.L->N); break;
+                        if (grp == 64 && j.L->stride == 0) {
+                            if (M == 1)
+                                caudal::gemv_int4_affine_g64_M<1>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + r0, j.L->N);
+                            else
+                                caudal::gemv_int4_affine_g64_M<2>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + r0, j.L->N);
+                        } else {
+                            switch (M) {
+                                case 1: caudal::gemv_int4_affine_M<1>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + r0, j.L->N); break;
+                                default: caudal::gemv_int4_affine_M<2>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + r0, j.L->N); break;
+                            }
                         }
                     }
                     r0 = r1;
@@ -856,11 +877,14 @@ int main(int argc, char** argv) {
                 std::string name; is >> name;
                 std::size_t N2, K2, off2, pb2, so2, mo2;
                 is >> N2 >> K2 >> off2 >> pb2 >> so2 >> mo2;
+                std::size_t g2 = 32;
+                if (!(is >> g2) || g2 == 0) g2 = 32;
+                const std::size_t G2 = K2 / g2;
                 Lin L; L.N = N2; L.K = K2; L.row_bytes = K2 / 2;
                 L.packed = c.w_file.ptr + off2;
                 L.scale = reinterpret_cast<const _Float16*>(c.s_file.ptr + so2);
                 L.min = reinterpret_cast<const _Float16*>(c.s_file.ptr + mo2);
-                L.stride = 0; L.G = K2 / 32;
+                L.stride = 0; L.G = G2;
                 c.lin[name] = L;
 
                 if (name.find("model.layers.") == 0) {
@@ -872,8 +896,9 @@ int main(int argc, char** argv) {
                         auto& sp = c.layer_spans[l_idx];
                         sp.w_start = std::min(sp.w_start, off2);
                         sp.w_end   = std::max(sp.w_end, off2 + pb2);
-                        sp.s_start = std::min(sp.s_start, so2);
-                        sp.s_end   = std::max(sp.s_end, mo2 + (N2 * (K2 / 32) * 2));
+                        sp.s_start = std::min(sp.s_start, std::min(so2, mo2));
+                        sp.s_end   = std::max(sp.s_end, so2 + N2 * G2 * 2);
+                        sp.s_end   = std::max(sp.s_end, mo2 + N2 * G2 * 2);
                     }
                 }
             } else if (kind == "LINEARK") {              // super-bloque + minimo

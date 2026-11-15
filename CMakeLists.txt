@@ -50,6 +50,10 @@ add_executable(test_kmin tests/test_kmin.cpp)
 target_link_libraries(test_kmin PRIVATE aquifer_flags)
 add_test(NAME test_kmin COMMAND test_kmin)
 
+add_executable(test_affine_g64 tests/test_affine_g64.cpp)
+target_link_libraries(test_affine_g64 PRIVATE aquifer_flags)
+add_test(NAME test_affine_g64 COMMAND test_affine_g64)
+
 add_executable(test_doublemap tests/test_doublemap.cpp)
 target_link_libraries(test_doublemap PRIVATE aquifer_flags)
 add_test(NAME test_doublemap COMMAND test_doublemap)

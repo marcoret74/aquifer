@@ -4,7 +4,7 @@ CXXFLAGS_SSE = -std=c++23 -O3 -msse4.2 -Wall -Wextra -Wpedantic -pthread -I incl
 
 BUILD_DIR = build
 TESTS = $(BUILD_DIR)/test_morton $(BUILD_DIR)/test_portero $(BUILD_DIR)/test_paging_rss \
-        $(BUILD_DIR)/test_sse_affine $(BUILD_DIR)/test_affine_g32 $(BUILD_DIR)/test_kmin \
+        $(BUILD_DIR)/test_sse_affine $(BUILD_DIR)/test_affine_g32 $(BUILD_DIR)/test_kmin $(BUILD_DIR)/test_affine_g64 \
         $(BUILD_DIR)/test_doublemap $(BUILD_DIR)/check_g32M
 BINS = $(BUILD_DIR)/generate_aquifer $(BUILD_DIR)/generate_aquifer_sse $(BUILD_DIR)/generate_aquifer_diamond
 
@@ -31,6 +31,9 @@ $(BUILD_DIR)/test_affine_g32: tests/test_affine_g32.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD_DIR)/test_kmin: tests/test_kmin.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< -o $@
+
+$(BUILD_DIR)/test_affine_g64: tests/test_affine_g64.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@
 
 $(BUILD_DIR)/test_doublemap: tests/test_doublemap.cpp | $(BUILD_DIR)
@@ -67,6 +70,8 @@ test: tests
 	@$(BUILD_DIR)/test_affine_g32
 	@echo ""
 	@$(BUILD_DIR)/test_kmin
+	@echo ""
+	@$(BUILD_DIR)/test_affine_g64
 	@echo ""
 	@$(BUILD_DIR)/test_doublemap
 	@echo ""
