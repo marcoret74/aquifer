@@ -241,7 +241,7 @@ def main():
 
     # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
     sys_tokens_str = ""
-    if args.system and args.model in ("qwen", "qwen05", "coder", "tiny", "smol2"):
+    if args.system and args.model in ("qwen", "qwen05", "qwen3", "coder", "tiny", "smol2"):
         if args.model == "tiny":
             sys_str = f"<|system|>\n{args.system}</s>\n"
         else:
