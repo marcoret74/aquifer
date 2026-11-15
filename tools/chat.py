@@ -72,6 +72,89 @@ def format_prompt(history, model_type="qwen", system_prompt=None):
         return "".join(parts)
 
 
+MODELS_CATALOG = [
+    {
+        "key": "qwen05",
+        "name": "Qwen 2.5-0.5B Instruct",
+        "params": "490M",
+        "ram": "~37 MB",
+        "speed": "35-50 tok/s",
+        "artifact": "qwen05_affine",
+        "desc": "Ultra-fast response, lightweight direct answers"
+    },
+    {
+        "key": "qwen",
+        "name": "Qwen 2.5-1.5B Instruct",
+        "params": "1.54B",
+        "ram": "~50 MB",
+        "speed": "15-20 tok/s",
+        "artifact": "qwen15_affine",
+        "desc": "Golden balance between intelligence, Spanish & speed"
+    },
+    {
+        "key": "qwen3",
+        "name": "Qwen 2.5-3B Instruct",
+        "params": "3.09B",
+        "ram": "~75 MB",
+        "speed": "6-7 tok/s",
+        "artifact": "qwen3b_affine",
+        "desc": "Deep reasoning, eloquent writing & rich vocabulary"
+    },
+    {
+        "key": "coder",
+        "name": "Qwen 2.5-Coder-1.5B",
+        "params": "1.54B",
+        "ram": "~50 MB",
+        "speed": "15-20 tok/s",
+        "artifact": "coder15_affine",
+        "desc": "Code generation, C++, Python, algorithms & systems"
+    },
+    {
+        "key": "r1",
+        "name": "DeepSeek-R1-Distill-1.5B",
+        "params": "1.54B",
+        "ram": "~50 MB",
+        "speed": "15-20 tok/s",
+        "artifact": "r1_affine",
+        "desc": "Chain-of-thought reasoning with <think> tags"
+    },
+    {
+        "key": "smol2",
+        "name": "SmolLM2-1.7B Instruct",
+        "params": "1.71B",
+        "ram": "~50 MB",
+        "speed": "15-18 tok/s",
+        "artifact": "smol2_affine",
+        "desc": "HuggingFace curated knowledge dataset"
+    },
+    {
+        "key": "tiny",
+        "name": "TinyLlama-1.1B Chat",
+        "params": "1.10B",
+        "ram": "~45 MB",
+        "speed": "20-25 tok/s",
+        "artifact": "tiny_affine",
+        "desc": "Compact Llama-2 architecture"
+    },
+]
+
+
+def print_model_catalog(resolve_artifact):
+    print(f"\n{BOLD}{CYAN}Available Models in Aquifer Engine (Zero-Copy HiperRAM Paging):{RESET}")
+    print("=" * 95)
+    print(f"{'Key':<8} {'Model Name':<26} {'Params':<8} {'RAM (VmRSS)':<12} {'Speed':<13} {'Status'}")
+    print("-" * 95)
+    for m in MODELS_CATALOG:
+        art_path = resolve_artifact(m["artifact"])
+        exists = os.path.exists(art_path)
+        status_str = f"{GREEN}● Ready{RESET}" if exists else f"{DIM}○ Missing{RESET}"
+        print(f"{YELLOW}{m['key']:<8}{RESET} {m['name']:<26} {m['params']:<8} {m['ram']:<12} {m['speed']:<13} {status_str}")
+        print(f"         {DIM}{m['desc']}{RESET}")
+    print("=" * 95)
+    print(f"Run model  : {BOLD}python3 tools/chat.py --model <key>{RESET}")
+    print(f"Diamond 3D : {BOLD}python3 tools/chat.py --model <key> --diamond 90{RESET}\n")
+
+
 def main():
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     default_bin = os.path.join(repo_dir, "build", "generate_aquifer")
@@ -88,6 +171,7 @@ def main():
         return local_art
 
     ap = argparse.ArgumentParser(description="Chat interactivo en Aquifer Engine (Zero-Copy Paging, 5.00 bpw)")
+    ap.add_argument("--list", "-l", action="store_true", help="Listar todos los modelos disponibles y salir")
     ap.add_argument("--model", choices=["qwen", "qwen05", "qwen3", "coder", "r1", "tiny", "smol2"], default="qwen",
                     help="Modelo: 'qwen' (1.5B), 'qwen05' (0.5B rápido), 'qwen3' (3B Instruct), 'coder' (1.5B Coder), 'r1' (R1 Distill), 'tiny' (1.1B), 'smol2' (1.7B)")
     ap.add_argument("--bin", default=default_bin, help="Ruta al binario generate_aquifer")
@@ -99,6 +183,10 @@ def main():
     ap.add_argument("--system", default=None, help="Prompt de sistema")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
+
+    if args.list:
+        print_model_catalog(resolve_artifact)
+        return 0
 
     if args.diamond is not None and args.bin == default_bin:
         diamond_bin = os.path.join(repo_dir, "build", "generate_aquifer_diamond")
@@ -257,8 +345,9 @@ def main():
     print(f"\n{BOLD}================================================================={RESET}")
     print(f"{BOLD}      Aquifer Interactive Shell · {model_title}                  {RESET}")
     print(f"  Commands:                                                      ")
-    print(f"    {YELLOW}/reset{RESET} (or {YELLOW}/clear{RESET})  -> Reset conversation history & KV cache  ")
-    print(f"    {YELLOW}/exit{RESET}  (or {YELLOW}/quit{RESET})   -> Exit interactive shell                 ")
+    print(f"    {YELLOW}/models{RESET} (or {YELLOW}/list{RESET})   -> List all available models              ")
+    print(f"    {YELLOW}/reset{RESET}  (or {YELLOW}/clear{RESET})  -> Reset conversation history & KV cache  ")
+    print(f"    {YELLOW}/exit{RESET}   (or {YELLOW}/quit{RESET})   -> Exit interactive shell                 ")
     print(f"{BOLD}================================================================={RESET}\n")
 
     history = []
@@ -276,6 +365,9 @@ def main():
 
             if user_input.lower() in ("/exit", "/quit", "exit", "quit", "/salir", "salir"):
                 break
+            elif user_input.lower() in ("/models", "/list", "models", "list", "/modelos", "modelos"):
+                print_model_catalog(resolve_artifact)
+                continue
             elif user_input.lower() in ("/reset", "/clear", "clear", "/limpiar", "reset"):
                 history.clear()
                 proc.stdin.write("RESET\n")
