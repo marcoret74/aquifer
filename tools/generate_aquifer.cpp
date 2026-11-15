@@ -605,6 +605,7 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                         case 7: caudal::gemv_int4_affine_M<7>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                         default: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     }
+                    off = hi;   // no saltear el offset del siguiente job
                     continue;
 #if defined(__AVX2__)
                 } else if (j.L->kmin) {
@@ -619,6 +620,7 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                         case 7: caudal::gemv_int4_kmin_M<7>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                         default: caudal::gemv_int4_kmin_M<8>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     }
+                    off = hi;   // idem: el proximo job arranca en hi
                     continue;
                 }
                 switch (M) {
