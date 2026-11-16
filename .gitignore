@@ -20,6 +20,7 @@ __pycache__/
 # Security & Secrets protection
 *.env
 *.env.*
+!*.env.example
 *.key
 *.pem
 *.id_rsa
