@@ -68,7 +68,7 @@ static bool g_kv_fp16 = true;        // KV en fp16: mitad de tráfico en atenci�
 
 namespace {
 
-constexpr unsigned kMaxM = 8;          // secuencias por pasada
+constexpr unsigned kMaxM = 16;         // secuencias por pasada (prefill B=16)
 
 struct Cfg {
     std::size_t H{0}, NLY{0}, NH{0}, NKV{0}, DH{0}, INTER{0}, V{0};
@@ -579,10 +579,54 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
         }
     });
 
+    const unsigned T = pool.size();
+
+    // Prefill B=16: dos grupos de 8 tokens sobre el MISMO bloque de filas.
+    // El primer pase trae el bloque a L3; el segundo lo lee de cache. Así se
+    // evita leer los pesos dos veces desde DRAM sin spillear registros.
+    if (M == 16) {
+        const std::size_t G4 = std::size_t(G);
+        const std::size_t row_bytes = K / 2 + G4 * 4;   // pesos + escala + mínimo
+        const std::size_t RB = std::max<std::size_t>(
+            32, (std::size_t{4} << 20) / std::max<std::size_t>(1, T * row_bytes));
+        pool.run([&](unsigned tid) {
+            for (const auto& j : jobs) {
+                const std::size_t a = std::size_t(tid) * j.L->N / T;
+                const std::size_t b = std::size_t(tid + 1) * j.L->N / T;
+                for (std::size_t rb = a; rb < b; rb += RB) {
+                    const std::size_t re = std::min(rb + RB, b);
+                    for (unsigned tg = 0; tg < 2; ++tg) {
+                        caudal::Shape s; s.N = re - rb; s.K = K; s.group = grp;
+                        s.stride = j.L->stride;
+                        const std::uint8_t* pk = j.L->packed +
+                            rb * (j.L->stride ? j.L->stride : j.L->row_bytes);
+                        const _Float16* sc = j.L->min ? (j.L->scale + rb * G) : nullptr;
+                        const std::size_t tok0 = std::size_t(tg) * 8;
+                        const std::int8_t* xp = xqp.data() + tok0 * K;
+                        const float* xsp = xs.data() + tok0 * G;
+                        float* yy = j.y + tok0 * j.L->N + rb;
+                        if (j.L->min) {
+                            const _Float16* mn = j.L->min + rb * G;
+                            caudal::gemv_int4_affine_M<8>(s, pk, sc, mn,
+                                xms.data() + tok0 * G, xp, xsp, yy, j.L->N);
+                        } else if (j.L->kmin) {
+                            const std::uint8_t* hp = j.L->kmin + rb * (K / 256) * 16;
+                            caudal::gemv_int4_kmin_M<8>(s, pk, hp,
+                                xg.data() + tok0 * G, xp, xsp, yy, j.L->N);
+                        } else {
+                            caudal::gemv_int4_g32_M<8>(s, pk, sc,
+                                xg.data() + tok0 * G, xp, xsp, yy, j.L->N);
+                        }
+                    }
+                }
+            }
+        });
+        return;
+    }
+
     std::size_t total = 0;
     for (const auto& j : jobs) total += j.L->N;
 
-    const unsigned T = pool.size();
     pool.run([&](unsigned tid) {
         const std::size_t a = std::size_t(tid) * total / T;
         const std::size_t b = std::size_t(tid + 1) * total / T;
@@ -611,7 +655,16 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                         case 5: caudal::gemv_int4_affine_M<5>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                         case 6: caudal::gemv_int4_affine_M<6>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                         case 7: caudal::gemv_int4_affine_M<7>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        default: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 8: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 9: caudal::gemv_int4_affine_M<9>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 10: caudal::gemv_int4_affine_M<10>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 11: caudal::gemv_int4_affine_M<11>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 12: caudal::gemv_int4_affine_M<12>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 13: caudal::gemv_int4_affine_M<13>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 14: caudal::gemv_int4_affine_M<14>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 15: caudal::gemv_int4_affine_M<15>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 16: caudal::gemv_int4_affine_M<16>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        default: caudal::gemv_int4_affine_M<16>(s, pk, sc, mn, xms.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     }
                     off = hi;   // no saltear el offset del siguiente job
                     continue;
@@ -626,7 +679,16 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                         case 5: caudal::gemv_int4_kmin_M<5>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                         case 6: caudal::gemv_int4_kmin_M<6>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                         case 7: caudal::gemv_int4_kmin_M<7>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                        default: caudal::gemv_int4_kmin_M<8>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 8: caudal::gemv_int4_kmin_M<8>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 9: caudal::gemv_int4_kmin_M<9>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 10: caudal::gemv_int4_kmin_M<10>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 11: caudal::gemv_int4_kmin_M<11>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 12: caudal::gemv_int4_kmin_M<12>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 13: caudal::gemv_int4_kmin_M<13>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 14: caudal::gemv_int4_kmin_M<14>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 15: caudal::gemv_int4_kmin_M<15>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        case 16: caudal::gemv_int4_kmin_M<16>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                        default: caudal::gemv_int4_kmin_M<16>(s, pk, hp, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     }
                     off = hi;   // idem: el proximo job arranca en hi
                     continue;
@@ -639,7 +701,16 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
                     case 5: caudal::gemv_int4_g32_M<5>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     case 6: caudal::gemv_int4_g32_M<6>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                     case 7: caudal::gemv_int4_g32_M<7>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
-                    default: caudal::gemv_int4_g32_M<8>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 8: caudal::gemv_int4_g32_M<8>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 9: caudal::gemv_int4_g32_M<9>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 10: caudal::gemv_int4_g32_M<10>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 11: caudal::gemv_int4_g32_M<11>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 12: caudal::gemv_int4_g32_M<12>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 13: caudal::gemv_int4_g32_M<13>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 14: caudal::gemv_int4_g32_M<14>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 15: caudal::gemv_int4_g32_M<15>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    case 16: caudal::gemv_int4_g32_M<16>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
+                    default: caudal::gemv_int4_g32_M<16>(s, pk, sc, xg.data(), xqp.data(), xs.data(), yy + n0, j.L->N); break;
                 }
 #else
                 } else {
@@ -776,7 +847,7 @@ int main(int argc, char** argv) {
     }
     if (ctx < 1) { std::printf("--ctx tiene que ser >= 1\n"); return 1; }
     g_prefill_batch = std::min(g_prefill_batch, unsigned(kMaxM));
-    spec = std::max(0, std::min(spec, int(kMaxM)));
+    spec = std::max(0, std::min(spec, 8));
     g_spec_min = std::max(2, std::min(g_spec_min, 16));
     g_spec_max = std::max(g_spec_min, std::min(g_spec_max, 16));
     // Cada secuencia conserva SU longitud: truncar al minimo hacia que el
