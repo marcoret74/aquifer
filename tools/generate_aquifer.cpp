@@ -1478,7 +1478,30 @@ int main(int argc, char** argv) {
             if (cmd == "RESET") {
                 cached_tokens.clear();
                 kv_written = 0;
+                recent_tokens.clear();
                 std::printf("RESET_OK\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "CONFIG") {
+                // Ajustes por request: n, temperatura, top-k, top-p, semilla,
+                // repetition penalty y ventana. No toca el kernel ni el KV.
+                int nn = 0, tk = 40, rln = 64;
+                float t = 0.0f, tp = 0.9f, rp = 1.0f;
+                unsigned long long sd = 0;
+                if (ss >> nn >> t >> tk >> tp >> sd >> rp >> rln) {
+                    ngen = std::max(1, nn);
+                    g_temperature = std::max(0.0f, t);
+                    g_top_k = std::max(0, tk);
+                    g_top_p = std::max(0.0f, std::min(1.0f, tp));
+                    g_repeat_penalty = std::max(1.0f, rp);
+                    g_repeat_last_n = std::max(0, std::min(rln, ctx));
+                    recent_tokens.clear();
+                    if (sd) rng.seed(sd);
+                    std::printf("CONFIG_OK\n");
+                } else {
+                    std::printf("CONFIG_ERR\n");
+                }
                 std::fflush(stdout);
                 continue;
             }

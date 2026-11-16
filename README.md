@@ -63,6 +63,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Atención paralelizada por (token, cabeza).** Antes corría en un hilo mientras los workers esperaban; ahora usa el pool. A ctx 512 la atención baja de ~19 ms/token a ~4 ms/token (4 hilos).
 - **Decodificación especulativa por prompt-lookup (`--spec 4`, default en chat).** Propone hasta 4 tokens copiados de una repetición reciente del contexto, los verifica en una sola pasada `M=4` y acepta el prefijo correcto. En greedy genera **exactamente los mismos tokens** que sin spec. Medido: +5–15 % en texto natural y **1,5–2,2×** en salida repetitiva/código. `--spec 0` lo desactiva. Tuning: `--spec-min 2 --spec-max 8` es el default; k=6/8 y min=3/4 no fueron robustamente mejores (k=8 ayuda en listas periódicas pero castiga prosa), y una propuesta de 1 token se descarta porque no ahorra nada. `--spec-min/--spec-max` quedan expuestos para experimentar.
 - **Sesión persistente (`--session RUTA`).** Guarda y restaura el KV cache + el historial entre ejecuciones, en un formato binario propio `AQKV v1` (`RUTA.kv`) con cabecera, tokens del prefijo y checksum FNV-1a, más un `RUTA.json` con el historial. Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo, así que un KV de otro modelo o un archivo truncado se rechaza en vez de corromper la generación. Autoguarda al cerrar cada turno; `/reset` borra la sesión.
+- **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
 - **Stop sequences por texto (`--stop`, repetible).** El chat acumula el texto decodificado en un buffer rodante, detecta la parada aunque cruce varios tokens, imprime solo lo anterior, envía `STOP` al motor y drena hasta `DONE`. El historial se trunca en la parada. Es lógica de chat/orquestador: el kernel no cambia y `--eos` sigue siendo el corte por ID de token.
 - **Repetition penalty nativo (`--repeat-penalty`, `--repeat-last-n`).** Penaliza tokens recientes antes de muestrear o de elegir el argmax; sirve para cortar bucles en modelos chicos sin bajar la temperatura. Implementación propia del algoritmo genérico CTRL, sin dependencias.
 - **Sampling configurable (`--temperature`, `--top-k`, `--top-p`, `--seed`).** Greedy sigue siendo el default; con `--temperature > 0` se muestrea con top-k/nucleus y semilla reproducible. El spec n-gram se desactiva automáticamente cuando hay sampling, porque su verificación es greedy.
@@ -166,6 +167,54 @@ python3 tools/chat.py --model qwen3 --threads 4 --prefill-batch 8 --kv-dtype fp1
 * `/switch <modelo>` $\to$ Cambiar de modelo en caliente sin reiniciar el proceso (ej: `/switch coder`).
 * `/reset` o `/clear` $\to$ Limpiar historial de conversación y resetear el KV-cache.
 * `/exit` o `/quit` $\to$ Salir de la shell.
+
+### 4. Servidor HTTP local (API estilo OpenAI)
+El motor se puede exponer como servicio local para conectar una UI, un script o el
+verificador, sin dependencias externas y sin tocar el kernel:
+
+```bash
+# Levantar el servidor (escucha solo en 127.0.0.1 por defecto)
+python3 tools/serve.py --model qwen05 --port 8080 --ctx 2048
+
+# Opciones útiles
+python3 tools/serve.py --model qwen3 --port 8080 --threads 4 \
+  --api-key mi_clave --cors
+```
+
+Rutas:
+
+| Método | Ruta | Descripción |
+| :--- | :--- | :--- |
+| `GET` | `/health` | Estado del motor, modelo y `ctx`. |
+| `GET` | `/v1/models` | Modelo servido, formato OpenAI. |
+| `GET` | `/v1/models/catalog` | Catálogo local de modelos disponibles. |
+| `POST` | `/v1/chat/completions` | Chat con `stream: true` o `false`. |
+
+```bash
+curl -s localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hola"}],"max_tokens":64}'
+```
+
+```python
+# Cliente compatible con OpenAI
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="mi_clave")
+r = client.chat.completions.create(
+    model="qwen05",
+    messages=[{"role": "user", "content": "Hola"}],
+    max_tokens=64,
+)
+print(r.choices[0].message.content)
+```
+
+Acepta por request `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`,
+`repeat_penalty`, `repeat_last_n`, `stop` (string o lista) y `stream`. El sampling
+se envía al motor con el comando `CONFIG`; las stop sequences y el filtrado de
+tokens especiales se resuelven en el servidor. El KV cache se reutiliza entre
+requests de la misma conversación (prefijo), y si el historial no cabe en `ctx`
+se recortan los mensajes más antiguos. Una sola generación a la vez: las
+peticiones concurrentes esperan turno.
 
 ---
 
