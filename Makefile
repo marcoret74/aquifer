@@ -72,6 +72,8 @@ test: tests
 	@echo ""
 	@$(BUILD_DIR)/check_g32M
 	@echo ""
+	@python3 tools/test_structured.py
+	@echo ""
 	@echo ">>> TODOS LOS TESTS DE AQUIFER PASARON CON ÉXITO <<<"
 
 clean:

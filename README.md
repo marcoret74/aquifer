@@ -63,6 +63,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Atención paralelizada por (token, cabeza).** Antes corría en un hilo mientras los workers esperaban; ahora usa el pool. A ctx 512 la atención baja de ~19 ms/token a ~4 ms/token (4 hilos).
 - **Decodificación especulativa por prompt-lookup (`--spec 4`, default en chat).** Propone hasta 4 tokens copiados de una repetición reciente del contexto, los verifica en una sola pasada `M=4` y acepta el prefijo correcto. En greedy genera **exactamente los mismos tokens** que sin spec. Medido: +5–15 % en texto natural y **1,5–2,2×** en salida repetitiva/código. `--spec 0` lo desactiva. Tuning: `--spec-min 2 --spec-max 8` es el default; k=6/8 y min=3/4 no fueron robustamente mejores (k=8 ayuda en listas periódicas pero castiga prosa), y una propuesta de 1 token se descarta porque no ahorra nada. `--spec-min/--spec-max` quedan expuestos para experimentar.
 - **Sesión persistente (`--session RUTA`).** Guarda y restaura el KV cache + el historial entre ejecuciones, en un formato binario propio `AQKV v1` (`RUTA.kv`) con cabecera, tokens del prefijo y checksum FNV-1a, más un `RUTA.json` con el historial. Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo, así que un KV de otro modelo o un archivo truncado se rechaza en vez de corromper la generación. Autoguarda al cerrar cada turno; `/reset` borra la sesión.
+- **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
 - **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
 - **Stop sequences por texto (`--stop`, repetible).** El chat acumula el texto decodificado en un buffer rodante, detecta la parada aunque cruce varios tokens, imprime solo lo anterior, envía `STOP` al motor y drena hasta `DONE`. El historial se trunca en la parada. Es lógica de chat/orquestador: el kernel no cambia y `--eos` sigue siendo el corte por ID de token.
 - **Repetition penalty nativo (`--repeat-penalty`, `--repeat-last-n`).** Penaliza tokens recientes antes de muestrear o de elegir el argmax; sirve para cortar bucles en modelos chicos sin bajar la temperatura. Implementación propia del algoritmo genérico CTRL, sin dependencias.
@@ -215,6 +216,68 @@ tokens especiales se resuelven en el servidor. El KV cache se reutiliza entre
 requests de la misma conversación (prefijo), y si el historial no cabe en `ctx`
 se recortan los mensajes más antiguos. Una sola generación a la vez: las
 peticiones concurrentes esperan turno.
+
+#### Salida JSON estructurada (para el Juez)
+
+El cliente puede exigir un sobre JSON validable, sin que el motor sepa nada del
+dominio:
+
+```bash
+curl -s localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Resume y cita la cláusula 3."}],
+    "max_tokens": 256,
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "evidencia",
+        "schema": {
+          "type": "object",
+          "required": ["respuesta", "afirmaciones"],
+          "properties": {
+            "respuesta": {"type": "string"},
+            "afirmaciones": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["texto", "estado", "citas"],
+                "properties": {
+                  "texto": {"type": "string"},
+                  "estado": {"enum": ["SOPORTADO", "NO_SOPORTADO", "PARCIAL"]},
+                  "citas": {"type": "array", "items": {"type": "string"}}
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  }'
+```
+
+Comportamiento:
+
+- El servidor agrega el esquema al system prompt y pide JSON puro.
+- Valida con `tools/structured.py` (subconjunto: `type`, `required`,
+  `properties`, `additionalProperties`, `items`, `minItems`, `maxItems`, `enum`,
+  `const`, `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`, `anyOf`,
+  `oneOf`).
+- Si falla, reintenta con un mensaje correctivo que incluye los errores
+  (`--json-retries N`, default 1 → hasta 2 intentos).
+- En éxito, `content` es JSON canonicalizado y la respuesta trae
+  `x_aquifer: {valid, attempts, schema_name, value}`.
+- Si no cumple tras los intentos: HTTP `422` con
+  `error.details = {attempts, errors, content}`. Fallar es preferible a entregar
+  un sobre inválido como si fuera evidencia.
+- `{"type": "json_object"}` exige un objeto JSON válido sin esquema.
+- Con `stream: true` la generación se valida antes de emitir: el contenido
+  validado llega en un chunk y luego `finish_reason` + `[DONE]`.
+
+El esquema es del orquestador. En el repo no hay reglas legales ni lógica del
+Juez: solo extracción y validación genérica.
 
 ---
 

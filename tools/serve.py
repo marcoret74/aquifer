@@ -32,17 +32,19 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chat import (MODELS_CATALOG, StreamDecoder, format_prompt,  # noqa: E402
                   get_model_config, start_engine)
+from structured import SchemaError, extract_json, validate  # noqa: E402
 
 SPECIAL_MARKERS = ("<|im_end|>", "<|endoftext|>", "<｜end", "<think>",
                    "</s>", "<|user|>", "<|assistant|>")
 
 
 class ApiError(Exception):
-    def __init__(self, status, message, kind="invalid_request_error"):
+    def __init__(self, status, message, kind="invalid_request_error", details=None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.kind = kind
+        self.details = details
 
 
 class Generation:
@@ -267,8 +269,10 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, err):
         # Si no se consumió el cuerpo, cerrar evita desincronizar keep-alive.
         self.close_connection = True
-        self._send_json(err.status, {"error": {
-            "message": err.message, "type": err.kind, "code": err.status}})
+        payload = {"message": err.message, "type": err.kind, "code": err.status}
+        if err.details is not None:
+            payload["details"] = err.details
+        self._send_json(err.status, {"error": payload})
 
     def _auth(self):
         key = self.state.api_key
@@ -462,40 +466,115 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "prompt demasiado largo para ctx=%d" % ctx)
         return tokens
 
-    def _chat(self, body):
-        if not self.state.engine.alive():
-            raise ApiError(503, "el motor no está disponible", "server_error")
-        opts = self._opts(body)
-        system_text, history = self._prompt(body, opts)
-        tokens = self._tokens(system_text, history, opts)
-        stream = bool(body.get("stream", False))
-        completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
-        created = int(time.time())
+    # --- salida estructurada ----------------------------------------------
+    def _response_format(self, body):
+        rf = body.get("response_format")
+        if rf is None:
+            return None
+        if not isinstance(rf, dict):
+            raise ApiError(400, "response_format debe ser un objeto")
+        kind = rf.get("type")
+        if kind in (None, "text"):
+            return None
+        if kind == "json_object":
+            return {"type": "json_object", "schema": None, "schema_name": None}
+        if kind == "json_schema":
+            js = rf.get("json_schema")
+            if not isinstance(js, dict):
+                raise ApiError(400, "json_schema debe ser un objeto")
+            schema = js.get("schema")
+            if not isinstance(schema, dict):
+                raise ApiError(400, "json_schema.schema debe ser un objeto")
+            return {"type": "json_schema", "schema": schema,
+                    "schema_name": js.get("name") or "response"}
+        raise ApiError(400, "response_format.type no soportado: %r" % (kind,))
+
+    def _json_system(self, system_text, fmt):
+        if fmt.get("schema") is not None:
+            instr = ("Devuelve exclusivamente un objeto JSON válido que cumpla "
+                     "este esquema. No uses markdown ni ``` y no agregues texto "
+                     "fuera del JSON.\nEsquema:\n" +
+                     json.dumps(fmt["schema"], ensure_ascii=False,
+                                separators=(",", ":")))
+        else:
+            instr = ("Devuelve exclusivamente un objeto JSON válido. No uses "
+                     "markdown ni ``` y no agregues texto fuera del JSON.")
+        return (system_text + "\n\n" + instr).strip() if system_text else instr
+
+    def _corrective(self, errors, fmt, raw):
+        parts = ["Tu respuesta anterior no cumplió el formato exigido."]
+        snippet = (raw or "").strip()
+        if snippet:
+            if len(snippet) > 400:
+                snippet = snippet[:400] + "…"
+            parts.append("Respuesta anterior (recortada):\n" + snippet)
+        if errors:
+            parts.append("Errores detectados:\n" +
+                         "\n".join("- " + e for e in errors[:12]))
+        parts.append("Devuelve únicamente el objeto JSON corregido, sin markdown "
+                     "ni texto adicional.")
+        return "\n\n".join(parts)
+
+    def _structured(self, history, system_text, opts, fmt):
+        max_attempts = 1 + max(0, int(self.state.args.json_retries))
+        base_history = list(history)
+        attempt = 0
+        errors = []
+        raw = ""
+        value = None
+        tokens = []
         gen = Generation()
+        while attempt < max_attempts:
+            attempt += 1
+            tokens = self._tokens(system_text, base_history, opts)
+            gen = Generation()
+            raw = "".join(self.state.engine.stream(tokens, opts, gen))
+            try:
+                value = extract_json(raw)
+            except SchemaError as err:
+                value = None
+                errors = [str(err)]
+            else:
+                if fmt.get("schema") is None:
+                    errors = [] if isinstance(value, dict) else [
+                        "se esperaba un objeto JSON"]
+                else:
+                    errors = validate(value, fmt["schema"])
+                if not errors:
+                    return raw, value, gen, attempt, tokens
+            if attempt < max_attempts:
+                base_history = list(history) + [
+                    ("user", self._corrective(errors, fmt, raw))]
+        raise ApiError(
+            422,
+            "la salida no cumple el esquema tras %d intento(s)" % attempt,
+            "invalid_schema_output",
+            details={"attempts": attempt, "errors": errors,
+                     "content": (raw or "")[-2000:]})
 
-        if not stream:
-            parts = []
-            for piece in self.state.engine.stream(tokens, opts, gen):
-                parts.append(piece)
-            text = "".join(parts)
-            self._send_json(200, {
-                "id": completion_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": self.state.model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": gen.finish,
-                }],
-                "usage": {
-                    "prompt_tokens": len(tokens),
-                    "completion_tokens": gen.tokens,
-                    "total_tokens": len(tokens) + gen.tokens,
-                },
-            })
-            return
+    # --- respuesta ---------------------------------------------------------
+    def _send_completion(self, cid, created, text, gen, tokens, meta):
+        payload = {
+            "id": cid,
+            "object": "chat.completion",
+            "created": created,
+            "model": self.state.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": gen.finish,
+            }],
+            "usage": {
+                "prompt_tokens": len(tokens),
+                "completion_tokens": gen.tokens,
+                "total_tokens": len(tokens) + gen.tokens,
+            },
+        }
+        if meta is not None:
+            payload["x_aquifer"] = meta
+        self._send_json(200, payload)
 
+    def _begin_sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -505,12 +584,71 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        base = {
-            "id": completion_id,
+    def _chunk_base(self, cid, created):
+        return {
+            "id": cid,
             "object": "chat.completion.chunk",
             "created": created,
             "model": self.state.model,
         }
+
+    def _finish_sse(self, base, gen, tokens, body, meta):
+        final = dict(base, choices=[{
+            "index": 0, "delta": {}, "finish_reason": gen.finish}])
+        if meta is not None:
+            final["x_aquifer"] = meta
+        self._sse(final)
+        if (body.get("stream_options") or {}).get("include_usage"):
+            self._sse(dict(base, choices=[], usage={
+                "prompt_tokens": len(tokens),
+                "completion_tokens": gen.tokens,
+                "total_tokens": len(tokens) + gen.tokens,
+            }))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+    def _chat(self, body):
+        if not self.state.engine.alive():
+            raise ApiError(503, "el motor no está disponible", "server_error")
+        fmt = self._response_format(body)
+        opts = self._opts(body)
+        system_text, history = self._prompt(body, opts)
+        if fmt:
+            system_text = self._json_system(system_text, fmt)
+        stream = bool(body.get("stream", False))
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+
+        if fmt:
+            raw, value, gen, attempts, tokens = self._structured(
+                history, system_text, opts, fmt)
+            # El contenido se canonicaliza: lo que recibe el cliente ya es
+            # JSON parseable, sin markdown ni texto alrededor.
+            text = json.dumps(value, ensure_ascii=False)
+            meta = {"valid": True, "attempts": attempts, "value": value}
+            if fmt.get("schema_name"):
+                meta["schema_name"] = fmt["schema_name"]
+            if not stream:
+                self._send_completion(cid, created, text, gen, tokens, meta)
+                return
+            self._begin_sse()
+            base = self._chunk_base(cid, created)
+            self._sse(dict(base, choices=[{
+                "index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
+            self._sse(dict(base, choices=[{
+                "index": 0, "delta": {"content": text}, "finish_reason": None}]))
+            self._finish_sse(base, gen, tokens, body, meta)
+            return
+
+        tokens = self._tokens(system_text, history, opts)
+        gen = Generation()
+        if not stream:
+            text = "".join(self.state.engine.stream(tokens, opts, gen))
+            self._send_completion(cid, created, text, gen, tokens, None)
+            return
+
+        self._begin_sse()
+        base = self._chunk_base(cid, created)
         self._sse(dict(base, choices=[{
             "index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
         streamer = self.state.engine.stream(tokens, opts, gen)
@@ -520,16 +658,7 @@ class Handler(BaseHTTPRequestHandler):
                     "index": 0, "delta": {"content": piece}, "finish_reason": None}]))
         finally:
             streamer.close()
-        self._sse(dict(base, choices=[{
-            "index": 0, "delta": {}, "finish_reason": gen.finish}]))
-        if (body.get("stream_options") or {}).get("include_usage"):
-            self._sse(dict(base, choices=[], usage={
-                "prompt_tokens": len(tokens),
-                "completion_tokens": gen.tokens,
-                "total_tokens": len(tokens) + gen.tokens,
-            }))
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self._finish_sse(base, gen, tokens, body, None)
 
 
 def build_parser(repo_dir):
@@ -564,6 +693,9 @@ def build_parser(repo_dir):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--repeat-penalty", type=float, default=1.0)
     ap.add_argument("--repeat-last-n", type=int, default=64)
+    ap.add_argument("--json-retries", type=int, default=1,
+                    help="Reintentos extra cuando la salida no cumple el esquema "
+                         "(default: 1 = hasta 2 intentos)")
     ap.add_argument("--api-key", default=None,
                     help="Si se define, exige 'Authorization: Bearer <key>'")
     ap.add_argument("--cors", action="store_true",
