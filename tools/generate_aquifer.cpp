@@ -139,9 +139,11 @@ public:
                 for (;;) {
                     if (sleeping_.load(std::memory_order_acquire)) {
                         std::unique_lock<std::mutex> lk(sleep_m_);
+                        sleep_ack_.fetch_add(1, std::memory_order_release);
                         sleep_cv_.wait(lk, [this] {
                             return !sleeping_.load(std::memory_order_acquire) || stop_;
                         });
+                        wake_ack_.fetch_add(1, std::memory_order_release);
                     }
                     go_.wait();
                     if (stop_) return;
@@ -157,14 +159,19 @@ public:
 
     void pause() {
         if (T_ <= 1 || sleeping_.load(std::memory_order_acquire)) return;
+        sleep_ack_.store(0, std::memory_order_relaxed);
         sleeping_.store(true, std::memory_order_release);
         run([](unsigned) {}); // despierta workers de go_ para que entren en sleep
+        // Esperar a que TODOS estén dormidos: si no, un resume seguido de un
+        // pause (comandos sin inferencia) puede perder el wake y colgar.
+        while (sleep_ack_.load(std::memory_order_acquire) < T_ - 1) _mm_pause();
     }
 
     void resume() {
-        if (!sleeping_.load(std::memory_order_acquire)) return;
-        sleeping_.store(false, std::memory_order_release);
+        if (!sleeping_.exchange(false, std::memory_order_acq_rel)) return;
+        wake_ack_.store(0, std::memory_order_relaxed);
         sleep_cv_.notify_all();
+        while (wake_ack_.load(std::memory_order_acquire) < T_ - 1) _mm_pause();
     }
 
     void run(std::function<void(unsigned)> f) {
@@ -177,6 +184,7 @@ private:
     std::function<void(unsigned)> job_;
     bool stop_ = false;
     std::atomic<bool> sleeping_{false};
+    std::atomic<unsigned> sleep_ack_{0}, wake_ack_{0};
     std::mutex sleep_m_;
     std::condition_variable sleep_cv_;
 };
@@ -1225,6 +1233,32 @@ int main(int argc, char** argv) {
         std::printf("READY\n");
         std::fflush(stdout);
         std::vector<int> cached_tokens;
+        std::size_t cur_pos = 0;
+        int last_tok = -1;
+        bool state_ready = false, have_logits = false;
+        std::size_t draft_initial = 0;
+        std::vector<int> last_draft;
+        std::vector<float> saved_logits;
+        auto parse_ids = [](const std::string& s) {
+            std::vector<int> v;
+            std::stringstream pss(s);
+            std::string t;
+            while (std::getline(pss, t, ',')) if (!t.empty()) v.push_back(std::atoi(t.c_str()));
+            return v;
+        };
+        auto argmax_row = [&](const float* lg) {
+            std::size_t best = 0;
+            for (std::size_t j = 1; j < cfg.V; ++j) if (lg[j] > lg[best]) best = j;
+            return int(best);
+        };
+        auto ensure_logits = [&]() {
+            if (state_ready && !have_logits) {
+                (void)step({0u}, {last_tok}, {cur_pos});
+                if (cached_tokens.size() <= cur_pos) cached_tokens.resize(cur_pos + 1);
+                cached_tokens[cur_pos] = last_tok;
+                have_logits = true;
+            }
+        };
         std::string line;
         for (;;) {
             pool.pause(); // Pone los workers a dormir mientras espera comando (0% CPU, ventilador silencioso)
@@ -1237,6 +1271,8 @@ int main(int argc, char** argv) {
             ss >> cmd;
             if (cmd == "RESET") {
                 cached_tokens.clear();
+                state_ready = false; have_logits = false;
+                last_draft.clear(); saved_logits.clear();
                 std::printf("RESET_OK\n");
                 std::fflush(stdout);
                 continue;
@@ -1257,8 +1293,132 @@ int main(int argc, char** argv) {
                 }
                 prefill_range(0, ptokens, 0, ptokens.size());
                 cached_tokens = ptokens;
+                state_ready = false; have_logits = false;
                 std::printf("PREWARMED\n");
                 std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "BEGIN") {
+                std::string ids_str;
+                ss >> ids_str;
+                std::vector<int> ptokens = parse_ids(ids_str);
+                if (ptokens.empty() || ptokens.size() > std::size_t(ctx)) {
+                    std::printf("BEGIN_ERR\n"); std::fflush(stdout); continue;
+                }
+                std::size_t common = 0;
+                const std::size_t limit = std::min(cached_tokens.size(), ptokens.size() - 1);
+                while (common < limit && cached_tokens[common] == ptokens[common]) ++common;
+                prefill_range(0, ptokens, common, ptokens.size() - 1);
+                cached_tokens.resize(ptokens.size() - 1);
+                for (std::size_t i = common; i + 1 < ptokens.size(); ++i)
+                    cached_tokens[i] = ptokens[i];
+                last_tok = ptokens.back();
+                cur_pos = ptokens.size() - 1;
+                (void)step({0u}, {last_tok}, {cur_pos});
+                cached_tokens.push_back(last_tok);
+                state_ready = true; have_logits = true;
+                std::printf("BEGIN_OK\n"); std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "NEXT") {
+                if (!state_ready) { std::printf("NEXT_ERR\n"); std::fflush(stdout); continue; }
+                ensure_logits();
+                std::printf("NEXT %d\n", argmax_row(logits.data()));
+                std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "VERIFY") {
+                std::string ids_str;
+                ss >> ids_str;
+                std::vector<int> prop = parse_ids(ids_str);
+                if (!state_ready || prop.empty() || prop.size() > kMaxM) {
+                    std::printf("ACCEPT 0\n"); std::fflush(stdout); continue;
+                }
+                ensure_logits();
+                const int y = argmax_row(logits.data());
+                unsigned a = 0;
+                if (prop[0] == y) {
+                    std::vector<unsigned> sq(prop.size(), 0u);
+                    std::vector<std::size_t> ps(prop.size());
+                    for (std::size_t j = 0; j < prop.size(); ++j) ps[j] = cur_pos + 1 + j;
+                    (void)step(sq, prop, ps);
+                    a = 1;
+                    for (std::size_t j = 1; j < prop.size(); ++j) {
+                        if (argmax_row(logits.data() + (j - 1) * cfg.V) == prop[j]) ++a;
+                        else break;
+                    }
+                    std::memcpy(logits.data(),
+                                logits.data() + std::size_t(a - 1) * cfg.V,
+                                cfg.V * sizeof(float));
+                    for (unsigned j = 0; j < a; ++j) cached_tokens.push_back(prop[j]);
+                    cached_tokens.resize(cur_pos + 1 + a);
+                    cur_pos += a;
+                    last_tok = prop[a - 1];
+                    have_logits = true;
+                }
+                std::printf("ACCEPT %u\n", a); std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "COMMIT") {
+                int tok = -1;
+                ss >> tok;
+                if (!state_ready || cur_pos + 1 >= std::size_t(ctx)) {
+                    std::printf("COMMIT_ERR\n"); std::fflush(stdout); continue;
+                }
+                (void)step({0u}, {tok}, {cur_pos + 1});
+                ++cur_pos;
+                last_tok = tok;
+                cached_tokens.push_back(tok);
+                have_logits = true;
+                std::printf("COMMIT_OK\n"); std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "DRAFT") {
+                unsigned k = 0;
+                ss >> k;
+                if (!state_ready || k == 0 || k > kMaxM) {
+                    std::printf("DRAFT\n"); std::fflush(stdout); continue;
+                }
+                ensure_logits();
+                draft_initial = cur_pos;
+                last_draft.clear();
+                saved_logits.resize(std::size_t(k) * cfg.V);
+                for (unsigned i = 0; i < k && cur_pos + 1 < std::size_t(ctx); ++i) {
+                    const int y = argmax_row(logits.data());
+                    last_draft.push_back(y);
+                    (void)step({0u}, {y}, {cur_pos + 1});
+                    ++cur_pos;
+                    have_logits = true;
+                    cached_tokens.push_back(y);
+                    std::memcpy(saved_logits.data() + std::size_t(i) * cfg.V,
+                                logits.data(), cfg.V * sizeof(float));
+                }
+                std::printf("DRAFT ");
+                for (std::size_t i = 0; i < last_draft.size(); ++i)
+                    std::printf("%s%d", i ? "," : "", last_draft[i]);
+                std::printf("\n"); std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "SYNC") {
+                unsigned a = 0;
+                ss >> a;
+                if (!state_ready || a > last_draft.size()) {
+                    std::printf("SYNC_ERR\n"); std::fflush(stdout); continue;
+                }
+                if (a == 0) {
+                    cached_tokens.resize(draft_initial + 1);
+                    cur_pos = draft_initial;
+                    have_logits = false;
+                } else {
+                    cached_tokens.resize(draft_initial + 1 + a);
+                    cur_pos = draft_initial + a;
+                    last_tok = last_draft[a - 1];
+                    std::memcpy(logits.data(),
+                                saved_logits.data() + std::size_t(a - 1) * cfg.V,
+                                cfg.V * sizeof(float));
+                    have_logits = true;
+                }
+                std::printf("SYNC_OK\n"); std::fflush(stdout);
                 continue;
             }
             if (cmd == "PROMPT") {
