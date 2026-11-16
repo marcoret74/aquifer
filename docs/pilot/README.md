@@ -10,6 +10,9 @@ Demostración acotada de lo que Aquifer ya hace **en local**:
 No hay lógica legal ni del Juez en el repo: el mock es un servicio de clima
 genérico. El Juez/orquestador viviría **fuera** del motor.
 
+Checklist completo de despliegue:
+[`../deploy/CHECKLIST-PILOTO.md`](../deploy/CHECKLIST-PILOTO.md).
+
 ## Requisitos
 
 - `make all` hecho (binario en `build/generate_aquifer`).

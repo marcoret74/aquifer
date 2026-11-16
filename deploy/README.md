@@ -3,6 +3,9 @@
 Empaquetado del **servidor** (`tools/serve.py`) para systemd y Docker. El
 modelo no se incluye en la imagen: se monta en modo lectura.
 
+Checklist operativo del piloto:
+[`../docs/deploy/CHECKLIST-PILOTO.md`](../docs/deploy/CHECKLIST-PILOTO.md).
+
 ## Layout de modelos
 
 ```

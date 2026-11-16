@@ -702,6 +702,8 @@ Juez: solo extracción y validación genérica.
 - **Docker**: `deploy/Dockerfile` + `deploy/docker-compose.yml`; el modelo se
   monta en `/models` y el motor se compila dentro de la imagen.
 - Hardening, variables y operación: [`deploy/README.md`](deploy/README.md).
+- Checklist de despliegue del piloto:
+  [`docs/deploy/CHECKLIST-PILOTO.md`](docs/deploy/CHECKLIST-PILOTO.md).
 
 El servidor sigue siendo el mismo `tools/serve.py`: el empaquetado solo agrega
 un wrapper de configuración, unidades de servicio y una imagen.
