@@ -156,6 +156,33 @@ def test_envelope():
     check("sobre cita extra", bool(errors), str(errors))
 
 
+def test_json_stream():
+    from serve import JsonStreamFilter
+
+    raw = '```json\n{"a": [1, {"b": "x}y"}]}\n```\nEspero que sirva.'
+    f = JsonStreamFilter()
+    out = ""
+    for ch in raw:
+        out += f.feed(ch)
+    check("stream contenido", out == '{"a": [1, {"b": "x}y"}]}', out)
+    check("stream done", f.done)
+
+    f2 = JsonStreamFilter()
+    out2 = f2.feed("Claro: ") + f2.feed('{"a":1}') + f2.feed(" texto extra")
+    check("stream narración", out2 == '{"a":1}', out2)
+    check("stream corta extra", f2.done)
+
+    f3 = JsonStreamFilter(max_prefix=5)
+    out3 = f3.feed("abcdefg") + f3.feed("h")
+    check("stream sin json", out3 == "abcdefg", out3)
+    check("stream sin json no done", not f3.done)
+
+    f4 = JsonStreamFilter()
+    out4 = "".join(f4.feed(x) for x in ['{"t": "a \\" } b"}', " tail"])
+    check("stream escape", out4 == '{"t": "a \\" } b"}', out4)
+    check("stream escape done", f4.done)
+
+
 def main():
     test_extract()
     test_types()
@@ -163,6 +190,7 @@ def main():
     test_arrays()
     test_any_one_of()
     test_envelope()
+    test_json_stream()
     if FAILED:
         print("FALLARON %d de %d pruebas:" % (len(FAILED), TOTAL))
         for name in FAILED:

@@ -77,6 +77,7 @@ class Metrics:
         self.structured = 0
         self.schema_retried = 0
         self.schema_failed = 0
+        self.schema_streamed = 0
         self.compactions = 0
         self.tokens_in = 0
         self.tokens_out = 0
@@ -98,9 +99,12 @@ class Metrics:
                 self.streamed += 1
             if trace.get("response_format"):
                 self.structured += 1
+                if trace.get("stream"):
+                    self.schema_streamed += 1
             if (trace.get("schema_attempts") or 0) > 1:
                 self.schema_retried += 1
-            if trace.get("error_type") == "invalid_schema_output":
+            if (trace.get("error_type") == "invalid_schema_output"
+                    or trace.get("schema_invalid")):
                 self.schema_failed += 1
             compact = trace.get("compact") or {}
             if compact.get("status") == "ok":
@@ -150,7 +154,8 @@ class Metrics:
                     "samples": len(ttft),
                 },
                 "schema": {"retried": self.schema_retried,
-                           "failed": self.schema_failed},
+                           "failed": self.schema_failed,
+                           "streamed": self.schema_streamed},
                 "compactions": self.compactions,
             }
 
@@ -179,6 +184,66 @@ def canonical_hash(value):
     data = json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
+
+
+class JsonStreamFilter:
+    """Emite el JSON superior desde el primer '{'/'[' y corta al cerrarse.
+
+    Descarta cercas markdown y preámbulo. Si no aparece un objeto/arreglo en
+    `max_prefix` caracteres, emite best-effort y deja que la validación final
+    decida.
+    """
+
+    def __init__(self, max_prefix=512):
+        self.max_prefix = max_prefix
+        self.buf = ""
+        self.started = False
+        self.depth = 0
+        self.in_str = False
+        self.esc = False
+        self.done = False
+        self.text = ""
+
+    def feed(self, chunk):
+        if self.done or not chunk:
+            return ""
+        self.buf += chunk
+        if not self.started:
+            idx = next((i for i, ch in enumerate(self.buf) if ch in "{["), None)
+            if idx is None:
+                if len(self.buf) < self.max_prefix:
+                    return ""
+                out = self.buf
+                self.buf = ""
+                self.text += out
+                return out
+            self.buf = self.buf[idx:]
+            self.started = True
+
+        out = []
+        for ch in self.buf:
+            out.append(ch)
+            if self.in_str:
+                if self.esc:
+                    self.esc = False
+                elif ch == "\\":
+                    self.esc = True
+                elif ch == '"':
+                    self.in_str = False
+                continue
+            if ch == '"':
+                self.in_str = True
+            elif ch in "{[":
+                self.depth += 1
+            elif ch in "}]":
+                self.depth -= 1
+                if self.depth <= 0:
+                    self.done = True
+                    break
+        self.buf = ""
+        emitted = "".join(out)
+        self.text += emitted
+        return emitted
 
 
 def content_text(content):
@@ -792,6 +857,72 @@ class Handler(BaseHTTPRequestHandler):
             details={"attempts": attempt, "errors": errors,
                      "content": (raw or "")[-2000:]})
 
+    def _validate_value(self, text, fmt):
+        try:
+            value = extract_json(text)
+        except SchemaError as err:
+            return None, [str(err)]
+        if fmt.get("schema") is None:
+            if isinstance(value, dict):
+                return value, []
+            return value, ["se esperaba un objeto JSON"]
+        return value, validate(value, fmt["schema"])
+
+    def _structured_stream(self, cid, created, history, system_text, opts,
+                           fmt, body, trace):
+        """Una sola pasada en streaming: emite JSON y valida al final.
+
+        No hay reintentos: el contenido ya salió. La verdad final queda en
+        x_aquifer.valid, en la traza y en /metrics. Para garantía estricta
+        (422 + reintentos) el cliente debe usar stream=false.
+        """
+        tokens, opts["compact"] = self._tokens(system_text, history, opts)
+        trace["prompt_tokens"] = len(tokens)
+        trace["prompt_sha256"] = canonical_hash(tokens)
+        trace["schema_attempts"] = 1
+        self._begin_sse(self._sse_headers(trace))
+        base = self._chunk_base(cid, created)
+        self._sse(dict(base, choices=[{
+            "index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
+        gen = Generation()
+        filt = JsonStreamFilter()
+        parts = []
+        streamer = self.state.engine.stream(tokens, opts, gen)
+        try:
+            for piece in streamer:
+                out = filt.feed(piece)
+                if not out:
+                    continue
+                parts.append(out)
+                self._sse(dict(base, choices=[{
+                    "index": 0, "delta": {"content": out},
+                    "finish_reason": None}]))
+                if filt.done:
+                    break
+        finally:
+            trace["completion_tokens"] = gen.tokens
+            streamer.close()
+        text = "".join(parts)
+        self._stamp(trace, gen)
+        value, errors = self._validate_value(text, fmt)
+        valid = not errors
+        trace["schema_valid"] = valid
+        if not valid:
+            trace["schema_invalid"] = True
+            trace["schema_errors"] = errors[:10]
+        if self.state.trace_content:
+            trace["content"] = text
+        meta = self._public_trace(trace)
+        meta["valid"] = valid
+        meta["attempts"] = 1
+        if valid:
+            meta["value"] = value
+        else:
+            meta["schema_errors"] = errors[:10]
+        if fmt.get("schema_name"):
+            meta["schema_name"] = fmt["schema_name"]
+        self._finish_sse(base, gen, tokens, body, meta)
+
     # --- respuesta ---------------------------------------------------------
     def _send_completion(self, cid, created, text, gen, tokens, meta,
                          trace=None):
@@ -895,29 +1026,24 @@ class Handler(BaseHTTPRequestHandler):
             system_text = self._json_system(system_text, fmt)
 
         if fmt:
-            raw, value, gen, attempts, tokens = self._structured(
-                history, system_text, opts, fmt, trace)
-            text = json.dumps(value, ensure_ascii=False)
-            self._stamp(trace, gen)
-            if self.state.trace_content:
-                trace["content"] = text
-            meta = self._public_trace(trace)
-            meta["valid"] = True
-            meta["attempts"] = attempts
-            meta["value"] = value
-            if fmt.get("schema_name"):
-                meta["schema_name"] = fmt["schema_name"]
             if not stream:
+                raw, value, gen, attempts, tokens = self._structured(
+                    history, system_text, opts, fmt, trace)
+                text = json.dumps(value, ensure_ascii=False)
+                self._stamp(trace, gen)
+                if self.state.trace_content:
+                    trace["content"] = text
+                meta = self._public_trace(trace)
+                meta["valid"] = True
+                meta["attempts"] = attempts
+                meta["value"] = value
+                if fmt.get("schema_name"):
+                    meta["schema_name"] = fmt["schema_name"]
                 self._send_completion(cid, created, text, gen, tokens, meta,
                                       trace)
                 return
-            self._begin_sse(self._sse_headers(trace))
-            base = self._chunk_base(cid, created)
-            self._sse(dict(base, choices=[{
-                "index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
-            self._sse(dict(base, choices=[{
-                "index": 0, "delta": {"content": text}, "finish_reason": None}]))
-            self._finish_sse(base, gen, tokens, body, meta)
+            self._structured_stream(cid, created, history, system_text, opts,
+                                    fmt, body, trace)
             return
 
         tokens, opts["compact"] = self._tokens(system_text, history, opts)

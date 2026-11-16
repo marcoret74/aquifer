@@ -65,7 +65,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Compactación con KV (`COMPACT`).** Al llenarse el contexto, en vez de resetear todo el KV y re-prellenar el historial, el motor conserva el system prompt y mueve al frente la cola que coincide con el prompt recortado. Las claves ya calculadas no se recalculan ni se re-rotan: se ajusta `pos_base` (desplazamiento RoPE) para que los tokens conservados mantengan su posición absoluta. Medido en Qwen 0.5B con `ctx 256`: 132 ms de TTFT tras compactar contra 1423 ms del reset completo. `--no-kv-compact` recupera el comportamiento anterior.
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
 - **Métricas y trazas por request (`/metrics`, `--trace-log`).** Cada llamada registra latencia total, TTFT, cola, tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256 de prompt, conversación y esquema, intentos de esquema y compactaciones de KV. Agregados en `/metrics` (p50/p95) y traza JSONL opcional con `--trace-log` (`--trace-content` para incluir la respuesta). Pensado para auditar pilotos y depurar el orquestador.
-- **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
+- **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. Con `stream: true` emite el JSON incremental, corta al cerrar el objeto y publica el veredicto en `x_aquifer.valid` (sin reintentos). El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
 - **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
 - **Stop sequences por texto (`--stop`, repetible).** El chat acumula el texto decodificado en un buffer rodante, detecta la parada aunque cruce varios tokens, imprime solo lo anterior, envía `STOP` al motor y drena hasta `DONE`. El historial se trunca en la parada. Es lógica de chat/orquestador: el kernel no cambia y `--eos` sigue siendo el corte por ID de token.
 - **Repetition penalty nativo (`--repeat-penalty`, `--repeat-last-n`).** Penaliza tokens recientes antes de muestrear o de elegir el argmax; sirve para cortar bucles en modelos chicos sin bajar la temperatura. Implementación propia del algoritmo genérico CTRL, sin dependencias.
@@ -270,7 +270,7 @@ curl -s localhost:8080/metrics | python3 -m json.tool
   "tokens": {"prompt": 1439, "completion": 165, "total": 1604},
   "latency_ms": {"avg": 800.7, "p50": 583.5, "p95": 1058.0, "max": 3486.3},
   "ttft_ms": {"avg": 237.5, "p50": 152.7, "p95": 858.1},
-  "schema": {"retried": 1, "failed": 1},
+  "schema": {"retried": 1, "failed": 2, "streamed": 4},
   "compactions": 2
 }
 ```
@@ -344,8 +344,13 @@ Comportamiento:
   `error.details = {attempts, errors, content}`. Fallar es preferible a entregar
   un sobre inválido como si fuera evidencia.
 - `{"type": "json_object"}` exige un objeto JSON válido sin esquema.
-- Con `stream: true` la generación se valida antes de emitir: el contenido
-  validado llega en un chunk y luego `finish_reason` + `[DONE]`.
+- Con `stream: true` la salida estructurada es **incremental**: el servidor
+  descarta cercas markdown y preámbulo, emite el JSON a medida que se genera y
+  **corta al cerrarse el objeto/arreglo superior** (envía `STOP` al motor), así
+  que no hay texto de cola. Al final valida y publica el veredicto en
+  `x_aquifer.valid` (y `schema_errors` si falló). En streaming **no hay
+  reintentos**: el contenido ya salió, y el HTTP sigue siendo `200`; para
+  garantía estricta con `422` y reintentos usá `stream: false`.
 
 El esquema es del orquestador. En el repo no hay reglas legales ni lógica del
 Juez: solo extracción y validación genérica.
