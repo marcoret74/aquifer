@@ -86,6 +86,15 @@ class StreamDecoder:
                 self.first_token = False
             return chunk
 
+def system_prompt_text(model_type, system_prompt):
+    """Prefijo exacto del system prompt para el chat template del modelo."""
+    if not system_prompt or model_type == "r1":
+        return ""
+    if model_type == "tiny":
+        return f"<|system|>\n{system_prompt}</s>\n"
+    return f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+
+
 def format_prompt(history, model_type="qwen", system_prompt=None):
     """Genera la secuencia de prompt adecuada para el modelo."""
     if model_type == "r1":
@@ -419,11 +428,8 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact, restore=Fa
     # Pre-calentar system prompt en el KV-cache para que el turno 1 responda de inmediato
     sys_tokens_str = ""
     system_text = args.system if args.system is not None else mcfg["system"]
-    if system_text and args.model in ("qwen", "qwen05", "qwen3", "coder", "tiny", "smol2"):
-        if args.model == "tiny":
-            sys_str = f"<|system|>\n{system_text}</s>\n"
-        else:
-            sys_str = f"<|im_start|>system\n{system_text}<|im_end|>\n"
+    sys_str = system_prompt_text(args.model, system_text)
+    if sys_str:
         sys_tokens = tok.encode(sys_str)
         sys_tokens_str = ",".join(map(str, sys_tokens))
 
@@ -505,6 +511,10 @@ def main():
                     help="Penalización de repetición (1.0 = off; ej. 1.15)")
     ap.add_argument("--repeat-last-n", type=int, default=64,
                     help="Ventana de tokens para repetition penalty")
+    ap.add_argument("--no-kv-compact", dest="kv_compact", action="store_false",
+                    default=True,
+                    help="Al llenarse el contexto, resetear el KV en vez de "
+                         "conservar el system prompt y la cola reciente")
     ap.add_argument("--session", default=None, metavar="RUTA",
                     help="Sesión persistente: guarda/carga KV cache e historial en "
                          "RUTA.kv y RUTA.json entre ejecuciones")
@@ -653,6 +663,7 @@ def main():
             sys_text = args.system if args.system is not None else mcfg["system"]
             if len(tokens) >= args.ctx - gen_n:
                 print(f"{YELLOW}[Aviso: Contexto largo ({len(tokens)} tokens), compactando historia]{RESET}")
+                prev_len = len(history)
                 while len(tokens) >= args.ctx - gen_n and len(history) > 1:
                     history.pop(0)
                     while len(history) > 1 and history[0][0] != "user":
@@ -660,17 +671,40 @@ def main():
                     full_prompt = format_prompt(history, args.model, sys_text)
                     tokens = tok.encode(full_prompt)
 
-                proc.stdin.write("RESET\n")
-                proc.stdin.flush()
-                for rline in proc.stdout:
-                    if rline.strip() == "RESET_OK":
-                        break
-                if sys_tokens_str:
-                    proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
+                compacted = False
+                # Conserva el system prompt en el KV y la cola que coincide con
+                # el prompt recortado; el hueco descartado no se vuelve a prellenar.
+                sink = len(sys_tokens_str.split(",")) if sys_tokens_str else 0
+                if (args.kv_compact and len(history) < prev_len
+                        and sink < len(tokens)):
+                    try:
+                        proc.stdin.write("COMPACT %d %s\n" % (
+                            sink, ",".join(map(str, tokens[sink:]))))
+                        proc.stdin.flush()
+                        for rline in proc.stdout:
+                            ls = rline.strip()
+                            if ls.startswith("COMPACTED"):
+                                kept = ls.split()[1] if len(ls.split()) > 1 else "?"
+                                print(f"{DIM}[KV compactado: system + {kept} tokens conservados]{RESET}")
+                                compacted = True
+                                break
+                            if ls.startswith(("COMPACT_NOMATCH", "COMPACT_ERR")):
+                                break
+                    except Exception:
+                        compacted = False
+
+                if not compacted:
+                    proc.stdin.write("RESET\n")
                     proc.stdin.flush()
                     for rline in proc.stdout:
-                        if rline.strip() == "PREWARMED":
+                        if rline.strip() == "RESET_OK":
                             break
+                    if sys_tokens_str:
+                        proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
+                        proc.stdin.flush()
+                        for rline in proc.stdout:
+                            if rline.strip() == "PREWARMED":
+                                break
             tokens_str = ",".join(map(str, tokens))
             proc.stdin.write(f"PROMPT {tokens_str}\n")
             proc.stdin.flush()

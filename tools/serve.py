@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chat import (MODELS_CATALOG, StreamDecoder, format_prompt,  # noqa: E402
-                  get_model_config, start_engine)
+                  get_model_config, start_engine, system_prompt_text)
 from structured import SchemaError, extract_json, validate  # noqa: E402
 
 SPECIAL_MARKERS = ("<|im_end|>", "<|endoftext|>", "<｜end", "<think>",
@@ -121,6 +121,14 @@ class Engine:
                 return False
         raise ApiError(503, "el motor terminó la conexión", "server_error")
 
+    def _read_until(self, prefixes):
+        for raw in self.proc.stdout:
+            line = raw.strip()
+            for p in prefixes:
+                if line.startswith(p):
+                    return line
+        raise ApiError(503, "el motor terminó la conexión", "server_error")
+
     def configure(self, opts):
         line = "CONFIG %d %.6g %d %.6g %d %.6g %d" % (
             opts["max_tokens"], opts["temperature"], opts["top_k"],
@@ -139,6 +147,17 @@ class Engine:
                 if not self.alive():
                     raise ApiError(503, "el motor no está disponible", "server_error")
                 self.configure(opts)
+                compact = opts.get("compact")
+                if compact and compact.get("tokens"):
+                    try:
+                        self._send("COMPACT %d %s" % (
+                            compact["sink"],
+                            ",".join(map(str, compact["tokens"]))))
+                        line = self._read_until(
+                            ("COMPACTED", "COMPACT_NOMATCH", "COMPACT_ERR"))
+                        sys.stderr.write("[compact] %s\n" % line)
+                    except ApiError:
+                        pass
                 self._send("PROMPT " + ",".join(map(str, tokens)))
                 streamer = StreamDecoder(self.tok)
                 buf = ""
@@ -446,17 +465,28 @@ class Handler(BaseHTTPRequestHandler):
             system_text = self.state.system or ""
         return system_text, history
 
+    def _sink_tokens(self, system_text):
+        if not system_text:
+            return 0
+        try:
+            prefix = system_prompt_text(self.state.model, system_text)
+            return len(self.state.engine.tok.encode(prefix)) if prefix else 0
+        except Exception:
+            return 0
+
     def _tokens(self, system_text, history, opts):
         model = self.state.model
         ctx = self.state.ctx
         prompt = format_prompt(history, model, system_text or None)
         tokens = self.state.engine.tok.encode(prompt)
+        trimmed = False
         while len(history) > 1 and len(tokens) + opts["max_tokens"] >= ctx:
             history.pop(0)
             while len(history) > 1 and history[0][0] != "user":
                 history.pop(0)
             prompt = format_prompt(history, model, system_text or None)
             tokens = self.state.engine.tok.encode(prompt)
+            trimmed = True
         if len(tokens) + opts["max_tokens"] >= ctx:
             raise ApiError(
                 400,
@@ -464,7 +494,12 @@ class Handler(BaseHTTPRequestHandler):
                 "historial" % ctx)
         if len(tokens) >= ctx:
             raise ApiError(400, "prompt demasiado largo para ctx=%d" % ctx)
-        return tokens
+        compact = None
+        if trimmed:
+            sink = self._sink_tokens(system_text)
+            if sink < len(tokens):
+                compact = {"sink": sink, "tokens": tokens[sink:]}
+        return tokens, compact
 
     # --- salida estructurada ----------------------------------------------
     def _response_format(self, body):
@@ -526,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
         gen = Generation()
         while attempt < max_attempts:
             attempt += 1
-            tokens = self._tokens(system_text, base_history, opts)
+            tokens, opts["compact"] = self._tokens(system_text, base_history, opts)
             gen = Generation()
             raw = "".join(self.state.engine.stream(tokens, opts, gen))
             try:
@@ -640,7 +675,7 @@ class Handler(BaseHTTPRequestHandler):
             self._finish_sse(base, gen, tokens, body, meta)
             return
 
-        tokens = self._tokens(system_text, history, opts)
+        tokens, opts["compact"] = self._tokens(system_text, history, opts)
         gen = Generation()
         if not stream:
             text = "".join(self.state.engine.stream(tokens, opts, gen))

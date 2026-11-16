@@ -232,7 +232,7 @@ struct KvRings {
 // Cabecera little-endian, tokens del prefijo y luego, por capa, el bloque K y
 // el bloque V de las primeras n_tokens posiciones. Cierra con FNV-1a de todo
 // lo anterior, para detectar archivos truncados o de otro modelo.
-constexpr std::uint32_t kKvVersion = 1;
+constexpr std::uint32_t kKvVersion = 2;
 constexpr std::uint64_t kFnvBasis = 1469598103934665603ull;
 constexpr std::uint64_t kFnvPrime = 1099511628211ull;
 
@@ -282,15 +282,15 @@ struct KvReader {
 };
 
 static bool kv_save(const std::string& path, const KvRings& kv, const Cfg& cfg,
-                    std::uint64_t sig, const std::vector<int>& toks,
-                    std::size_t n, std::string& msg) {
+                    std::uint64_t sig, std::uint64_t pos_base,
+                    const std::vector<int>& toks, std::size_t n, std::string& msg) {
     if (n > kv.cap_tok) n = kv.cap_tok;
     if (n > toks.size()) n = toks.size();
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) { msg = "SAVE_ERR no se pudo abrir " + path; return false; }
     KvWriter w{f};
     w.raw("AQKV", 4);
-    w.u32(kKvVersion);
+    w.u32(kKvVersion);   // v2: agrega pos_base (desplazamiento RoPE)
     w.u32(kv.elem == sizeof(_Float16) ? 1u : 0u);
     w.u32(std::uint32_t(kv.cap_tok));
     w.u32(std::uint32_t(cfg.NLY));
@@ -300,6 +300,7 @@ static bool kv_save(const std::string& path, const KvRings& kv, const Cfg& cfg,
     w.u32(std::uint32_t(n));
     w.u32(std::uint32_t(cfg.V));
     w.u64(sig);
+    w.u64(pos_base);
     for (std::size_t i = 0; i < n; ++i) w.i32(toks[i]);
     const std::size_t row = n * kv.stride;
     for (std::size_t L = 0; L < cfg.NLY && w.ok; ++L)
@@ -314,7 +315,8 @@ static bool kv_save(const std::string& path, const KvRings& kv, const Cfg& cfg,
 }
 
 static bool kv_load(const std::string& path, const KvRings& kv, const Cfg& cfg,
-                    std::uint64_t sig, std::vector<int>& toks, std::string& msg) {
+                    std::uint64_t sig, std::vector<int>& toks,
+                    std::uint64_t& pos_base, std::string& msg) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) { msg = "LOAD_ERR no existe " + path; return false; }
     KvReader r{f};
@@ -337,8 +339,10 @@ static bool kv_load(const std::string& path, const KvRings& kv, const Cfg& cfg,
     const std::uint32_t n = r.u32();
     const std::uint32_t vocab = r.u32();
     const std::uint64_t saved_sig = r.u64();
+    std::uint64_t saved_base = 0;
+    if (ver >= 2) saved_base = r.u64();
     if (!r.ok) return fail("cabecera truncada");
-    if (ver != kKvVersion) return fail("version no soportada");
+    if (ver < 1 || ver > kKvVersion) return fail("version no soportada");
     if (flags != (kv.elem == sizeof(_Float16) ? 1u : 0u)) return fail("dtype de KV distinto");
     if (cap != kv.cap_tok)
         return fail("ctx distinto al de la sesion (reejecuta con el mismo --ctx)");
@@ -360,6 +364,7 @@ static bool kv_load(const std::string& path, const KvRings& kv, const Cfg& cfg,
     if (!r.ok) { toks.clear(); msg = "LOAD_ERR payload truncado"; return false; }
     if (digest != r.h) { toks.clear(); msg = "LOAD_ERR checksum no coincide"; return false; }
     toks = std::move(tmp);
+    pos_base = saved_base;
     msg = "LOADED " + std::to_string(n);
     return true;
 }
@@ -1106,6 +1111,9 @@ int main(int argc, char** argv) {
     std::vector<float> probs;
     std::vector<int> recent_tokens;
     std::vector<std::uint8_t> penal_mark(cfg.V, 0);
+    // Desplazamiento RoPE: al compactar, los tokens conservados mantienen su
+    // posición absoluta aunque se muevan a índices menores del anillo.
+    std::size_t pos_base = 0;
     auto sample_token = [&](const float* lg, bool use_pen) -> int {
         const std::size_t V = cfg.V;
         if (use_pen) {
@@ -1215,9 +1223,9 @@ int main(int argc, char** argv) {
                 add_bias(kt.data() + i * cfg.NKV * cfg.DH, c.aux_of(p + "self_attn.k_proj.bias"), cfg.NKV * cfg.DH);
                 add_bias(vt.data() + i * cfg.NKV * cfg.DH, c.aux_of(p + "self_attn.v_proj.bias"), cfg.NKV * cfg.DH);
                 for (std::size_t hh = 0; hh < cfg.NH; ++hh)
-                    rope_one(q.data() + (i * cfg.NH + hh) * cfg.DH, pos[i], cfg);
+                    rope_one(q.data() + (i * cfg.NH + hh) * cfg.DH, pos[i] + pos_base, cfg);
                 for (std::size_t hh = 0; hh < cfg.NKV; ++hh)
-                    rope_one(kt.data() + (i * cfg.NKV + hh) * cfg.DH, pos[i], cfg);
+                    rope_one(kt.data() + (i * cfg.NKV + hh) * cfg.DH, pos[i] + pos_base, cfg);
                 const std::size_t kn = cfg.NKV * cfg.DH;
                 if (g_kv_fp16) {
                     auto* kd = reinterpret_cast<_Float16*>(kv.slot(seq[i], L, false, pos[i]));
@@ -1478,6 +1486,7 @@ int main(int argc, char** argv) {
             if (cmd == "RESET") {
                 cached_tokens.clear();
                 kv_written = 0;
+                pos_base = 0;
                 recent_tokens.clear();
                 std::printf("RESET_OK\n");
                 std::fflush(stdout);
@@ -1505,6 +1514,67 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            if (cmd == "COMPACT") {
+                // Conserva el prefijo [0,sink) y la cola del KV que mejor
+                // coincide con la secuencia dada. Mueve la cola a "sink" y
+                // ajusta pos_base para no tocar las rotaciones RoPE.
+                std::size_t sink = 0;
+                std::string ids_str;
+                if (!(ss >> sink >> ids_str)) {
+                    std::printf("COMPACT_ERR argumentos\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                std::vector<int> needle;
+                std::stringstream pss(ids_str);
+                std::string t;
+                while (std::getline(pss, t, ','))
+                    if (!t.empty()) needle.push_back(std::atoi(t.c_str()));
+                const std::size_t end = std::min(cached_tokens.size(), kv_written);
+                if (needle.empty() || end == 0 || sink > end) {
+                    std::printf("COMPACT_ERR argumentos\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                std::size_t best_start = end, best_len = 0;
+                for (std::size_t s = end; s-- > sink; ) {
+                    if (cached_tokens[s] != needle[0]) continue;
+                    std::size_t k = 1;
+                    while (k < needle.size() && s + k < end &&
+                           cached_tokens[s + k] == needle[k]) ++k;
+                    if (k > best_len) {
+                        best_len = k;
+                        best_start = s;
+                        if (k == needle.size()) break;
+                    }
+                }
+                const std::size_t min_anchor = std::min<std::size_t>(4, needle.size());
+                if (best_len < min_anchor) {
+                    std::printf("COMPACT_NOMATCH %zu\n", best_len);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (best_start > sink) {
+                    const std::size_t rows = end - best_start;
+                    for (std::size_t L = 0; L < cfg.NLY; ++L)
+                        for (int isv = 0; isv < 2; ++isv)
+                            std::memmove(kv.slot(0, L, isv != 0, sink),
+                                         kv.slot(0, L, isv != 0, best_start),
+                                         rows * kv.stride);
+                    pos_base += best_start - sink;
+                    std::vector<int> rebased;
+                    rebased.reserve(sink + rows);
+                    rebased.insert(rebased.end(), cached_tokens.begin(),
+                                   cached_tokens.begin() + sink);
+                    rebased.insert(rebased.end(), cached_tokens.begin() + best_start,
+                                   cached_tokens.begin() + end);
+                    cached_tokens.swap(rebased);
+                }
+                kv_written = cached_tokens.size();
+                std::printf("COMPACTED %zu %zu %zu\n", kv_written, best_start, pos_base);
+                std::fflush(stdout);
+                continue;
+            }
             if (cmd == "SAVEKV" || cmd == "LOADKV") {
                 std::string rest;
                 std::getline(ss, rest);
@@ -1517,12 +1587,14 @@ int main(int argc, char** argv) {
                     if (cmd == "LOADKV") msg = "LOAD_ERR falta ruta";
                 } else if (cmd == "SAVEKV") {
                     const std::size_t n = std::min(cached_tokens.size(), kv_written);
-                    kv_save(path, kv, cfg, kv_sig, cached_tokens, n, msg);
-                } else if (kv_load(path, kv, cfg, kv_sig, cached_tokens, msg)) {
+                    kv_save(path, kv, cfg, kv_sig, pos_base, cached_tokens, n, msg);
+                } else if (kv_load(path, kv, cfg, kv_sig, cached_tokens,
+                                   pos_base, msg)) {
                     kv_written = cached_tokens.size();
                 } else {
                     cached_tokens.clear();
                     kv_written = 0;
+                    pos_base = 0;
                 }
                 std::printf("%s\n", msg.c_str());
                 std::fflush(stdout);
