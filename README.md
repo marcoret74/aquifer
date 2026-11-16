@@ -74,6 +74,20 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 
 Hasta entonces, `--diamond` queda como experimental y no se recomienda para producción.
 
+### Caché de prefijo: la diferencia real con Ollama
+
+Medición en 3B, 3 turnos de chat, mismo system prompt:
+
+| Turno | Aquifer: prefijo reutilizado | Aquifer TTFT | Ollama: prompt | Ollama prefill |
+| :--- | :---: | :---: | :---: | :---: |
+| 1 | 11/27 tok (system prewarm) | **501 ms** | 27 tok | 0,700 s |
+| 2 | 39/57 tok | **637 ms** | 56 tok | 0,456 s |
+| 3 | 69/85 tok | **531 ms** | 84 tok | 0,424 s |
+
+- El chat reutiliza **system + historial + respuesta previa**: en el turno 3 solo prellena los ~16 tokens nuevos. El TTFT queda en 0,5–0,64 s, comparable a Ollama (0,46–0,70 s de prompt + primer token).
+- En frío, ambos están en ~40 tok/s de prefill (Aquifer ~42; Ollama 38,6).
+- El famoso “10× de prefill” era **prompt cache** de Ollama, no un GEMM mágico. Nuestro motor ya está en paridad en frío y también cachea prefijo.
+
 ### Límites medidos (para no repetir el camino)
 
 - **Atención GQA online (experimental):** se implementó con chunks de posición y reducción `(max, sum)`. En 0.5B a ctx 2048 dio **47 ms vs 35 ms** del kernel por cabeza (26,6 % → 31,2 % del decode) y prefill 33,3 s vs 22,7 s. En este CPU la atención ya es compute-bound y el K/V de GQA vive en L2/L3; compartir K/V no reduce los MAC. Queda en la rama `perf/gqa-attn`, no se usa.
