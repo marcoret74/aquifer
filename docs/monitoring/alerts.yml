@@ -53,6 +53,15 @@ groups:
           summary: "Salidas estructuradas inválidas"
           description: "Hubo salidas JSON que no cumplieron el esquema."
 
+      - alert: AquiferTimeouts
+        expr: sum(increase(aquifer_timeouts_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Generaciones cortadas por timeout"
+          description: "El watchdog cortó generaciones en los últimos 10 minutos."
+
       - alert: AquiferNoTraffic
         expr: sum(rate(aquifer_requests_total[10m])) == 0
         for: 30m

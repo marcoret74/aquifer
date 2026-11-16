@@ -68,6 +68,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
 - **Tool calling local (`tools` en `/v1/chat/completions`).** El modelo emite `<tool_call>{...}</tool_call>`; el servidor parsea (incluye reparación de JSON laxo), valida argumentos contra el esquema de la herramienta y devuelve `tool_calls` estilo OpenAI. Soporta `tool_choice` auto/none/forzado, mensajes `role:"tool"`, streaming bufferizado y `422 invalid_tool_call` con detalles. Sin ejecutar herramientas: eso queda en el orquestador.
 - **Cadena de trazas append-only (`--trace-log` + `--trace-hmac-key`).** Cada traza enlaza el hash de la anterior (`seq`, `prev`, `sha256`) y opcionalmente se firma con HMAC. `bundle.py verify-traces` detecta borrados, alteraciones y reordenamientos; la cadena se reanuda tras reiniciar el servidor.
+- **Watchdog de generación (`--ttft-timeout`, `--token-timeout`, `--request-timeout`, `--command-timeout`).** Cada espera del motor tiene deadline. Si no hay tokens a tiempo, se manda `STOP`, se drena 5 s y, si no vuelve, se mata el proceso; el siguiente request lo reinicia. No-stream responde `504 generation_timeout`; streaming cierra con `finish_reason: "error"`. Métrica: `aquifer_timeouts_total`.
 - **Métricas y trazas por request (`/metrics`, `/metrics/prometheus`, `--trace-log`).** Cada llamada registra latencia total, TTFT, cola, tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256 de prompt, conversación y esquema, intentos de esquema y compactaciones de KV. Agregados en `/metrics` (p50/p95) y `/metrics/prometheus` (histogramas, contadores, in-flight), y traza JSONL opcional con `--trace-log` (`--trace-content` para incluir la respuesta). Pensado para auditar pilotos y depurar el orquestador.
 - **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. Con `stream: true` emite el JSON incremental, corta al cerrar el objeto y publica el veredicto en `x_aquifer.valid` (sin reintentos). El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
 - **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
@@ -409,6 +410,29 @@ verificación. Con `--trace-hmac-key` cada entrada también se firma. La cadena
 se reanuda al reiniciar el servidor. Al exportar un bundle con `--traces`, una
 cadena rota se rechaza; `verify` también la comprueba.
 
+#### Watchdog de generación
+
+El servidor no espera para siempre al motor:
+
+| Flag | Default | Qué mide |
+| :--- | ---: | :--- |
+| `--ttft-timeout` | 120 s | hasta el primer token (prefill) |
+| `--token-timeout` | 45 s | silencio máximo entre tokens |
+| `--request-timeout` | 300 s | generación completa |
+| `--command-timeout` | 30 s | comandos `CONFIG`/`COMPACT`/`SAVEKV`/`LOADKV` |
+
+Si vence un deadline, manda `STOP` y drena hasta 5 s; si el motor no vuelve, lo
+mata. El próximo request lo reinicia (pierde el KV y re-prellena). En
+no-stream devuelve `504 generation_timeout`; en streaming cierra con
+`finish_reason: "error"` y `x_aquifer.error`. Se cuenta en
+`aquifer_timeouts_total`.
+
+```bash
+# 3B con prefill frío: dar más margen al primer token
+python3 tools/serve.py --model qwen3 --ctx 2048 \
+  --ttft-timeout 180 --token-timeout 30 --request-timeout 600
+```
+
 Formato Prometheus (histogramas reales de latencia y TTFT):
 
 ```bash
@@ -428,7 +452,8 @@ aquifer_request_latency_ms_count 12
 ```
 
 También expone `aquifer_tokens_total{direction="prompt|completion"}`,
-`aquifer_schema_{retried,failed,streamed}_total`, `aquifer_compactions_total`,
+`aquifer_schema_{retried,failed,streamed}_total`, `aquifer_tool_{requests,calls}_total`,
+`aquifer_timeouts_total`, `aquifer_compactions_total`,
 `aquifer_requests_in_flight`, `aquifer_uptime_seconds` y `aquifer_info{model,ctx}`.
 Se puede apuntar Prometheus directo:
 

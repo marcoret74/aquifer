@@ -79,6 +79,7 @@ prometheus --config.file=prometheus.yml
 | `AquiferLatencyP95` | p95 > 5 s por 10 min | warning |
 | `AquiferTTFTP95` | TTFT p95 > 2 s por 10 min | warning |
 | `AquiferSchemaFailures` | alguna salida estructurada inválida en 10 min | warning |
+| `AquiferTimeouts` | alguna generación cortada por timeout en 10 min | warning |
 | `AquiferNoTraffic` | sin requests por 30 min | info |
 
 Ajustar umbrales según el modelo y el hardware. En un 0.5B el TTFT normal es

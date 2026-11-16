@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import re
 import signal
 import sys
@@ -54,7 +55,7 @@ class Generation:
     """Estado de una generación: tokens, tiempos y compactación."""
 
     __slots__ = ("tokens", "finish", "done", "first_token_at", "queue_ms",
-                 "compact")
+                 "compact", "error")
 
     def __init__(self):
         self.tokens = 0
@@ -63,6 +64,7 @@ class Generation:
         self.first_token_at = None
         self.queue_ms = 0.0
         self.compact = None
+        self.error = None
 
 
 class Metrics:
@@ -82,6 +84,7 @@ class Metrics:
         self.schema_failed = 0
         self.schema_streamed = 0
         self.compactions = 0
+        self.timeouts = 0
         self.tool_requests = 0
         self.tool_calls = 0
         self.tokens_in = 0
@@ -129,6 +132,8 @@ class Metrics:
                 self.tool_requests += 1
             if trace.get("tool_calls"):
                 self.tool_calls += 1
+            if trace.get("error_type") == "generation_timeout":
+                self.timeouts += 1
             self.tokens_in += int(trace.get("prompt_tokens") or 0)
             self.tokens_out += int(trace.get("completion_tokens") or 0)
             lat = trace.get("latency_ms")
@@ -197,6 +202,7 @@ class Metrics:
                 "tools": {"requests": self.tool_requests,
                           "calls": self.tool_calls},
                 "compactions": self.compactions,
+                "timeouts": self.timeouts,
             }
 
     @staticmethod
@@ -225,6 +231,7 @@ class Metrics:
                 "compactions": self.compactions,
                 "tool_requests": self.tool_requests,
                 "tool_calls": self.tool_calls,
+                "timeouts": self.timeouts,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
                 "in_flight": self.in_flight,
                 "lat_sum": self.latency_sum, "lat_count": self.latency_count,
@@ -261,6 +268,7 @@ class Metrics:
                 ("aquifer_schema_streamed_total", "Salidas estructuradas en streaming"),
                 ("aquifer_tool_requests_total", "Peticiones con herramientas"),
                 ("aquifer_tool_calls_total", "Llamadas de herramienta emitidas"),
+                ("aquifer_timeouts_total", "Generaciones cortadas por timeout"),
                 ("aquifer_compactions_total", "Compactaciones de KV")):
             kind = "gauge" if name.endswith("in_flight") else "counter"
             add("# HELP %s %s" % (name, help_text))
@@ -275,6 +283,7 @@ class Metrics:
                    "aquifer_schema_streamed_total": "schema_streamed",
                    "aquifer_tool_requests_total": "tool_requests",
                    "aquifer_tool_calls_total": "tool_calls",
+                   "aquifer_timeouts_total": "timeouts",
                    "aquifer_compactions_total": "compactions"}[name]
             add("%s %d" % (name, data[key]))
 
@@ -440,64 +449,205 @@ def content_text(content):
     return ""
 
 
+class EngineTimeout(Exception):
+    pass
+
+
 class Engine:
-    """Un proceso del motor, serializado por lock (una generación a la vez)."""
+    """Un proceso del motor, serializado por lock (una generación a la vez).
+
+    Un hilo lector vuelca stdout en una cola: así cada espera tiene deadline y
+    un motor colgado no bloquea el servidor para siempre. Si el motor deja de
+    responder, se intenta STOP + drenaje corto y, si no vuelve, se mata para
+    que el próximo request lo reinicie.
+    """
 
     def __init__(self, mcfg, args, repo_dir, default_bin, resolve_artifact):
         self.mcfg = mcfg
         self.args = args
+        self.repo_dir = repo_dir
+        self.default_bin = default_bin
+        self.resolve_artifact = resolve_artifact
         self.lock = threading.Lock()
-        self.proc, self.tok, _ = start_engine(
-            mcfg, args, repo_dir, default_bin, resolve_artifact)
-        if self.proc is None:
-            raise SystemExit("No se pudo iniciar el motor")
+        self.proc = None
+        self.queue = None
+        self.tok = None
+        self.token_timeout = max(0.05, float(getattr(args, "token_timeout", 45.0)))
+        self.ttft_timeout = max(0.05, float(getattr(args, "ttft_timeout", 120.0)))
+        self.request_timeout = max(0.5, float(getattr(args, "request_timeout", 300.0)))
+        self.command_timeout = max(0.05, float(getattr(args, "command_timeout", 30.0)))
+        self._spawn()
+
+    # --- ciclo de vida -----------------------------------------------------
+    def _spawn(self):
+        proc, tok, _ = start_engine(
+            self.mcfg, self.args, self.repo_dir, self.default_bin,
+            self.resolve_artifact)
+        if proc is None:
+            raise ApiError(503, "no se pudo iniciar el motor", "server_error")
+        self.proc = proc
+        self.tok = tok
+        self.queue = queue.Queue()
+        threading.Thread(target=self._reader, args=(proc, self.queue),
+                         daemon=True).start()
+
+    @staticmethod
+    def _reader(proc, q):
+        try:
+            for line in proc.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            q.put(None)
 
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
+    def ensure_alive(self):
+        """Reinicia el motor si murió. Devuelve True si quedó operativo."""
+        with self.lock:
+            if self.alive():
+                return True
+            try:
+                self._spawn()
+            except Exception as err:
+                sys.stderr.write("[engine] no se pudo reiniciar: %s\n" % err)
+                return False
+            sys.stderr.write("[engine] reiniciado\n")
+            return True
+
+    def _kill(self):
+        proc = self.proc
+        self.proc = None
+        self.queue = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        sys.stderr.write("[engine] proceso terminado\n")
+
+    def close(self):
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            proc.stdin.write("QUIT\n")
+            proc.stdin.flush()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    # --- E/S con deadline --------------------------------------------------
     def _send(self, line):
+        if self.proc is None:
+            raise ApiError(503, "el motor no está disponible", "server_error")
         try:
             self.proc.stdin.write(line + "\n")
             self.proc.stdin.flush()
         except (BrokenPipeError, ValueError, OSError):
+            self._kill()
             raise ApiError(503, "el motor no está disponible", "server_error")
 
-    def _expect(self, ok, err):
-        for raw in self.proc.stdout:
-            line = raw.strip()
+    def _readline(self, timeout=None):
+        if self.queue is None:
+            raise ApiError(503, "el motor no está disponible", "server_error")
+        wait = self.command_timeout if timeout is None else timeout
+        try:
+            line = self.queue.get(timeout=max(0.0, wait))
+        except queue.Empty:
+            raise EngineTimeout()
+        if line is None:
+            raise ApiError(503, "el motor terminó la conexión", "server_error")
+        return line
+
+    def _read_until(self, prefixes, timeout=None):
+        deadline = time.monotonic() + (self.command_timeout if timeout is None
+                                       else timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EngineTimeout()
+            line = self._readline(remaining).strip()
+            for prefix in prefixes:
+                if line.startswith(prefix):
+                    return line
+
+    def _expect(self, ok, err, timeout=None):
+        deadline = time.monotonic() + (self.command_timeout if timeout is None
+                                       else timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EngineTimeout()
+            line = self._readline(remaining).strip()
             if line == ok:
                 return True
             if line == err:
                 return False
-        raise ApiError(503, "el motor terminó la conexión", "server_error")
 
-    def _read_until(self, prefixes):
-        for raw in self.proc.stdout:
-            line = raw.strip()
-            for p in prefixes:
-                if line.startswith(p):
-                    return line
-        raise ApiError(503, "el motor terminó la conexión", "server_error")
+    def _drain_done(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                if self._readline(remaining).strip() == "DONE":
+                    return True
+            except EngineTimeout:
+                return False
+            except ApiError:
+                return False
 
+    def _abort(self):
+        """Intenta STOP + DONE con deadline corto; si no, mata el proceso."""
+        try:
+            self._send("STOP")
+        except ApiError:
+            self._kill()
+            return
+        if self._drain_done(5.0):
+            return
+        self._kill()
+
+    # --- comandos ----------------------------------------------------------
     def configure(self, opts):
         line = "CONFIG %d %.6g %d %.6g %d %.6g %d" % (
             opts["max_tokens"], opts["temperature"], opts["top_k"],
             opts["top_p"], opts["seed"], opts["repeat_penalty"],
             opts["repeat_last_n"])
-        self._send(line)
-        if not self._expect("CONFIG_OK", "CONFIG_ERR"):
-            raise ApiError(500, "el motor rechazó los parámetros", "server_error")
+        try:
+            self._send(line)
+            if not self._expect("CONFIG_OK", "CONFIG_ERR"):
+                raise ApiError(500, "el motor rechazó los parámetros",
+                               "server_error")
+        except EngineTimeout:
+            self._kill()
+            raise ApiError(504, "el motor no respondió a CONFIG", "generation_timeout")
 
     def stream(self, tokens, opts, gen):
         """Genera texto. Debe consumirse entero o cerrarse (envía STOP)."""
         stops = opts.get("stop") or []
         hit_stop = False
+        timed_out = False
         t_wait = time.monotonic()
         with self.lock:
             gen.queue_ms = (time.monotonic() - t_wait) * 1000.0
             try:
                 if not self.alive():
-                    raise ApiError(503, "el motor no está disponible", "server_error")
+                    try:
+                        self._spawn()
+                    except Exception:
+                        raise ApiError(503, "el motor no está disponible",
+                                       "server_error")
                 self.configure(opts)
                 compact = opts.get("compact")
                 if compact and compact.get("tokens"):
@@ -506,7 +656,8 @@ class Engine:
                             compact["sink"],
                             ",".join(map(str, compact["tokens"]))))
                         line = self._read_until(
-                            ("COMPACTED", "COMPACT_NOMATCH", "COMPACT_ERR"))
+                            ("COMPACTED", "COMPACT_NOMATCH", "COMPACT_ERR"),
+                            timeout=self.command_timeout)
                         if line.startswith("COMPACTED"):
                             parts = line.split()
                             try:
@@ -523,13 +674,23 @@ class Engine:
                         else:
                             gen.compact = {"status": "error"}
                         sys.stderr.write("[compact] %s\n" % line)
+                    except EngineTimeout:
+                        self._kill()
+                        raise ApiError(504, "el motor no respondió a COMPACT",
+                                       "timeout")
                     except ApiError:
                         pass
                 self._send("PROMPT " + ",".join(map(str, tokens)))
                 streamer = StreamDecoder(self.tok)
                 buf = ""
-                for raw in self.proc.stdout:
-                    line = raw.strip()
+                deadline = time.monotonic() + self.request_timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise EngineTimeout()
+                    wait = (self.ttft_timeout if gen.first_token_at is None
+                            else self.token_timeout)
+                    line = self._readline(min(wait, remaining)).strip()
                     if line == "DONE":
                         gen.done = True
                         break
@@ -560,10 +721,8 @@ class Engine:
                             self._send("STOP")
                         except ApiError:
                             pass
-                        for extra in self.proc.stdout:
-                            if extra.strip() == "DONE":
-                                gen.done = True
-                                break
+                        if self._drain_done(5.0):
+                            gen.done = True
                         break
                     keep = stop_keep(buf, stops)
                     emit = len(buf) - keep
@@ -577,30 +736,18 @@ class Engine:
                     # El motor terminó sin tocar la parada: se emite el resto.
                     yield buf
                     buf = ""
+            except EngineTimeout:
+                timed_out = True
             finally:
-                if not gen.done:
-                    # Cliente desconectado o excepción: cortar y drenar.
-                    try:
-                        self._send("STOP")
-                        for extra in self.proc.stdout:
-                            if extra.strip() == "DONE":
-                                break
-                    except Exception:
-                        pass
+                if timed_out or not gen.done:
+                    self._abort()
                     gen.done = True
-                gen.finish = ("stop" if hit_stop or gen.tokens < opts["max_tokens"]
-                              else "length")
-
-    def close(self):
-        try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=2)
-        except Exception:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
+                if timed_out:
+                    gen.error = "timeout"
+                    gen.finish = "error"
+                else:
+                    gen.finish = ("stop" if hit_stop or gen.tokens < opts["max_tokens"]
+                                  else "length")
 
 
 class Server(ThreadingHTTPServer):
@@ -1219,6 +1366,8 @@ class Handler(BaseHTTPRequestHandler):
             text = "".join(self.state.engine.stream(tokens, opts, gen))
             trace["completion_tokens"] = gen.tokens
             trace["finish_reason"] = gen.finish
+            if gen.error:
+                raise ApiError(504, "tiempo de generación agotado", "generation_timeout")
             call, errors = self._parse_tool_call(text, specs, choice)
             if not errors:
                 return call, text, gen, attempt, tokens
@@ -1282,6 +1431,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = "".join(self.state.engine.stream(tokens, opts, gen))
             trace["completion_tokens"] = gen.tokens
             trace["finish_reason"] = gen.finish
+            if gen.error:
+                raise ApiError(504, "tiempo de generación agotado", "generation_timeout")
             try:
                 value = extract_json(raw)
             except SchemaError as err:
@@ -1353,6 +1504,14 @@ class Handler(BaseHTTPRequestHandler):
             streamer.close()
         text = "".join(parts)
         self._stamp(trace, gen)
+        if gen.error:
+            trace["error_type"] = "generation_timeout"
+            meta = self._public_trace(trace)
+            meta["valid"] = False
+            meta["error"] = {"type": "generation_timeout",
+                             "message": "el motor no respondió a tiempo"}
+            self._finish_sse(base, gen, tokens, body, meta, finish="error")
+            return
         value, errors = self._validate_value(text, fmt)
         valid = not errors
         trace["schema_valid"] = valid
@@ -1452,7 +1611,7 @@ class Handler(BaseHTTPRequestHandler):
         return headers
 
     def _chat(self, body, trace):
-        if not self.state.engine.alive():
+        if not self.state.engine.ensure_alive():
             raise ApiError(503, "el motor no está disponible", "server_error")
         fmt = self._response_format(body)
         opts = self._opts(body)
@@ -1490,6 +1649,8 @@ class Handler(BaseHTTPRequestHandler):
             if not stream:
                 raw, value, gen, attempts, tokens = self._structured(
                     history, system_text, opts, fmt, trace)
+                if gen.error:
+                    raise ApiError(504, "tiempo de generación agotado", "generation_timeout")
                 text = json.dumps(value, ensure_ascii=False)
                 self._stamp(trace, gen)
                 if self.state.trace_content:
@@ -1555,6 +1716,8 @@ class Handler(BaseHTTPRequestHandler):
         gen = Generation()
         if not stream:
             text = "".join(self.state.engine.stream(tokens, opts, gen))
+            if gen.error:
+                raise ApiError(504, "tiempo de generación agotado", "generation_timeout")
             self._stamp(trace, gen)
             if self.state.trace_content:
                 trace["content"] = text
@@ -1579,6 +1742,13 @@ class Handler(BaseHTTPRequestHandler):
             trace["finish_reason"] = gen.finish
             streamer.close()
         self._stamp(trace, gen)
+        if gen.error:
+            trace["error_type"] = "generation_timeout"
+            meta = self._public_trace(trace)
+            meta["error"] = {"type": "generation_timeout",
+                             "message": "el motor no respondió a tiempo"}
+            self._finish_sse(base, gen, tokens, body, meta, finish="error")
+            return
         if parts is not None:
             trace["content"] = "".join(parts)
         self._finish_sse(base, gen, tokens, body, self._public_trace(trace))
@@ -1616,6 +1786,14 @@ def build_parser(repo_dir):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--repeat-penalty", type=float, default=1.0)
     ap.add_argument("--repeat-last-n", type=int, default=64)
+    ap.add_argument("--token-timeout", type=float, default=45.0,
+                    help="Segundos máximos entre tokens durante la generación")
+    ap.add_argument("--ttft-timeout", type=float, default=120.0,
+                    help="Segundos máximos hasta el primer token (prefill)")
+    ap.add_argument("--request-timeout", type=float, default=300.0,
+                    help="Segundos máximos por generación completa")
+    ap.add_argument("--command-timeout", type=float, default=30.0,
+                    help="Segundos máximos para comandos del motor")
     ap.add_argument("--json-retries", type=int, default=1,
                     help="Reintentos extra cuando la salida no cumple el esquema "
                          "(default: 1 = hasta 2 intentos)")
@@ -1682,7 +1860,10 @@ def main():
         spec_max=args.spec_max, temperature=args.temperature,
         top_k=args.top_k, top_p=args.top_p, seed=args.seed,
         repeat_penalty=args.repeat_penalty, repeat_last_n=args.repeat_last_n,
-        session=None,
+        session=None, token_timeout=args.token_timeout,
+        ttft_timeout=args.ttft_timeout,
+        request_timeout=args.request_timeout,
+        command_timeout=args.command_timeout,
     )
     if args.trace_log:
         trace_dir = os.path.dirname(os.path.abspath(args.trace_log))
