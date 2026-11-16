@@ -71,6 +71,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Herramientas HTTP con allowlist (`--http-tools`).** El operador define URL, método, headers, timeout y esquema en un JSON; el cliente solo manda argumentos validados. Allowlist de hosts (loopback por default, soporta `*.dominio`), sin redirecciones, sin credenciales en URL, bloqueo de IPs privadas/link-local y tope de bytes. Catálogo en `GET /v1/http-tools`; ejecución con `tool_execution: local|auto`; métrica `aquifer_tool_http_calls_total`.
 - **Presupuesto de cadena multi-herramienta (`--tool-budget-ms`).** Además de `--max-tool-rounds`, el servidor limita el tiempo total de la cadena (default 15 s). Cada ejecución lleva `round` y `elapsed_ms`; si se agota, devuelve la llamada pendiente con `tool_budget_exceeded` y lo cuenta en `aquifer_tool_budget_exceeded_total`.
 - **Verificación end-to-end (`tools/verify.py`).** Un comando valida bundle, hashes, conversación, firma, cadena de trazas, recibos y cadena de padres, con salida legible o `--json` para el orquestador.
+- **Despliegue empaquetado (`deploy/`).** Unit files de systemd (sistema y usuario), wrapper `aquifer-serve.sh` con variables de entorno, `aquifer.env.example`, Dockerfile multi-stage (compila el motor con AVX2) y `docker-compose.yml` con `read_only`, `cap_drop`, healthcheck y el modelo montado en `/models`. El modelo no va en la imagen.
 - **Demo de piloto (`docs/pilot/`).** Mock HTTP local de clima, config allowlisted, script `demo.sh` y guion de 5 minutos. Sin lógica legal en el repo.
 - **Recibos HMAC por request (`--receipt-key`).** Firma un payload canónico con `request_id`, estado, tokens, latencias, hashes de prompt/conversación/esquema/respuesta y herramientas. Viaja en `x_aquifer.receipt`, headers y errores; `bundle.py verify-traces` y `verify` los comprueban. Sin clave, no hay recibo.
 - **Cadena de trazas append-only (`--trace-log` + `--trace-hmac-key`).** Cada traza enlaza el hash de la anterior (`seq`, `prev`, `sha256`) y opcionalmente se firma con HMAC. `bundle.py verify-traces` detecta borrados, alteraciones y reordenamientos; la cadena se reanuda tras reiniciar el servidor.
@@ -527,7 +528,7 @@ El servidor no espera para siempre al motor:
 | `--ttft-timeout` | 120 s | hasta el primer token (prefill) |
 | `--token-timeout` | 45 s | silencio máximo entre tokens |
 | `--request-timeout` | 300 s | generación completa |
-| `--command-timeout` | 30 s | comandos `CONFIG`/`COMPACT`/`SAVEKV`/`LOADKV` |
+| `--command-timeout` | 15 s | comandos `CONFIG`/`COMPACT`/`SAVEKV`/`LOADKV` |
 
 Si vence un deadline, manda `STOP` y drena hasta 5 s; si el motor no vuelve, lo
 mata. El próximo request lo reinicia (pierde el KV y re-prellena). En
@@ -694,6 +695,16 @@ El esquema es del orquestador. En el repo no hay reglas legales ni lógica del
 Juez: solo extracción y validación genérica.
 
 ---
+
+## 📦 Despliegue
+
+- **systemd**: `deploy/systemd/` + `deploy/aquifer.env.example`.
+- **Docker**: `deploy/Dockerfile` + `deploy/docker-compose.yml`; el modelo se
+  monta en `/models` y el motor se compila dentro de la imagen.
+- Hardening, variables y operación: [`deploy/README.md`](deploy/README.md).
+
+El servidor sigue siendo el mismo `tools/serve.py`: el empaquetado solo agrega
+un wrapper de configuración, unidades de servicio y una imagen.
 
 ## 📖 Monografía Técnica y Tratado Científico
 

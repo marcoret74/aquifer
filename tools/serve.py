@@ -505,7 +505,7 @@ class Engine:
         self.token_timeout = max(0.05, float(getattr(args, "token_timeout", 45.0)))
         self.ttft_timeout = max(0.05, float(getattr(args, "ttft_timeout", 120.0)))
         self.request_timeout = max(0.5, float(getattr(args, "request_timeout", 300.0)))
-        self.command_timeout = max(0.05, float(getattr(args, "command_timeout", 30.0)))
+        self.command_timeout = max(0.05, float(getattr(args, "command_timeout", 15.0)))
         self._spawn()
 
     # --- ciclo de vida -----------------------------------------------------
@@ -2046,6 +2046,9 @@ def build_parser(repo_dir):
                     help="Modelo servido (default: qwen05)")
     ap.add_argument("--bin", default=os.path.join(repo_dir, "build", "generate_aquifer"),
                     help="Ruta al binario generate_aquifer")
+    ap.add_argument("--models-dir", default=None, metavar="DIR",
+                    help="Directorio de artefactos/tokenizers (para Docker o "
+                         "systemd; busca <DIR>/<artefacto> y <DIR>/<modelo>/tokenizer.json)")
     ap.add_argument("--artifact", default=None)
     ap.add_argument("--tokenizer", default=None)
     ap.add_argument("--system", default=None,
@@ -2089,7 +2092,7 @@ def build_parser(repo_dir):
                     help="Segundos máximos hasta el primer token (prefill)")
     ap.add_argument("--request-timeout", type=float, default=300.0,
                     help="Segundos máximos por generación completa")
-    ap.add_argument("--command-timeout", type=float, default=30.0,
+    ap.add_argument("--command-timeout", type=float, default=15.0,
                     help="Segundos máximos para comandos del motor")
     ap.add_argument("--json-retries", type=int, default=1,
                     help="Reintentos extra cuando la salida no cumple el esquema "
@@ -2116,21 +2119,30 @@ def main():
     if not os.path.exists(default_bin):
         default_bin = os.path.join(repo_dir, "build", "generate_qwen")
 
-    def resolve_artifact(name):
-        local = os.path.join(repo_dir, "build", name)
-        if os.path.exists(local):
-            return local
-        caudal = os.path.join("/home/marco/source/repos/caudal/build", name)
-        if os.path.exists(caudal):
-            return caudal
-        return local
-
     args = build_parser(repo_dir).parse_args()
+
+    def resolve_artifact(name):
+        candidates = []
+        if args.models_dir:
+            candidates.append(os.path.join(args.models_dir, name))
+        candidates.append(os.path.join(repo_dir, "build", name))
+        candidates.append(os.path.join("/home/marco/source/repos/caudal/build", name))
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return candidates[0]
     mcfg = get_model_config(args.model, resolve_artifact)
     if args.artifact:
         mcfg["artifact"] = args.artifact
     if args.tokenizer:
         mcfg["tokenizer"] = args.tokenizer
+    elif args.models_dir:
+        for candidate in (
+                os.path.join(args.models_dir, args.model, "tokenizer.json"),
+                os.path.join(args.models_dir, "tokenizer.json")):
+            if os.path.exists(candidate):
+                mcfg["tokenizer"] = candidate
+                break
     if args.n is not None:
         mcfg["n"] = args.n
 

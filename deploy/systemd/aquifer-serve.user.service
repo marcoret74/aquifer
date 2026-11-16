@@ -1,0 +1,24 @@
+[Unit]
+Description=Aquifer local inference API (user)
+Documentation=https://github.com/marcoret74/aquifer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/aquifer
+EnvironmentFile=-%h/.config/aquifer/aquifer.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/aquifer/deploy/aquifer-serve.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+KillMode=control-group
+SyslogIdentifier=aquifer
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65536
+TasksMax=128
+
+[Install]
+WantedBy=default.target

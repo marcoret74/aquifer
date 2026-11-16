@@ -1,0 +1,9 @@
+.git
+.gitignore
+build
+docs
+tests
+*.pdf
+**/__pycache__
+**/*.pyc
+deploy/models

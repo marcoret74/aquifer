@@ -1,0 +1,45 @@
+services:
+  aquifer:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: aquifer:local
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      AQUIFER_MODEL: ${AQUIFER_MODEL:-qwen05}
+      AQUIFER_MODELS_DIR: /models
+      AQUIFER_HOST: 0.0.0.0
+      AQUIFER_PORT: "8080"
+      AQUIFER_CTX: ${AQUIFER_CTX:-2048}
+      AQUIFER_LOCAL_TOOLS: "1"
+      AQUIFER_MAX_TOOL_ROUNDS: "2"
+      AQUIFER_TOOL_BUDGET_MS: "15000"
+      AQUIFER_TRACE_LOG: /var/lib/aquifer/traces.jsonl
+      # AQUIFER_API_KEY: ${AQUIFER_API_KEY:-}
+      # AQUIFER_RECEIPT_KEY: /etc/aquifer/receipt.key
+      # AQUIFER_HTTP_TOOLS: /etc/aquifer/http-tools.json
+      # AQUIFER_HTTP_ALLOW_HOSTS: 127.0.0.1,localhost
+    volumes:
+      - ${AQUIFER_MODELS_DIR:-./models}:/models:ro
+      - aquifer-state:/var/lib/aquifer
+      # - ./receipt.key:/etc/aquifer/receipt.key:ro
+      # - ./http-tools.json:/etc/aquifer/http-tools.json:ro
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  aquifer-state:
