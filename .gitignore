@@ -32,3 +32,6 @@ __pycache__/
 .idea/
 *~
 *.swp
+
+# Prototype audit logs
+prototype/legal_verifier/out/
