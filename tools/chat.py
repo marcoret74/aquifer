@@ -326,7 +326,9 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
         "--prefill-batch", str(args.prefill_batch),
         "--mem-policy", args.mem_policy,
         "--kv-dtype", args.kv_dtype,
-        "--spec", str(args.spec)
+        "--spec", str(args.spec),
+        "--spec-min", str(args.spec_min),
+        "--spec-max", str(args.spec_max)
     ]
     if args.diamond is not None:
         print(f"{YELLOW}[Experimental] El modo Diamante actual selecciona neuronas "
@@ -401,6 +403,10 @@ def main():
                     help="Precisión del KV cache (fp16 = mitad de memoria y tráfico)")
     ap.add_argument("--spec", type=int, default=4,
                     help="Tokens especulativos por pasada con prompt-lookup (0 = desactivado)")
+    ap.add_argument("--spec-min", type=int, default=2,
+                    help="Longitud mínima del n-grama para especular")
+    ap.add_argument("--spec-max", type=int, default=8,
+                    help="Longitud máxima del n-grama a buscar")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
 

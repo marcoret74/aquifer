@@ -684,9 +684,11 @@ void rope_one(float* v, std::size_t pos, const Cfg& c) {
 // tokens que le siguieron. Coste ~0 (memcmp sobre el historico), sin modelo.
 // Es la unica forma de batching con UN SOLO usuario: los k tokens propuestos se
 // verifican en UNA pasada (M=k) y se acepta el prefijo correcto.
-std::vector<int> prompt_lookup(const std::vector<int>& ctx, int k) {
+std::vector<int> prompt_lookup(const std::vector<int>& ctx, int k,
+                               int min_match = 2, int max_match = 8) {
     const int N = int(ctx.size());
-    for (int n = std::min(8, N - 1); n >= 2; --n) {
+    if (N < 2) return {};
+    for (int n = std::min(max_match, N - 1); n >= min_match; --n) {
         for (int p = N - n - 1; p >= 0; --p) {
             bool eq = true;
             for (int i = 0; i < n; ++i)
@@ -710,6 +712,9 @@ static double vnorm(const float* p, std::size_t n) {
 
 static bool g_dump = false;
 static int g_stepn = 0;
+static int g_spec_min = 2;
+static int g_spec_max = 8;
+static std::size_t g_spec_prop = 0, g_spec_acc = 0, g_spec_rounds = 0;
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -730,6 +735,8 @@ int main(int argc, char** argv) {
         else if (a == "--threads") reqT = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--spec") spec = std::atoi(next().c_str());
+        else if (a == "--spec-min") g_spec_min = std::atoi(next().c_str());
+        else if (a == "--spec-max") g_spec_max = std::atoi(next().c_str());
         else if (a == "--dump") g_dump = true;
         else if (a == "--time") g_time = true;
         else if (a == "--probe-read") g_probe = true;
@@ -770,6 +777,8 @@ int main(int argc, char** argv) {
     if (ctx < 1) { std::printf("--ctx tiene que ser >= 1\n"); return 1; }
     g_prefill_batch = std::min(g_prefill_batch, unsigned(kMaxM));
     spec = std::max(0, std::min(spec, int(kMaxM)));
+    g_spec_min = std::max(2, std::min(g_spec_min, 16));
+    g_spec_max = std::max(g_spec_min, std::min(g_spec_max, 16));
     // Cada secuencia conserva SU longitud: truncar al minimo hacia que el
     // modelo recibiera prompts cortados a mitad de frase (y repitiera el texto).
     std::size_t plen = prompts.empty() ? 0 : prompts[0].size();
@@ -1269,6 +1278,11 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            if (cmd == "STATS") {
+                std::printf("STATS %zu %zu %zu\n", g_spec_rounds, g_spec_prop, g_spec_acc);
+                std::fflush(stdout);
+                continue;
+            }
             if (cmd == "PROMPT") {
                 std::string ids_str;
                 ss >> ids_str;
@@ -1338,13 +1352,15 @@ int main(int argc, char** argv) {
 
                     bool speculated = false;
                     if (spec > 0 && cur_pos + 1 < std::size_t(ctx)) {
-                        auto prop = prompt_lookup(cached_tokens, spec);
-                        if (!prop.empty() && prop[0] == y) {
+                        auto prop = prompt_lookup(cached_tokens, spec, g_spec_min, g_spec_max);
+                        if (prop.size() >= 2 && prop[0] == y) {
                             std::size_t k = prop.size();
                             k = std::min(k, std::size_t(ngen - generated));
                             k = std::min(k, std::size_t(ctx) - 1 - cur_pos);
                             if (k > 0) {
                                 prop.resize(k);
+                                ++g_spec_rounds;
+                                g_spec_prop += prop.size();
                                 std::vector<unsigned> sq(k, 0u);
                                 std::vector<std::size_t> ps(k);
                                 for (std::size_t j = 0; j < k; ++j) ps[j] = cur_pos + 1 + j;
@@ -1354,6 +1370,7 @@ int main(int argc, char** argv) {
                                     const int pred = argmax_row(logits.data() + (j - 1) * cfg.V);
                                     if (pred == prop[j]) ++a; else break;
                                 }
+                                g_spec_acc += a;
                                 for (unsigned j = 0; j < a && !stop; ++j) {
                                     emit(prop[j]);
                                     cached_tokens.push_back(prop[j]);
