@@ -68,7 +68,7 @@ static bool g_kv_fp16 = true;        // KV en fp16: mitad de tr√°fico en atenci√
 
 namespace {
 
-constexpr unsigned kMaxM = 8;          // secuencias por pasada
+constexpr unsigned kMaxM = 32;         // secuencias por pasada (prefill GEMM)
 
 struct Cfg {
     std::size_t H{0}, NLY{0}, NH{0}, NKV{0}, DH{0}, INTER{0}, V{0};
@@ -579,10 +579,79 @@ void gemv_group_M(Pool& pool, const std::vector<Job>& jobs, unsigned M,
         }
     });
 
+    const unsigned T = pool.size();
+
+    // Prefill GEMM cache-blocked: un bloque de filas se lee una vez desde
+    // DRAM y se reutiliza para todos los grupos de 8 tokens desde L2.
+    if (M > 8) {
+        pool.run([&](unsigned tid) {
+            for (const auto& j : jobs) {
+                const std::size_t a = std::size_t(tid) * j.L->N / T;
+                const std::size_t b = std::size_t(tid + 1) * j.L->N / T;
+                std::size_t row_bytes = j.L->stride ? j.L->stride : j.L->row_bytes;
+                if (j.L->min) row_bytes += j.L->G * 4;
+                else if (j.L->kmin) row_bytes += (K / 256) * 16;
+                else row_bytes += j.L->G * 2;
+                const std::size_t RB = std::max<std::size_t>(
+                    8, (std::size_t{128} << 10) / std::max<std::size_t>(1, row_bytes));
+                for (std::size_t rb = a; rb < b; rb += RB) {
+                    const std::size_t re = std::min(rb + RB, b);
+                    for (std::size_t tg = 0; tg < M; tg += 8) {
+                        const unsigned r = unsigned(std::min<std::size_t>(8, M - tg));
+                        caudal::Shape s; s.N = re - rb; s.K = K; s.group = grp;
+                        s.stride = j.L->stride;
+                        const std::uint8_t* pk = j.L->packed +
+                            rb * (j.L->stride ? j.L->stride : j.L->row_bytes);
+                        const _Float16* sc = j.L->min ? (j.L->scale + rb * G) : nullptr;
+                        const std::int8_t* xp = xqp.data() + tg * K;
+                        const float* xsp = xs.data() + tg * G;
+                        float* yy = j.y + tg * j.L->N + rb;
+                        if (j.L->min) {
+                            const _Float16* mn = j.L->min + rb * G;
+                            switch (r) {
+                                case 1: caudal::gemv_int4_affine_M<1>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 2: caudal::gemv_int4_affine_M<2>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 3: caudal::gemv_int4_affine_M<3>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 4: caudal::gemv_int4_affine_M<4>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 5: caudal::gemv_int4_affine_M<5>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 6: caudal::gemv_int4_affine_M<6>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 7: caudal::gemv_int4_affine_M<7>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                default: caudal::gemv_int4_affine_M<8>(s, pk, sc, mn, xms.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                            }
+                        } else if (j.L->kmin) {
+                            const std::uint8_t* hp = j.L->kmin + rb * (K / 256) * 16;
+                            switch (r) {
+                                case 1: caudal::gemv_int4_kmin_M<1>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 2: caudal::gemv_int4_kmin_M<2>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 3: caudal::gemv_int4_kmin_M<3>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 4: caudal::gemv_int4_kmin_M<4>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 5: caudal::gemv_int4_kmin_M<5>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 6: caudal::gemv_int4_kmin_M<6>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 7: caudal::gemv_int4_kmin_M<7>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                default: caudal::gemv_int4_kmin_M<8>(s, pk, hp, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                            }
+                        } else {
+                            switch (r) {
+                                case 1: caudal::gemv_int4_g32_M<1>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 2: caudal::gemv_int4_g32_M<2>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 3: caudal::gemv_int4_g32_M<3>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 4: caudal::gemv_int4_g32_M<4>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 5: caudal::gemv_int4_g32_M<5>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 6: caudal::gemv_int4_g32_M<6>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                case 7: caudal::gemv_int4_g32_M<7>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                                default: caudal::gemv_int4_g32_M<8>(s, pk, sc, xg.data() + tg * G, xp, xsp, yy, j.L->N); break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        return;
+    }
+
     std::size_t total = 0;
     for (const auto& j : jobs) total += j.L->N;
 
-    const unsigned T = pool.size();
     pool.run([&](unsigned tid) {
         const std::size_t a = std::size_t(tid) * total / T;
         const std::size_t b = std::size_t(tid + 1) * total / T;
@@ -776,7 +845,7 @@ int main(int argc, char** argv) {
     }
     if (ctx < 1) { std::printf("--ctx tiene que ser >= 1\n"); return 1; }
     g_prefill_batch = std::min(g_prefill_batch, unsigned(kMaxM));
-    spec = std::max(0, std::min(spec, int(kMaxM)));
+    spec = std::max(0, std::min(spec, 8));
     g_spec_min = std::max(2, std::min(g_spec_min, 16));
     g_spec_max = std::max(g_spec_min, std::min(g_spec_max, 16));
     // Cada secuencia conserva SU longitud: truncar al minimo hacia que el
