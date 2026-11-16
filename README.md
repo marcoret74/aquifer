@@ -61,6 +61,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **`--mem-policy auto` (nuevo default).** Si el artefacto cabe en `MemAvailable` con holgura, no se llama `MADV_DONTNEED`: los pesos quedan en page cache y THP, sin 150k page faults por pasada. Si no cabe, se pagina como antes. `paged` conserva el VmRSS mínimo; `resident` fuerza page cache caliente. El tráfico real de DRAM no cambia; cambia cuántas veces se vuelve a tocar la misma página.
 - **`--prefill-batch 8`.** El prefill procesa hasta 8 tokens por pasada: cada byte de peso leído se reutiliza 8 veces. La causalidad se mantiene porque la atención de cada token corta en `pos[i]`, aunque el KV del bloque ya esté escrito. Solo se calculan los logits del último token del bloque.
 - **Atención paralelizada por (token, cabeza).** Antes corría en un hilo mientras los workers esperaban; ahora usa el pool. A ctx 512 la atención baja de ~19 ms/token a ~4 ms/token (4 hilos).
+- **Decodificación especulativa por prompt-lookup (`--spec 4`, default en chat).** Propone hasta 4 tokens copiados de una repetición reciente del contexto, los verifica en una sola pasada `M=4` y acepta el prefijo correcto. En greedy genera **exactamente los mismos tokens** que sin spec. Medido: +5–15 % en texto natural y hasta **2,2×** en salida repetitiva/código. `--spec 0` lo desactiva.
 - **KV en fp16 (default).** La mitad de memoria y de tráfico de KV; mismo texto generado en las pruebas de regresión. `--kv-dtype fp32` lo desactiva.
 - **Hilos = núcleos físicos por defecto.** Usar los 8 hilos lógicos de un 4C/8T calienta y compite por los puertos de memoria: en este equipo el default anterior (8) llegó a 104 ms/token contra 26 ms/token con 4. `--threads 0` deja elegir al motor.
 
@@ -77,6 +78,7 @@ Hasta entonces, `--diamond` queda como experimental y no se recomienda para prod
 
 - **Atención GQA online (experimental):** se implementó con chunks de posición y reducción `(max, sum)`. En 0.5B a ctx 2048 dio **47 ms vs 35 ms** del kernel por cabeza (26,6 % → 31,2 % del decode) y prefill 33,3 s vs 22,7 s. En este CPU la atención ya es compute-bound y el K/V de GQA vive en L2/L3; compartir K/V no reduce los MAC. Queda en la rama `perf/gqa-attn`, no se usa.
 - **Afín grupo 64 (4,5 bpw, experimental):** reduce 5,5–10 % los bytes, pero el kernel rinde **18,5 vs 20,9 GB/s** en 1.5B y la PPL sube **20,73 → 22,37 (+7,9 %)**; en 0.5B la PPL sube ~16 %. El balance neto en 1.5B es más lento. La capacidad de empaquetar/consumir grupo 64 quedó en la rama `perf/affine-g64` con `test_affine_g64`, pero **no es el default**.
+- **Prefill B=16 (no adoptado):** a `--prefill-batch 8` el prefill ya es compute-bound (≈9,6 GB/s contra 20,9 GB/s de decode en 1.5B); M=16 requiere 32 acumuladores YMM (facc+minacc) y spillea. El límite práctico en AVX2 es 8.
 - **Diamante:** ver el triple check arriba; al 90 % queda neutral o más lento, y el 3,7× no es alcanzable.
 
 El camino que sí quedó en producción es el **fix de offsets del GEMV** + memoria adaptativa + prefill batcheado + atención paralela + KV fp16 + núcleos físicos.
@@ -126,6 +128,9 @@ Inicia una conversación interactiva en tiempo real:
 ```bash
 # Iniciar chat con Qwen 0.5B (usa RAM libre como caché y prefill por bloques)
 python3 tools/chat.py --model qwen05
+
+# Decodificación especulativa por prompt-lookup (default: 4 tokens)
+python3 tools/chat.py --model qwen05 --spec 4
 
 # Forzar VmRSS mínimo (paga page faults, pero no retiene pesos)
 python3 tools/chat.py --model qwen05 --mem-policy paged

@@ -325,7 +325,8 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
         "--eos", mcfg["eos"],
         "--prefill-batch", str(args.prefill_batch),
         "--mem-policy", args.mem_policy,
-        "--kv-dtype", args.kv_dtype
+        "--kv-dtype", args.kv_dtype,
+        "--spec", str(args.spec)
     ]
     if args.diamond is not None:
         print(f"{YELLOW}[Experimental] El modo Diamante actual selecciona neuronas "
@@ -398,6 +399,8 @@ def main():
                     help="auto usa RAM libre como caché y pagina bajo presión; paged fuerza VmRSS mínimo; resident nunca desaloja")
     ap.add_argument("--kv-dtype", choices=["fp16", "fp32"], default="fp16",
                     help="Precisión del KV cache (fp16 = mitad de memoria y tráfico)")
+    ap.add_argument("--spec", type=int, default=4,
+                    help="Tokens especulativos por pasada con prompt-lookup (0 = desactivado)")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
 

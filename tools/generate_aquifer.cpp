@@ -761,6 +761,7 @@ int main(int argc, char** argv) {
     }
     if (ctx < 1) { std::printf("--ctx tiene que ser >= 1\n"); return 1; }
     g_prefill_batch = std::min(g_prefill_batch, unsigned(kMaxM));
+    spec = std::max(0, std::min(spec, int(kMaxM)));
     // Cada secuencia conserva SU longitud: truncar al minimo hacia que el
     // modelo recibiera prompts cortados a mitad de frase (y repitiera el texto).
     std::size_t plen = prompts.empty() ? 0 : prompts[0].size();
@@ -1300,32 +1301,93 @@ int main(int argc, char** argv) {
 
                 int last_tok = ptokens.back();
                 std::size_t cur_pos = ptokens.size() - 1;
-                cached_tokens.push_back(last_tok);
-
-                for (int step_idx = 0; step_idx < ngen; ++step_idx) {
-                    if (cur_pos >= std::size_t(ctx)) break;
-                    auto out = step({0u}, {last_tok}, {cur_pos});
-                    int tok = out[0];
+                // El último token del prompt todavía no está procesado: el
+                // primer step lo procesa y deja logits para elegir el siguiente.
+                bool have_logits = false;
+                int generated = 0;
+                bool stop = false;
+                auto argmax_row = [&](const float* lg) {
+                    std::size_t best = 0;
+                    for (std::size_t j = 1; j < cfg.V; ++j)
+                        if (lg[j] > lg[best]) best = j;
+                    return int(best);
+                };
+                auto emit = [&](int tok) {
                     std::printf("TOKEN %d\n", tok);
                     std::fflush(stdout);
-                    bool is_eos = false;
-                    for (int e : eos_tokens) {
-                        if (tok == e) { is_eos = true; break; }
+                    ++generated;
+                    for (int e : eos_tokens) if (tok == e) stop = true;
+                };
+                while (generated < ngen && !stop) {
+                    if (cur_pos >= std::size_t(ctx)) break;
+                    if (!have_logits) {
+                        (void)step({0u}, {last_tok}, {cur_pos});
+                        if (cached_tokens.size() <= cur_pos) cached_tokens.resize(cur_pos + 1);
+                        cached_tokens[cur_pos] = last_tok;
+                        have_logits = true;
                     }
-                    if (is_eos) break;
-                    // El cliente puede cortar un bucle degenerado sin matar el
-                    // proceso: al llegar STOP se deja de generar y se emite DONE.
-                    {
+                    const int y = argmax_row(logits.data());
+
+                    bool speculated = false;
+                    if (spec > 0 && cur_pos + 1 < std::size_t(ctx)) {
+                        auto prop = prompt_lookup(cached_tokens, spec);
+                        if (!prop.empty() && prop[0] == y) {
+                            std::size_t k = prop.size();
+                            k = std::min(k, std::size_t(ngen - generated));
+                            k = std::min(k, std::size_t(ctx) - 1 - cur_pos);
+                            if (k > 0) {
+                                prop.resize(k);
+                                std::vector<unsigned> sq(k, 0u);
+                                std::vector<std::size_t> ps(k);
+                                for (std::size_t j = 0; j < k; ++j) ps[j] = cur_pos + 1 + j;
+                                (void)step(sq, prop, ps);   // verifica k tokens en una pasada
+                                unsigned a = 1;             // prop[0] == y ya está aceptado
+                                for (std::size_t j = 1; j < k; ++j) {
+                                    const int pred = argmax_row(logits.data() + (j - 1) * cfg.V);
+                                    if (pred == prop[j]) ++a; else break;
+                                }
+                                for (unsigned j = 0; j < a && !stop; ++j) {
+                                    emit(prop[j]);
+                                    cached_tokens.push_back(prop[j]);
+                                }
+                                cur_pos += a;
+                                last_tok = prop[a - 1];
+                                if (!stop && generated < ngen) {
+                                    // R[a-1] es el último token procesado y
+                                    // predice el siguiente (sea aceptado o no).
+                                    std::memcpy(logits.data(),
+                                                logits.data() + std::size_t(a - 1) * cfg.V,
+                                                cfg.V * sizeof(float));
+                                    have_logits = true;
+                                }
+                                speculated = true;
+                            }
+                        }
+                    }
+                    if (speculated) {
+                        if (stop || generated >= ngen) break;
                         struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
                         if (::poll(&pfd, 1, 0) > 0) {
                             std::string ctl;
                             std::getline(std::cin, ctl);
                             if (ctl == "STOP") break;
                         }
+                        continue;
                     }
-                    cached_tokens.push_back(tok);
-                    last_tok = tok;
+
+                    // Sin propuesta: emite y y procesa y en la próxima vuelta.
+                    emit(y);
+                    cached_tokens.push_back(y);
+                    if (stop || generated >= ngen) break;
+                    struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
+                    if (::poll(&pfd, 1, 0) > 0) {
+                        std::string ctl;
+                        std::getline(std::cin, ctl);
+                        if (ctl == "STOP") break;
+                    }
                     ++cur_pos;
+                    last_tok = y;
+                    have_logits = false;
                 }
                 std::printf("DONE\n");
                 std::fflush(stdout);
@@ -1421,59 +1483,6 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    // --- modo especulativo (una sola secuencia) -----------------------------
-    if (spec > 0 && NS == 1) {
-        std::vector<int> ctx = prompts[0];
-        std::size_t p = ctx.size() - 1;
-        auto L = [&](unsigned m) { return logits.data() + std::size_t(m) * cfg.V; };
-        auto argmax = [&](const float* lg) {
-            std::size_t b = 0;
-            for (std::size_t j = 1; j < cfg.V; ++j) if (lg[j] > lg[b]) b = j;
-            return int(b);
-        };
-        const double ts0 = now_ms();
-        int emitted = 0, steps = 0, accepted = 0, proposed = 0;
-        std::vector<int> out;
-        while (emitted < ngen) {
-            const int y = argmax(L(0));
-            auto prop = prompt_lookup(ctx, spec);
-            if (prop.empty() || prop[0] != y) {
-                // sin propuesta util: un token normal
-                ctx.push_back(y); out.push_back(y); ++emitted; ++p;
-                (void)step({0u}, {y}, {p});
-                ++steps;
-                continue;
-            }
-            ++steps;
-            proposed += int(prop.size());
-            std::vector<std::size_t> ps;
-            for (std::size_t i = 0; i < prop.size(); ++i) ps.push_back(p + 1 + i);
-            (void)step(std::vector<unsigned>(prop.size(), 0u), prop, ps);
-            // L(i) son los logits en la posicion p+1+i, y predicen el token de
-            // p+2+i. Entonces prop[j] (en p+1+j) lo predice L(j-1), NO L(j).
-            unsigned a = 1;
-            for (std::size_t j = 1; j < prop.size(); ++j) {
-                if (a != j) break;
-                if (argmax(logits.data() + (j - 1) * cfg.V) == prop[j]) ++a; else break;
-            }
-            for (unsigned j = 0; j < a; ++j) { ctx.push_back(prop[j]); out.push_back(prop[j]); ++emitted; }
-            accepted += int(a);
-            p += a;
-            // dejar L(0) apuntando a la posicion p: es logits[a]
-            std::memcpy(logits.data(), logits.data() + std::size_t(a) * cfg.V,
-                        cfg.V * sizeof(float));
-            if (emitted >= ngen) break;
-        }
-        const double ts1 = now_ms();
-        std::printf("\n--- especulativo (k=%d) ---\n", spec);
-        std::printf("pasos %d | tokens %d | propuestos %d | aceptados %d (%.0f%%)\n",
-                    steps, emitted, proposed, accepted, 100.0 * accepted / std::max(proposed, 1));
-        std::printf("%.1f ms/token -> %.1f tok/s\n", (ts1 - ts0) / emitted,
-                    1000.0 * emitted / (ts1 - ts0));
-        std::printf("SPEC ");
-        for (int v : out) std::printf("%d ", v);
-        std::printf("\n");
-    }
     std::printf("\n");
     return 0;
 }
