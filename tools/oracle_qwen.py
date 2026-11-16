@@ -322,8 +322,45 @@ class Qwen:
         qg = getattr(self, 'qgroup', 64)
         if K % qg:
             return t
+        fmt = getattr(self, 'qformat', 'sym')
+        tiny = torch.finfo(torch.float16).tiny
+        if fmt in ('affine', 'q4k'):
+            qg = 32
         G = K // qg
         g = t.view(N, G, qg)
+        if fmt == 'affine':
+            # Escala fp16 + mínimo fp16 por grupo de 32 (5.0 bpw).
+            lo = g.amin(-1, keepdim=True)
+            hi = g.amax(-1, keepdim=True)
+            sc = ((hi - lo) / 15.0).half().float()
+            mn = lo.half().float()
+            q = ((g - mn) / sc.clamp_min(tiny)).round().clamp(0, 15)
+            return (q * sc + mn).view(N, K)
+        if fmt == 'q4k':
+            # Q4_K-like: grupo 32, escala/mínimo 6 bits y super-escala fp16
+            # por super-bloque de 8 grupos (256 valores). ~4.5 bpw.
+            lo = g.amin(-1)
+            hi = g.amax(-1)
+            s = (hi - lo) / 15.0
+            mn = lo
+            SB = (G + 7) // 8
+            pad = SB * 8 - G
+            if pad:
+                gp = torch.zeros(N, pad, qg, dtype=g.dtype, device=g.device)
+                g = torch.cat([g, gp], dim=1)
+                s = torch.cat([s, torch.zeros(N, pad, dtype=s.dtype, device=s.device)], dim=1)
+                mn = torch.cat([mn, torch.zeros(N, pad, dtype=mn.dtype, device=mn.device)], dim=1)
+            s4 = s.view(N, SB, 8)
+            mn4 = mn.view(N, SB, 8)
+            d = (s4.amax(-1, keepdim=True) / 63.0).half().float().clamp_min(tiny)
+            dmin = (mn4.abs().amax(-1, keepdim=True) / 32.0).half().float().clamp_min(tiny)
+            scq = (s4 / d).round().clamp(0, 63)
+            mnq = (mn4 / dmin).round().clamp(-32, 31)
+            s_eff = (d * scq).unsqueeze(-1)
+            mn_eff = (dmin * mnq).unsqueeze(-1)
+            q = ((g.view(N, SB, 8, qg) - mn_eff) / s_eff.clamp_min(tiny)).round().clamp(0, 15)
+            deq = q * s_eff + mn_eff
+            return deq.view(N, SB * 8 * qg)[:, :K]
         bits = int(getattr(self, 'qbits', 4))
         if bits < 2 or bits > 8:
             bits = 4
@@ -332,7 +369,7 @@ class Qwen:
         # Clamp en dominio fp16: 1e-8 NO es representable (min subnormal ~6e-8),
         # y los grupos con amax==0 daban sw=0 -> division por cero -> nan.
         sw = (g.abs().amax(-1, keepdim=True) / float(qmax)).half()
-        sw = torch.clamp(sw, min=torch.finfo(torch.float16).tiny).float()
+        sw = torch.clamp(sw, min=tiny).float()
         codes = (g / sw).round().clamp(qmin, qmax)
         return (codes * sw).view(N, K)
 

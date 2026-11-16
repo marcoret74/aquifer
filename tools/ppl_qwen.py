@@ -48,12 +48,18 @@ def main():
     ap.add_argument('--model', required=True)
     ap.add_argument('--groups', default='64,32')
     ap.add_argument('--bits', default='4', help='bits de peso a simular, ej. 4,3')
+    ap.add_argument('--format', default='sym', choices=['sym', 'affine', 'q4k'], help='sym=int4 sin minimo; affine=5.0 bpw; q4k=super-bloque ~4.5 bpw')
     ap.add_argument('--text', default=TEXTO_POR_DEFECTO)
+    ap.add_argument('--text-file', default=None)
+    ap.add_argument('--window', type=int, default=0)
     args = ap.parse_args()
 
     cfg = json.load(open(os.path.join(args.model, 'config.json')))
     tok = Tokenizer(os.path.join(args.model, 'tokenizer.json'))
-    ids = tok.encode(args.text, allow_special=False)
+    txt = open(args.text_file, encoding='utf-8').read() if args.text_file else args.text
+    ids = tok.encode(txt, allow_special=False)
+    if args.window:
+        ids = ids[:args.window]
     print(f'modelo : {args.model}')
     print(f'texto  : {len(ids)} tokens\n')
 
@@ -63,15 +69,24 @@ def main():
     base = ppl(m, ids)
     print(f'{"bf16":<12} {"16.00":>7} bits   ppl {base:8.3f}   (referencia)')
 
-    for qbits in [int(x) for x in args.bits.split(',')]:
-        for g in [int(x) for x in args.groups.split(',')]:
-            m.quant = True
-            m.qgroup = g
-            m.qbits = qbits
-            p = ppl(m, ids)
-            bits = qbits + 16.0 / g
-            print(f'{"int" + str(qbits) + " g" + str(g):<12} {bits:7.2f} bits   ppl {p:8.3f}   '
-                  f'({100.0 * (p / base - 1.0):+.1f} %)')
+    if args.format != 'sym':
+        m.quant = True
+        m.qformat = args.format
+        p = ppl(m, ids)
+        bits = 5.0 if args.format == 'affine' else 4.5
+        print(f'{args.format:<12} {bits:7.2f} bits   ppl {p:8.3f}   '
+              f'({100.0 * (p / base - 1.0):+.1f} %)')
+    else:
+        for qbits in [int(x) for x in args.bits.split(',')]:
+            for g in [int(x) for x in args.groups.split(',')]:
+                m.quant = True
+                m.qgroup = g
+                m.qbits = qbits
+                m.qformat = 'sym'
+                p = ppl(m, ids)
+                bits = qbits + 16.0 / g
+                print(f'{"int" + str(qbits) + " g" + str(g):<12} {bits:7.2f} bits   ppl {p:8.3f}   '
+                      f'({100.0 * (p / base - 1.0):+.1f} %)')
 
 
 if __name__ == '__main__':
