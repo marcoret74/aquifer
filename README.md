@@ -68,6 +68,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
 - **Tool calling local (`tools` en `/v1/chat/completions`).** El modelo emite `<tool_call>{...}</tool_call>`; el servidor parsea (incluye reparación de JSON laxo), valida argumentos contra el esquema de la herramienta y devuelve `tool_calls` estilo OpenAI. Soporta `tool_choice` auto/none/forzado, mensajes `role:"tool"`, streaming bufferizado y `422 invalid_tool_call` con detalles. Sin ejecutar herramientas: eso queda en el orquestador.
 - **Ejecutor de herramientas local opt-in (`--local-tools`).** Registro seguro de funciones puras (`sumar`, `restar`, `multiplicar`, `dividir`, `ahora`, `fecha`, `contar`, `mayusculas`, `minusculas`, `eco`). `tool_execution: local|auto` ejecuta, valida argumentos y continúa la conversación hasta la respuesta; `client` mantiene el comportamiento de proponer y que ejecute el cliente. Sin shell, archivos ni red. `--max-tool-rounds` limita el bucle; `GET /v1/local-tools` lista el registro. Métrica: `aquifer_tool_local_calls_total`.
+- **Herramientas HTTP con allowlist (`--http-tools`).** El operador define URL, método, headers, timeout y esquema en un JSON; el cliente solo manda argumentos validados. Allowlist de hosts (loopback por default, soporta `*.dominio`), sin redirecciones, sin credenciales en URL, bloqueo de IPs privadas/link-local y tope de bytes. Catálogo en `GET /v1/http-tools`; ejecución con `tool_execution: local|auto`; métrica `aquifer_tool_http_calls_total`.
 - **Recibos HMAC por request (`--receipt-key`).** Firma un payload canónico con `request_id`, estado, tokens, latencias, hashes de prompt/conversación/esquema/respuesta y herramientas. Viaja en `x_aquifer.receipt`, headers y errores; `bundle.py verify-traces` y `verify` los comprueban. Sin clave, no hay recibo.
 - **Cadena de trazas append-only (`--trace-log` + `--trace-hmac-key`).** Cada traza enlaza el hash de la anterior (`seq`, `prev`, `sha256`) y opcionalmente se firma con HMAC. `bundle.py verify-traces` detecta borrados, alteraciones y reordenamientos; la cadena se reanuda tras reiniciar el servidor.
 - **Watchdog de generación (`--ttft-timeout`, `--token-timeout`, `--request-timeout`, `--command-timeout`).** Cada espera del motor tiene deadline. Si no hay tokens a tiempo, se manda `STOP`, se drena 5 s y, si no vuelve, se mata el proceso; el siguiente request lo reinicia. No-stream responde `504 generation_timeout`; streaming cierra con `finish_reason: "error"`. Métrica: `aquifer_timeouts_total`.
@@ -285,6 +286,7 @@ Rutas:
 | `GET` | `/v1/models` | Modelo servido, formato OpenAI. |
 | `GET` | `/v1/models/catalog` | Catálogo local de modelos disponibles. |
 | `GET` | `/v1/local-tools` | Herramientas locales disponibles (si `--local-tools`). |
+| `GET` | `/v1/http-tools` | Herramientas HTTP configuradas (si `--http-tools`). |
 | `POST` | `/v1/chat/completions` | Chat con `stream: true` o `false`. |
 
 ```bash
@@ -399,6 +401,52 @@ Pedido:
 - La respuesta final trae `x_aquifer.tool_trace` con las llamadas ejecutadas y
   `tool_rounds`/`tool_local_calls`. Métrica:
   `aquifer_tool_local_calls_total`.
+
+#### Herramientas HTTP con allowlist
+
+La configuración la define el operador, nunca el cliente:
+
+```json
+{
+  "tools": {
+    "consultar": {
+      "url": "http://127.0.0.1:9000/eco",
+      "method": "POST",
+      "timeout": 10,
+      "headers": {"Authorization": "Bearer ..."},
+      "description": "Devuelve el mismo texto que recibe.",
+      "parameters": {
+        "type": "object", "required": ["texto"],
+        "properties": {"texto": {"type": "string"}},
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+```bash
+python3 tools/serve.py --model qwen05 --http-tools tools.json \
+  --max-tool-rounds 2
+```
+
+- `--http-allow-host HOST` (repetible) define la allowlist; default
+  `127.0.0.1`, `localhost`, `::1`. También acepta `*.dominio`.
+- Solo `http`/`https`, sin credenciales embebidas; **sin redirecciones**.
+- Timeout por herramienta (`timeout`, máx. 60 s) y tope de respuesta
+  `--http-max-bytes` (default 64 KiB).
+- Hostnames que resuelven a IPs privadas, loopback o link-local se rechazan
+  (salvo loopback explícito), para evitar SSRF.
+- Headers y auth los define la config; el cliente no puede inyectarlos.
+  `Host`, `Content-Length`, `Transfer-Encoding` y `Connection` están prohibidos.
+- `GET /v1/http-tools` muestra el catálogo (sin URL ni headers).
+- `tool_execution: local|auto` ejecuta herramientas HTTP configuradas. Si la
+  herramienta no está en el registro: `422 tool_not_executable` en `local`, y
+  `tool_calls` en `auto`.
+- El `tool_trace` incluye `kind: "http"`, `status` y `duration_ms`. Métrica:
+  `aquifer_tool_http_calls_total`.
+- Si la config incluye headers/tokens, usala con permisos `600`; el servidor
+  avisa si es legible por otros.
 
 #### Métricas y trazas
 
@@ -529,7 +577,8 @@ aquifer_request_latency_ms_count 12
 
 También expone `aquifer_tokens_total{direction="prompt|completion"}`,
 `aquifer_schema_{retried,failed,streamed}_total`, `aquifer_tool_{requests,calls,local_calls}_total`,
-`aquifer_timeouts_total`, `aquifer_receipts_total`, `aquifer_compactions_total`,
+`aquifer_timeouts_total`, `aquifer_receipts_total`,
+`aquifer_tool_http_calls_total`, `aquifer_compactions_total`,
 `aquifer_requests_in_flight`, `aquifer_uptime_seconds` y `aquifer_info{model,ctx}`.
 Se puede apuntar Prometheus directo:
 

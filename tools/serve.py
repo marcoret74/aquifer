@@ -38,6 +38,7 @@ from chat import (MODELS_CATALOG, StreamDecoder, format_prompt,  # noqa: E402
                   get_model_config, start_engine, system_prompt_text)
 from structured import SchemaError, extract_json, validate  # noqa: E402
 import local_tools  # noqa: E402
+import http_tools  # noqa: E402
 import receipts  # noqa: E402
 
 SPECIAL_MARKERS = ("<|im_end|>", "<|endoftext|>", "<｜end", "<think>",
@@ -91,6 +92,7 @@ class Metrics:
         self.tool_requests = 0
         self.tool_calls = 0
         self.tool_local_calls = 0
+        self.tool_http_calls = 0
         self.tokens_in = 0
         self.tokens_out = 0
         self.by_status = {}
@@ -137,6 +139,7 @@ class Metrics:
             if trace.get("tool_calls"):
                 self.tool_calls += 1
             self.tool_local_calls += int(trace.get("tool_local_calls") or 0)
+            self.tool_http_calls += int(trace.get("tool_http_calls") or 0)
             if trace.get("error_type") == "generation_timeout":
                 self.timeouts += 1
             if trace.get("receipt"):
@@ -208,7 +211,8 @@ class Metrics:
                            "streamed": self.schema_streamed},
                 "tools": {"requests": self.tool_requests,
                           "calls": self.tool_calls,
-                          "local_calls": self.tool_local_calls},
+                          "local_calls": self.tool_local_calls,
+                          "http_calls": self.tool_http_calls},
                 "compactions": self.compactions,
                 "timeouts": self.timeouts,
                 "receipts": self.receipts,
@@ -241,6 +245,7 @@ class Metrics:
                 "tool_requests": self.tool_requests,
                 "tool_calls": self.tool_calls,
                 "tool_local_calls": self.tool_local_calls,
+                "tool_http_calls": self.tool_http_calls,
                 "timeouts": self.timeouts,
                 "receipts": self.receipts,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
@@ -280,6 +285,7 @@ class Metrics:
                 ("aquifer_tool_requests_total", "Peticiones con herramientas"),
                 ("aquifer_tool_calls_total", "Llamadas de herramienta emitidas"),
                 ("aquifer_tool_local_calls_total", "Herramientas ejecutadas localmente"),
+                ("aquifer_tool_http_calls_total", "Herramientas HTTP ejecutadas"),
                 ("aquifer_timeouts_total", "Generaciones cortadas por timeout"),
                 ("aquifer_receipts_total", "Requests con recibo firmado"),
                 ("aquifer_compactions_total", "Compactaciones de KV")):
@@ -297,6 +303,7 @@ class Metrics:
                    "aquifer_tool_requests_total": "tool_requests",
                    "aquifer_tool_calls_total": "tool_calls",
                    "aquifer_tool_local_calls_total": "tool_local_calls",
+                   "aquifer_tool_http_calls_total": "tool_http_calls",
                    "aquifer_timeouts_total": "timeouts",
                    "aquifer_receipts_total": "receipts",
                    "aquifer_compactions_total": "compactions"}[name]
@@ -793,6 +800,22 @@ class State:
         self.trace_lock = threading.Lock()
         self.local_tools = bool(getattr(args, "local_tools", False))
         self.max_tool_rounds = max(0, int(getattr(args, "max_tool_rounds", 2)))
+        self.http_tools = None
+        if getattr(args, "http_tools", None):
+            try:
+                self.http_tools = http_tools.HttpToolRegistry(
+                    args.http_tools,
+                    allow_hosts=getattr(args, "http_allow_host", None),
+                    default_timeout=getattr(args, "http_timeout", 15.0),
+                    max_bytes=getattr(args, "http_max_bytes", 65536))
+            except http_tools.ToolError as err:
+                raise SystemExit("http-tools: %s" % err)
+            clash = (set(self.http_tools.names()) &
+                     set(local_tools.names()))
+            if clash:
+                raise SystemExit(
+                    "http-tools: nombres en conflicto con el registro local: %s"
+                    % ", ".join(sorted(clash)))
         self.trace_hmac_key = None
         if getattr(args, "trace_hmac_key", None):
             with open(args.trace_hmac_key, "rb") as f:
@@ -950,7 +973,8 @@ class Handler(BaseHTTPRequestHandler):
                 "conversation_sha256", "response_format", "schema_name",
                 "schema_sha256", "schema_attempts", "compact", "tools",
                 "tool_choice", "tool_calls", "tool_name", "tool_attempts",
-                "tool_execution", "tool_rounds", "tool_local_calls", "ts",
+                "tool_execution", "tool_rounds", "tool_local_calls",
+                "tool_http_calls", "ts",
                 "response_sha256", "receipt")
         return {k: trace[k] for k in keys if trace.get(k) is not None}
 
@@ -995,6 +1019,12 @@ class Handler(BaseHTTPRequestHandler):
                 if self.state.local_tools:
                     self._send_json(200, {"enabled": True,
                                           "data": local_tools.catalog()})
+                else:
+                    self._send_json(200, {"enabled": False, "data": []})
+            elif path == "/v1/http-tools":
+                if self.state.http_tools:
+                    self._send_json(200, {"enabled": True,
+                                          "data": self.state.http_tools.catalog()})
                 else:
                     self._send_json(200, {"enabled": False, "data": []})
             elif path == "/v1/models":
@@ -1433,10 +1463,12 @@ class Handler(BaseHTTPRequestHandler):
         mode = body.get("tool_execution", "client")
         if mode not in ("client", "local", "auto"):
             raise ApiError(400, "tool_execution debe ser client|local|auto")
-        if mode != "client" and not self.state.local_tools:
+        if mode != "client" and not (self.state.local_tools or
+                                     self.state.http_tools):
             raise ApiError(403,
                            "ejecución local deshabilitada; arranca el servidor "
-                           "con --local-tools", "permission_error")
+                           "con --local-tools o --http-tools",
+                           "permission_error")
         return mode
 
     def _execute_local(self, call):
@@ -1452,6 +1484,23 @@ class Handler(BaseHTTPRequestHandler):
         try:
             result = local_tools.execute(name, args)
         except local_tools.ToolError as err:
+            raise ApiError(422, str(err), "tool_execution_error",
+                           details={"tool": name, "arguments": args})
+        return args, result
+
+    def _execute_http(self, call):
+        name = call["function"]["name"]
+        try:
+            args = json.loads(call["function"].get("arguments") or "{}")
+        except ValueError:
+            raise ApiError(422, "argumentos de herramienta inválidos",
+                           "invalid_tool_call")
+        if not isinstance(args, dict):
+            raise ApiError(422, "arguments debe ser un objeto",
+                           "invalid_tool_call")
+        try:
+            result = self.state.http_tools.execute(name, args)
+        except http_tools.ToolError as err:
             raise ApiError(422, str(err), "tool_execution_error",
                            details={"tool": name, "arguments": args})
         return args, result
@@ -1478,20 +1527,41 @@ class Handler(BaseHTTPRequestHandler):
             if not call:
                 return text, None, gen, tokens, executed
             name = call["function"]["name"]
-            if not local_tools.has(name):
+            kind = None
+            if local_tools.has(name):
+                kind = "builtin"
+            elif self.state.http_tools and self.state.http_tools.has(name):
+                kind = "http"
+            if kind is None:
+                available = list(local_tools.names())
+                if self.state.http_tools:
+                    available += self.state.http_tools.names()
                 if mode == "auto":
                     return text, call, gen, tokens, executed
                 raise ApiError(
                     422,
-                    "la herramienta '%s' no está en el registro local" % name,
+                    "la herramienta '%s' no está en el registro del servidor"
+                    % name,
                     "tool_not_executable",
-                    details={"tool": name, "available": local_tools.names()})
+                    details={"tool": name,
+                             "available": sorted(set(available))})
             if rounds >= max_rounds:
                 return text, call, gen, tokens, executed
-            args, result = self._execute_local(call)
+            if kind == "builtin":
+                args, result = self._execute_local(call)
+                entry = {"kind": "builtin", "name": name, "arguments": args,
+                         "result": result}
+                result_text = self._tool_result_text(result)
+            else:
+                args, result = self._execute_http(call)
+                entry = {"kind": "http", "name": name, "arguments": args,
+                         "result": result["result"],
+                         "status": result["status"],
+                         "duration_ms": result["duration_ms"]}
+                result_text = self._tool_result_text(result["result"])
+                trace["tool_http_calls"] = trace.get("tool_http_calls", 0) + 1
             rounds += 1
-            executed.append({"name": name, "arguments": args,
-                             "result": result})
+            executed.append(entry)
             trace["tool_local_calls"] = len(executed)
             marker = "<tool_call>" + json.dumps(
                 {"name": name, "arguments": args}, ensure_ascii=False,
@@ -1499,7 +1569,7 @@ class Handler(BaseHTTPRequestHandler):
             current = list(current) + [
                 ("assistant", marker),
                 ("user", "[Resultado de herramienta %s]\n%s" %
-                 (call["id"], self._tool_result_text(result))),
+                 (call["id"], result_text)),
             ]
 
     def _corrective(self, errors, fmt, raw):
@@ -1832,6 +1902,8 @@ class Handler(BaseHTTPRequestHandler):
             trace["tool_calls"] = 1 if call else 0
             trace["tool_rounds"] = len(executed)
             trace["tool_local_calls"] = len(executed)
+            trace["tool_http_calls"] = sum(
+                1 for entry in executed if entry.get("kind") == "http")
             finish = "tool_calls" if call else gen.finish
             trace["finish_reason"] = finish
             content = None if call else raw_text.strip()
@@ -1956,6 +2028,16 @@ def build_parser(repo_dir):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--repeat-penalty", type=float, default=1.0)
     ap.add_argument("--repeat-last-n", type=int, default=64)
+    ap.add_argument("--http-tools", default=None, metavar="JSON",
+                    help="Configuración JSON de herramientas HTTP (allowlist)")
+    ap.add_argument("--http-allow-host", action="append", default=None,
+                    metavar="HOST",
+                    help="Host permitido para herramientas HTTP (repetible; "
+                         "default loopback)")
+    ap.add_argument("--http-timeout", type=float, default=15.0,
+                    help="Timeout por defecto de herramientas HTTP (segundos)")
+    ap.add_argument("--http-max-bytes", type=int, default=65536,
+                    help="Tamaño máximo de respuesta HTTP (bytes)")
     ap.add_argument("--local-tools", action="store_true",
                     help="Habilita el registro de herramientas locales seguras")
     ap.add_argument("--max-tool-rounds", type=int, default=2,

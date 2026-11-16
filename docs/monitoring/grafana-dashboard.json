@@ -520,6 +520,15 @@
           "expr": "sum(rate(aquifer_receipts_total[$__rate_interval]))",
           "legendFormat": "receipts",
           "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(aquifer_tool_http_calls_total[$__rate_interval]))",
+          "legendFormat": "http tools",
+          "refId": "G"
         }
       ]
     },

@@ -82,6 +82,8 @@ test: tests
 	@echo ""
 	@python3 tools/test_local_tools.py
 	@echo ""
+	@python3 tools/test_http_tools.py
+	@echo ""
 	@python3 tools/test_receipts.py
 	@echo ""
 	@python3 tools/test_watchdog.py
