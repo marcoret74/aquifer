@@ -32,6 +32,7 @@ def main():
         "latency_ms": 120.0, "ttft_ms": 40.0, "schema_attempts": 1,
         "compact": {"status": "ok", "kept": 50},
         "tools": ["sumar"], "tool_calls": 1, "tool_name": "sumar",
+        "tool_local_calls": 1,
     })
     m.begin()
     m.record({
@@ -95,7 +96,8 @@ def main():
     snap = m.snapshot()
     check("snapshot in_flight", snap["requests"]["in_flight"] == 0)
     check("snapshot schema", snap["schema"]["failed"] == 2)
-    check("snapshot tools", snap["tools"] == {"requests": 1, "calls": 1},
+    check("snapshot tools", snap["tools"] == {"requests": 1, "calls": 1,
+                                              "local_calls": 1},
           snap.get("tools"))
 
     if FAILED:

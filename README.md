@@ -67,6 +67,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Compactación con KV (`COMPACT`).** Al llenarse el contexto, en vez de resetear todo el KV y re-prellenar el historial, el motor conserva el system prompt y mueve al frente la cola que coincide con el prompt recortado. Las claves ya calculadas no se recalculan ni se re-rotan: se ajusta `pos_base` (desplazamiento RoPE) para que los tokens conservados mantengan su posición absoluta. Medido en Qwen 0.5B con `ctx 256`: 132 ms de TTFT tras compactar contra 1423 ms del reset completo. `--no-kv-compact` recupera el comportamiento anterior.
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
 - **Tool calling local (`tools` en `/v1/chat/completions`).** El modelo emite `<tool_call>{...}</tool_call>`; el servidor parsea (incluye reparación de JSON laxo), valida argumentos contra el esquema de la herramienta y devuelve `tool_calls` estilo OpenAI. Soporta `tool_choice` auto/none/forzado, mensajes `role:"tool"`, streaming bufferizado y `422 invalid_tool_call` con detalles. Sin ejecutar herramientas: eso queda en el orquestador.
+- **Ejecutor de herramientas local opt-in (`--local-tools`).** Registro seguro de funciones puras (`sumar`, `restar`, `multiplicar`, `dividir`, `ahora`, `fecha`, `contar`, `mayusculas`, `minusculas`, `eco`). `tool_execution: local|auto` ejecuta, valida argumentos y continúa la conversación hasta la respuesta; `client` mantiene el comportamiento de proponer y que ejecute el cliente. Sin shell, archivos ni red. `--max-tool-rounds` limita el bucle; `GET /v1/local-tools` lista el registro. Métrica: `aquifer_tool_local_calls_total`.
 - **Cadena de trazas append-only (`--trace-log` + `--trace-hmac-key`).** Cada traza enlaza el hash de la anterior (`seq`, `prev`, `sha256`) y opcionalmente se firma con HMAC. `bundle.py verify-traces` detecta borrados, alteraciones y reordenamientos; la cadena se reanuda tras reiniciar el servidor.
 - **Watchdog de generación (`--ttft-timeout`, `--token-timeout`, `--request-timeout`, `--command-timeout`).** Cada espera del motor tiene deadline. Si no hay tokens a tiempo, se manda `STOP`, se drena 5 s y, si no vuelve, se mata el proceso; el siguiente request lo reinicia. No-stream responde `504 generation_timeout`; streaming cierra con `finish_reason: "error"`. Métrica: `aquifer_timeouts_total`.
 - **Métricas y trazas por request (`/metrics`, `/metrics/prometheus`, `--trace-log`).** Cada llamada registra latencia total, TTFT, cola, tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256 de prompt, conversación y esquema, intentos de esquema y compactaciones de KV. Agregados en `/metrics` (p50/p95) y `/metrics/prometheus` (histogramas, contadores, in-flight), y traza JSONL opcional con `--trace-log` (`--trace-content` para incluir la respuesta). Pensado para auditar pilotos y depurar el orquestador.
@@ -282,6 +283,7 @@ Rutas:
 | `GET` | `/metrics/prometheus` | Mismo estado en formato Prometheus 0.0.4 (`?format=prometheus` también). |
 | `GET` | `/v1/models` | Modelo servido, formato OpenAI. |
 | `GET` | `/v1/models/catalog` | Catálogo local de modelos disponibles. |
+| `GET` | `/v1/local-tools` | Herramientas locales disponibles (si `--local-tools`). |
 | `POST` | `/v1/chat/completions` | Chat con `stream: true` o `false`. |
 
 ```bash
@@ -357,6 +359,45 @@ y el servidor devuelve formato OpenAI:
 - Se aceptan claves sin comillas o comillas simples en el JSON generado
   (`{a:10,b:5}`) y se reparan antes de validar.
 - Métricas: `aquifer_tool_requests_total`, `aquifer_tool_calls_total`.
+
+#### Ejecución local de herramientas (opt-in)
+
+El servidor puede ejecutar un registro pequeño de herramientas seguras. Está
+deshabilitado por defecto y **no ejecuta shell, archivos ni red**:
+
+```bash
+python3 tools/serve.py --model qwen05 --local-tools --max-tool-rounds 2
+```
+
+Pedido:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Usa sumar con a=2 y b=8."}],
+  "tools": [{"type": "function", "function": {
+    "name": "sumar", "description": "Suma dos números.",
+    "parameters": {"type": "object", "required": ["a", "b"],
+      "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+      "additionalProperties": false}}}],
+  "tool_execution": "local"
+}
+```
+
+- `tool_execution`: `client` (default, el cliente ejecuta), `local` o `auto`.
+  - `local`: ejecuta si la herramienta está en el registro; si no, `422
+    tool_not_executable`.
+  - `auto`: ejecuta si está en el registro; si no, devuelve `tool_calls` al
+    cliente.
+  - Sin `--local-tools`: `403 permission_error`.
+- Registro: `sumar`, `restar`, `multiplicar`, `dividir`, `ahora`, `fecha`,
+  `contar`, `mayusculas`, `minusculas`, `eco`. Se consulta en
+  `GET /v1/local-tools`.
+- Los argumentos se validan contra el esquema del registro antes de ejecutar.
+- Se permiten hasta `--max-tool-rounds` ejecuciones por request. Si el modelo
+  pide otra, se devuelve esa llamada al cliente.
+- La respuesta final trae `x_aquifer.tool_trace` con las llamadas ejecutadas y
+  `tool_rounds`/`tool_local_calls`. Métrica:
+  `aquifer_tool_local_calls_total`.
 
 #### Métricas y trazas
 
@@ -452,7 +493,7 @@ aquifer_request_latency_ms_count 12
 ```
 
 También expone `aquifer_tokens_total{direction="prompt|completion"}`,
-`aquifer_schema_{retried,failed,streamed}_total`, `aquifer_tool_{requests,calls}_total`,
+`aquifer_schema_{retried,failed,streamed}_total`, `aquifer_tool_{requests,calls,local_calls}_total`,
 `aquifer_timeouts_total`, `aquifer_compactions_total`,
 `aquifer_requests_in_flight`, `aquifer_uptime_seconds` y `aquifer_info{model,ctx}`.
 Se puede apuntar Prometheus directo:

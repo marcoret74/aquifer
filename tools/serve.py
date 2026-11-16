@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chat import (MODELS_CATALOG, StreamDecoder, format_prompt,  # noqa: E402
                   get_model_config, start_engine, system_prompt_text)
 from structured import SchemaError, extract_json, validate  # noqa: E402
+import local_tools  # noqa: E402
 
 SPECIAL_MARKERS = ("<|im_end|>", "<|endoftext|>", "<｜end", "<think>",
                    "</s>", "<|user|>", "<|assistant|>")
@@ -87,6 +88,7 @@ class Metrics:
         self.timeouts = 0
         self.tool_requests = 0
         self.tool_calls = 0
+        self.tool_local_calls = 0
         self.tokens_in = 0
         self.tokens_out = 0
         self.by_status = {}
@@ -132,6 +134,7 @@ class Metrics:
                 self.tool_requests += 1
             if trace.get("tool_calls"):
                 self.tool_calls += 1
+            self.tool_local_calls += int(trace.get("tool_local_calls") or 0)
             if trace.get("error_type") == "generation_timeout":
                 self.timeouts += 1
             self.tokens_in += int(trace.get("prompt_tokens") or 0)
@@ -200,7 +203,8 @@ class Metrics:
                            "failed": self.schema_failed,
                            "streamed": self.schema_streamed},
                 "tools": {"requests": self.tool_requests,
-                          "calls": self.tool_calls},
+                          "calls": self.tool_calls,
+                          "local_calls": self.tool_local_calls},
                 "compactions": self.compactions,
                 "timeouts": self.timeouts,
             }
@@ -231,6 +235,7 @@ class Metrics:
                 "compactions": self.compactions,
                 "tool_requests": self.tool_requests,
                 "tool_calls": self.tool_calls,
+                "tool_local_calls": self.tool_local_calls,
                 "timeouts": self.timeouts,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
                 "in_flight": self.in_flight,
@@ -268,6 +273,7 @@ class Metrics:
                 ("aquifer_schema_streamed_total", "Salidas estructuradas en streaming"),
                 ("aquifer_tool_requests_total", "Peticiones con herramientas"),
                 ("aquifer_tool_calls_total", "Llamadas de herramienta emitidas"),
+                ("aquifer_tool_local_calls_total", "Herramientas ejecutadas localmente"),
                 ("aquifer_timeouts_total", "Generaciones cortadas por timeout"),
                 ("aquifer_compactions_total", "Compactaciones de KV")):
             kind = "gauge" if name.endswith("in_flight") else "counter"
@@ -283,6 +289,7 @@ class Metrics:
                    "aquifer_schema_streamed_total": "schema_streamed",
                    "aquifer_tool_requests_total": "tool_requests",
                    "aquifer_tool_calls_total": "tool_calls",
+                   "aquifer_tool_local_calls_total": "tool_local_calls",
                    "aquifer_timeouts_total": "timeouts",
                    "aquifer_compactions_total": "compactions"}[name]
             add("%s %d" % (name, data[key]))
@@ -776,6 +783,8 @@ class State:
         self.trace_path = args.trace_log
         self.trace_content = args.trace_content
         self.trace_lock = threading.Lock()
+        self.local_tools = bool(getattr(args, "local_tools", False))
+        self.max_tool_rounds = max(0, int(getattr(args, "max_tool_rounds", 2)))
         self.trace_hmac_key = None
         if getattr(args, "trace_hmac_key", None):
             with open(args.trace_hmac_key, "rb") as f:
@@ -911,7 +920,8 @@ class Handler(BaseHTTPRequestHandler):
                 "tokens_per_s", "finish_reason", "prompt_sha256",
                 "conversation_sha256", "response_format", "schema_name",
                 "schema_sha256", "schema_attempts", "compact", "tools",
-                "tool_choice", "tool_calls", "tool_name", "tool_attempts")
+                "tool_choice", "tool_calls", "tool_name", "tool_attempts",
+                "tool_execution", "tool_rounds", "tool_local_calls")
         return {k: trace[k] for k in keys if trace.get(k) is not None}
 
     # --- rutas -------------------------------------------------------------
@@ -951,6 +961,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(200, snap)
             elif path.startswith("/v1/") and not self._auth():
                 raise ApiError(401, "API key inválida", "authentication_error")
+            elif path == "/v1/local-tools":
+                if self.state.local_tools:
+                    self._send_json(200, {"enabled": True,
+                                          "data": local_tools.catalog()})
+                else:
+                    self._send_json(200, {"enabled": False, "data": []})
             elif path == "/v1/models":
                 self._send_json(200, {"object": "list", "data": [{
                     "id": self.state.model,
@@ -1382,6 +1398,80 @@ class Handler(BaseHTTPRequestHandler):
             details={"attempts": attempt, "errors": errors,
                      "content": (text or "")[-2000:]})
 
+    # --- ejecución local de herramientas ----------------------------------
+    def _tool_execution(self, body):
+        mode = body.get("tool_execution", "client")
+        if mode not in ("client", "local", "auto"):
+            raise ApiError(400, "tool_execution debe ser client|local|auto")
+        if mode != "client" and not self.state.local_tools:
+            raise ApiError(403,
+                           "ejecución local deshabilitada; arranca el servidor "
+                           "con --local-tools", "permission_error")
+        return mode
+
+    def _execute_local(self, call):
+        name = call["function"]["name"]
+        try:
+            args = json.loads(call["function"].get("arguments") or "{}")
+        except ValueError:
+            raise ApiError(422, "argumentos de herramienta inválidos",
+                           "invalid_tool_call")
+        if not isinstance(args, dict):
+            raise ApiError(422, "arguments debe ser un objeto",
+                           "invalid_tool_call")
+        try:
+            result = local_tools.execute(name, args)
+        except local_tools.ToolError as err:
+            raise ApiError(422, str(err), "tool_execution_error",
+                           details={"tool": name, "arguments": args})
+        return args, result
+
+    @staticmethod
+    def _tool_result_text(result):
+        if isinstance(result, str):
+            return result
+        return json.dumps(result, ensure_ascii=False)
+
+    def _tool_loop(self, history, system_text, opts, specs, choice, mode,
+                   trace):
+        """Genera, ejecuta herramientas locales y continúa hasta la respuesta."""
+        rounds = 0
+        executed = []
+        current = list(history)
+        max_rounds = max(0, int(self.state.max_tool_rounds))
+        while True:
+            call, text, gen, attempts, tokens = self._tool_generation(
+                current, system_text, opts, specs, choice, trace)
+            if gen.error:
+                raise ApiError(504, "tiempo de generación agotado",
+                               "generation_timeout")
+            if not call:
+                return text, None, gen, tokens, executed
+            name = call["function"]["name"]
+            if not local_tools.has(name):
+                if mode == "auto":
+                    return text, call, gen, tokens, executed
+                raise ApiError(
+                    422,
+                    "la herramienta '%s' no está en el registro local" % name,
+                    "tool_not_executable",
+                    details={"tool": name, "available": local_tools.names()})
+            if rounds >= max_rounds:
+                return text, call, gen, tokens, executed
+            args, result = self._execute_local(call)
+            rounds += 1
+            executed.append({"name": name, "arguments": args,
+                             "result": result})
+            trace["tool_local_calls"] = len(executed)
+            marker = "<tool_call>" + json.dumps(
+                {"name": name, "arguments": args}, ensure_ascii=False,
+                separators=(",", ":")) + "</tool_call>"
+            current = list(current) + [
+                ("assistant", marker),
+                ("user", "[Resultado de herramienta %s]\n%s" %
+                 (call["id"], self._tool_result_text(result))),
+            ]
+
     def _corrective(self, errors, fmt, raw):
         parts = ["Tu respuesta anterior no cumplió el formato exigido."]
         snippet = (raw or "").strip()
@@ -1617,6 +1707,7 @@ class Handler(BaseHTTPRequestHandler):
         opts = self._opts(body)
         system_text, history = self._prompt(body, opts)
         tool_specs, tool_choice = self._tools(body)
+        tool_execution = self._tool_execution(body)
         tool_mode = bool(tool_specs) and tool_choice != "none"
         if fmt and tool_mode:
             raise ApiError(400, "response_format y tools no se combinan")
@@ -1669,10 +1760,22 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if tool_mode:
-            call, raw_text, gen, attempts, tokens = self._tool_generation(
-                history, system_text, opts, tool_specs, tool_choice, trace)
+            if tool_execution == "client":
+                call, raw_text, gen, attempts, tokens = self._tool_generation(
+                    history, system_text, opts, tool_specs, tool_choice, trace)
+                executed = []
+            else:
+                raw_text, call, gen, tokens, executed = self._tool_loop(
+                    history, system_text, opts, tool_specs, tool_choice,
+                    tool_execution, trace)
+            if gen.error:
+                raise ApiError(504, "tiempo de generación agotado",
+                               "generation_timeout")
             self._stamp(trace, gen)
+            trace["tool_execution"] = tool_execution
             trace["tool_calls"] = 1 if call else 0
+            trace["tool_rounds"] = len(executed)
+            trace["tool_local_calls"] = len(executed)
             finish = "tool_calls" if call else gen.finish
             trace["finish_reason"] = finish
             content = None if call else raw_text.strip()
@@ -1681,6 +1784,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.state.trace_content:
                 trace["content"] = raw_text
             meta = self._public_trace(trace)
+            if executed:
+                meta["tool_trace"] = executed
             if not stream:
                 self._send_completion(
                     cid, created, content, gen, tokens, meta, trace,
@@ -1786,6 +1891,10 @@ def build_parser(repo_dir):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--repeat-penalty", type=float, default=1.0)
     ap.add_argument("--repeat-last-n", type=int, default=64)
+    ap.add_argument("--local-tools", action="store_true",
+                    help="Habilita el registro de herramientas locales seguras")
+    ap.add_argument("--max-tool-rounds", type=int, default=2,
+                    help="Máximo de herramientas locales ejecutadas por request")
     ap.add_argument("--token-timeout", type=float, default=45.0,
                     help="Segundos máximos entre tokens durante la generación")
     ap.add_argument("--ttft-timeout", type=float, default=120.0,

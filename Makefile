@@ -80,6 +80,8 @@ test: tests
 	@echo ""
 	@python3 tools/test_tools.py
 	@echo ""
+	@python3 tools/test_local_tools.py
+	@echo ""
 	@python3 tools/test_watchdog.py
 	@echo ""
 	@echo ">>> TODOS LOS TESTS DE AQUIFER PASARON CON ÉXITO <<<"
