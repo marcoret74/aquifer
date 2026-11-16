@@ -189,4 +189,5 @@ docker compose -f deploy/docker-compose.yml up -d
 ```
 
 Monitoreo: ver [`docs/monitoring/`](../docs/monitoring/).
+Dimensionamiento: ver [`docs/deploy/SIZING.md`](../docs/deploy/SIZING.md).
 Demo de piloto: ver [`docs/pilot/`](../docs/pilot/).

@@ -704,6 +704,8 @@ Juez: solo extracción y validación genérica.
 - Hardening, variables y operación: [`deploy/README.md`](deploy/README.md).
 - Checklist de despliegue del piloto:
   [`docs/deploy/CHECKLIST-PILOTO.md`](docs/deploy/CHECKLIST-PILOTO.md).
+- Dimensionamiento y prueba de carga:
+  [`docs/deploy/SIZING.md`](docs/deploy/SIZING.md).
 
 El servidor sigue siendo el mismo `tools/serve.py`: el empaquetado solo agrega
 un wrapper de configuración, unidades de servicio y una imagen.

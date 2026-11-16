@@ -34,6 +34,9 @@ esta máquina (i7-10510U, 4C/8T, AVX2) y de los tamaños reales de los artefacto
 - [ ] Fuente estable y temperatura controlada si es un notebook.
 - [ ] Reloj sincronizado (NTP/chrony): los recibos y trazas llevan timestamp.
 
+Para medir el hardware con carga controlada, ver
+[`SIZING.md`](SIZING.md).
+
 Comandos de verificación:
 
 ```bash
