@@ -135,6 +135,9 @@ def main():
 
         expect_error("HTTP 500", lambda: reg.execute("fail", {}), "HTTP 500")
         expect_error("timeout", lambda: reg.execute("slow", {}), "fallo HTTP")
+        expect_error("timeout cap",
+                     lambda: reg.execute("slow", {}, timeout_cap=0.1),
+                     "fallo HTTP")
         expect_error("redirect", lambda: reg.execute("redirect", {}), "HTTP 302")
 
         result = reg.execute("big", {})

@@ -93,6 +93,7 @@ class Metrics:
         self.tool_calls = 0
         self.tool_local_calls = 0
         self.tool_http_calls = 0
+        self.tool_budget_exceeded = 0
         self.tokens_in = 0
         self.tokens_out = 0
         self.by_status = {}
@@ -140,6 +141,8 @@ class Metrics:
                 self.tool_calls += 1
             self.tool_local_calls += int(trace.get("tool_local_calls") or 0)
             self.tool_http_calls += int(trace.get("tool_http_calls") or 0)
+            if trace.get("tool_budget_exceeded"):
+                self.tool_budget_exceeded += 1
             if trace.get("error_type") == "generation_timeout":
                 self.timeouts += 1
             if trace.get("receipt"):
@@ -212,7 +215,8 @@ class Metrics:
                 "tools": {"requests": self.tool_requests,
                           "calls": self.tool_calls,
                           "local_calls": self.tool_local_calls,
-                          "http_calls": self.tool_http_calls},
+                          "http_calls": self.tool_http_calls,
+                          "budget_exceeded": self.tool_budget_exceeded},
                 "compactions": self.compactions,
                 "timeouts": self.timeouts,
                 "receipts": self.receipts,
@@ -246,6 +250,7 @@ class Metrics:
                 "tool_calls": self.tool_calls,
                 "tool_local_calls": self.tool_local_calls,
                 "tool_http_calls": self.tool_http_calls,
+                "tool_budget_exceeded": self.tool_budget_exceeded,
                 "timeouts": self.timeouts,
                 "receipts": self.receipts,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
@@ -286,6 +291,8 @@ class Metrics:
                 ("aquifer_tool_calls_total", "Llamadas de herramienta emitidas"),
                 ("aquifer_tool_local_calls_total", "Herramientas ejecutadas localmente"),
                 ("aquifer_tool_http_calls_total", "Herramientas HTTP ejecutadas"),
+                ("aquifer_tool_budget_exceeded_total",
+                 "Cadenas de herramientas cortadas por presupuesto"),
                 ("aquifer_timeouts_total", "Generaciones cortadas por timeout"),
                 ("aquifer_receipts_total", "Requests con recibo firmado"),
                 ("aquifer_compactions_total", "Compactaciones de KV")):
@@ -304,6 +311,7 @@ class Metrics:
                    "aquifer_tool_calls_total": "tool_calls",
                    "aquifer_tool_local_calls_total": "tool_local_calls",
                    "aquifer_tool_http_calls_total": "tool_http_calls",
+                   "aquifer_tool_budget_exceeded_total": "tool_budget_exceeded",
                    "aquifer_timeouts_total": "timeouts",
                    "aquifer_receipts_total": "receipts",
                    "aquifer_compactions_total": "compactions"}[name]
@@ -800,6 +808,7 @@ class State:
         self.trace_lock = threading.Lock()
         self.local_tools = bool(getattr(args, "local_tools", False))
         self.max_tool_rounds = max(0, int(getattr(args, "max_tool_rounds", 2)))
+        self.tool_budget_ms = max(0, int(getattr(args, "tool_budget_ms", 15000)))
         self.http_tools = None
         if getattr(args, "http_tools", None):
             try:
@@ -974,7 +983,8 @@ class Handler(BaseHTTPRequestHandler):
                 "schema_sha256", "schema_attempts", "compact", "tools",
                 "tool_choice", "tool_calls", "tool_name", "tool_attempts",
                 "tool_execution", "tool_rounds", "tool_local_calls",
-                "tool_http_calls", "ts",
+                "tool_http_calls", "tool_budget_ms", "tool_budget_exceeded",
+                "tool_rounds_exceeded", "ts",
                 "response_sha256", "receipt")
         return {k: trace[k] for k in keys if trace.get(k) is not None}
 
@@ -1488,7 +1498,7 @@ class Handler(BaseHTTPRequestHandler):
                            details={"tool": name, "arguments": args})
         return args, result
 
-    def _execute_http(self, call):
+    def _execute_http(self, call, timeout_cap=None):
         name = call["function"]["name"]
         try:
             args = json.loads(call["function"].get("arguments") or "{}")
@@ -1499,7 +1509,8 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(422, "arguments debe ser un objeto",
                            "invalid_tool_call")
         try:
-            result = self.state.http_tools.execute(name, args)
+            result = self.state.http_tools.execute(name, args,
+                                                   timeout_cap=timeout_cap)
         except http_tools.ToolError as err:
             raise ApiError(422, str(err), "tool_execution_error",
                            details={"tool": name, "arguments": args})
@@ -1518,6 +1529,10 @@ class Handler(BaseHTTPRequestHandler):
         executed = []
         current = list(history)
         max_rounds = max(0, int(self.state.max_tool_rounds))
+        budget_ms = self.state.tool_budget_ms
+        budget_start = time.monotonic()
+        if budget_ms > 0:
+            trace["tool_budget_ms"] = budget_ms
         while True:
             call, text, gen, attempts, tokens = self._tool_generation(
                 current, system_text, opts, specs, choice, trace)
@@ -1546,14 +1561,32 @@ class Handler(BaseHTTPRequestHandler):
                     details={"tool": name,
                              "available": sorted(set(available))})
             if rounds >= max_rounds:
+                trace["tool_rounds_exceeded"] = True
                 return text, call, gen, tokens, executed
+            remaining_ms = None
+            if budget_ms > 0:
+                remaining_ms = budget_ms - (time.monotonic() -
+                                            budget_start) * 1000.0
+                if remaining_ms < 50:
+                    trace["tool_budget_exceeded"] = True
+                    return text, call, gen, tokens, executed
             if kind == "builtin":
                 args, result = self._execute_local(call)
                 entry = {"kind": "builtin", "name": name, "arguments": args,
                          "result": result}
                 result_text = self._tool_result_text(result)
             else:
-                args, result = self._execute_http(call)
+                try:
+                    args, result = self._execute_http(
+                        call, timeout_cap=(remaining_ms / 1000.0)
+                        if remaining_ms is not None else None)
+                except ApiError:
+                    if (budget_ms > 0 and
+                            (time.monotonic() - budget_start) * 1000.0
+                            >= budget_ms - 50):
+                        trace["tool_budget_exceeded"] = True
+                        return text, call, gen, tokens, executed
+                    raise
                 entry = {"kind": "http", "name": name, "arguments": args,
                          "result": result["result"],
                          "status": result["status"],
@@ -1561,6 +1594,9 @@ class Handler(BaseHTTPRequestHandler):
                 result_text = self._tool_result_text(result["result"])
                 trace["tool_http_calls"] = trace.get("tool_http_calls", 0) + 1
             rounds += 1
+            entry["round"] = rounds
+            entry["elapsed_ms"] = round(
+                (time.monotonic() - budget_start) * 1000.0, 1)
             executed.append(entry)
             trace["tool_local_calls"] = len(executed)
             marker = "<tool_call>" + json.dumps(
@@ -1904,6 +1940,8 @@ class Handler(BaseHTTPRequestHandler):
             trace["tool_local_calls"] = len(executed)
             trace["tool_http_calls"] = sum(
                 1 for entry in executed if entry.get("kind") == "http")
+            if self.state.tool_budget_ms > 0:
+                trace["tool_budget_ms"] = self.state.tool_budget_ms
             finish = "tool_calls" if call else gen.finish
             trace["finish_reason"] = finish
             content = None if call else raw_text.strip()
@@ -2040,6 +2078,9 @@ def build_parser(repo_dir):
                     help="Tamaño máximo de respuesta HTTP (bytes)")
     ap.add_argument("--local-tools", action="store_true",
                     help="Habilita el registro de herramientas locales seguras")
+    ap.add_argument("--tool-budget-ms", type=int, default=15000,
+                    help="Presupuesto total (ms) para ejecutar herramientas "
+                         "server-side por request (0 = sin límite)")
     ap.add_argument("--max-tool-rounds", type=int, default=2,
                     help="Máximo de herramientas locales ejecutadas por request")
     ap.add_argument("--token-timeout", type=float, default=45.0,

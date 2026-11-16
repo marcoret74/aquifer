@@ -178,7 +178,7 @@ class HttpToolRegistry:
             },
         } for name, spec in sorted(self.tools.items())]
 
-    def execute(self, name, args):
+    def execute(self, name, args, timeout_cap=None):
         spec = self.tools.get(name)
         if spec is None:
             raise ToolError("herramienta HTTP desconocida: %s" % name)
@@ -206,9 +206,12 @@ class HttpToolRegistry:
         for key, value in spec["headers"].items():
             req.add_header(key, value)
 
+        timeout = spec["timeout"]
+        if timeout_cap is not None:
+            timeout = max(0.1, min(timeout, float(timeout_cap)))
         started = time.monotonic()
         try:
-            with self.opener.open(req, timeout=spec["timeout"]) as resp:
+            with self.opener.open(req, timeout=timeout) as resp:
                 raw = resp.read(self.max_bytes + 1)
                 status = getattr(resp, "status", 200)
                 ctype = resp.headers.get("Content-Type", "")

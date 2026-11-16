@@ -69,6 +69,9 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Tool calling local (`tools` en `/v1/chat/completions`).** El modelo emite `<tool_call>{...}</tool_call>`; el servidor parsea (incluye reparación de JSON laxo), valida argumentos contra el esquema de la herramienta y devuelve `tool_calls` estilo OpenAI. Soporta `tool_choice` auto/none/forzado, mensajes `role:"tool"`, streaming bufferizado y `422 invalid_tool_call` con detalles. Sin ejecutar herramientas: eso queda en el orquestador.
 - **Ejecutor de herramientas local opt-in (`--local-tools`).** Registro seguro de funciones puras (`sumar`, `restar`, `multiplicar`, `dividir`, `ahora`, `fecha`, `contar`, `mayusculas`, `minusculas`, `eco`). `tool_execution: local|auto` ejecuta, valida argumentos y continúa la conversación hasta la respuesta; `client` mantiene el comportamiento de proponer y que ejecute el cliente. Sin shell, archivos ni red. `--max-tool-rounds` limita el bucle; `GET /v1/local-tools` lista el registro. Métrica: `aquifer_tool_local_calls_total`.
 - **Herramientas HTTP con allowlist (`--http-tools`).** El operador define URL, método, headers, timeout y esquema en un JSON; el cliente solo manda argumentos validados. Allowlist de hosts (loopback por default, soporta `*.dominio`), sin redirecciones, sin credenciales en URL, bloqueo de IPs privadas/link-local y tope de bytes. Catálogo en `GET /v1/http-tools`; ejecución con `tool_execution: local|auto`; métrica `aquifer_tool_http_calls_total`.
+- **Presupuesto de cadena multi-herramienta (`--tool-budget-ms`).** Además de `--max-tool-rounds`, el servidor limita el tiempo total de la cadena (default 15 s). Cada ejecución lleva `round` y `elapsed_ms`; si se agota, devuelve la llamada pendiente con `tool_budget_exceeded` y lo cuenta en `aquifer_tool_budget_exceeded_total`.
+- **Verificación end-to-end (`tools/verify.py`).** Un comando valida bundle, hashes, conversación, firma, cadena de trazas, recibos y cadena de padres, con salida legible o `--json` para el orquestador.
+- **Demo de piloto (`docs/pilot/`).** Mock HTTP local de clima, config allowlisted, script `demo.sh` y guion de 5 minutos. Sin lógica legal en el repo.
 - **Recibos HMAC por request (`--receipt-key`).** Firma un payload canónico con `request_id`, estado, tokens, latencias, hashes de prompt/conversación/esquema/respuesta y herramientas. Viaja en `x_aquifer.receipt`, headers y errores; `bundle.py verify-traces` y `verify` los comprueban. Sin clave, no hay recibo.
 - **Cadena de trazas append-only (`--trace-log` + `--trace-hmac-key`).** Cada traza enlaza el hash de la anterior (`seq`, `prev`, `sha256`) y opcionalmente se firma con HMAC. `bundle.py verify-traces` detecta borrados, alteraciones y reordenamientos; la cadena se reanuda tras reiniciar el servidor.
 - **Watchdog de generación (`--ttft-timeout`, `--token-timeout`, `--request-timeout`, `--command-timeout`).** Cada espera del motor tiene deadline. Si no hay tokens a tiempo, se manda `STOP`, se drena 5 s y, si no vuelve, se mata el proceso; el siguiente request lo reinicia. No-stream responde `504 generation_timeout`; streaming cierra con `finish_reason: "error"`. Métrica: `aquifer_timeouts_total`.
@@ -258,6 +261,20 @@ La firma cubre los bytes exactos de `manifest.json`; el manifiesto cubre cada
 archivo. `verify` recomputa todo, valida el hash semántico de la conversación
 (system + mensajes) y la cadena de padres si se pasa `--parent-bundle`.
 
+Verificación end-to-end en un comando:
+
+```bash
+python3 tools/verify.py --bundle ~/bundles/caso-01 \
+  --hmac-key bundle.key --traces-hmac-key trace.key
+
+# Salida JSON para un orquestador
+python3 tools/verify.py --bundle ~/bundles/caso-01 --json \
+  --hmac-key bundle.key --traces-hmac-key trace.key
+```
+
+Valida manifiesto, archivos, conversación, firma, cadena de trazas, recibos y
+padres. Sale con `0` si todo está verificado y `1` si algo falló.
+
 Cada sesión son dos archivos: `<nombre>.kv` (estado del motor) y `<nombre>.json`
 (historial y metadatos con `parent` para seguir el árbol de ramas). Las ramas son
 independientes: continuar una no modifica la otra. `/reset` y `/switch` desvinculan
@@ -396,8 +413,9 @@ Pedido:
   `contar`, `mayusculas`, `minusculas`, `eco`. Se consulta en
   `GET /v1/local-tools`.
 - Los argumentos se validan contra el esquema del registro antes de ejecutar.
-- Se permiten hasta `--max-tool-rounds` ejecuciones por request. Si el modelo
-  pide otra, se devuelve esa llamada al cliente.
+- Se permiten hasta `--max-tool-rounds` ejecuciones por request y un tiempo
+  total `--tool-budget-ms` (default 15 s). Si se agota, se devuelve la llamada
+  pendiente al cliente con `tool_budget_exceeded`.
 - La respuesta final trae `x_aquifer.tool_trace` con las llamadas ejecutadas y
   `tool_rounds`/`tool_local_calls`. Métrica:
   `aquifer_tool_local_calls_total`.
@@ -589,7 +607,9 @@ scrape_configs:
       - targets: ["127.0.0.1:8080"]
 ```
 
-Ejemplos listos para el piloto en [`docs/monitoring/`](docs/monitoring/):
+Demo de 5 minutos con mock HTTP y guion: [`docs/pilot/`](docs/pilot/).
+
+Ejemplos de monitoreo en [`docs/monitoring/`](docs/monitoring/):
 scrape de Prometheus, alertas, dashboard de Grafana (13 paneles) y
 `docker-compose.yml` con provisioning automático.
 

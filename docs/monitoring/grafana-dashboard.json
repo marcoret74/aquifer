@@ -529,6 +529,15 @@
           "expr": "sum(rate(aquifer_tool_http_calls_total[$__rate_interval]))",
           "legendFormat": "http tools",
           "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(aquifer_tool_budget_exceeded_total[$__rate_interval]))",
+          "legendFormat": "budget exceeded",
+          "refId": "H"
         }
       ]
     },

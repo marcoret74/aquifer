@@ -1,0 +1,18 @@
+{
+  "tools": {
+    "consultar_clima": {
+      "url": "http://127.0.0.1:9100/clima",
+      "method": "POST",
+      "timeout": 5,
+      "description": "Consulta el clima actual de una ciudad.",
+      "parameters": {
+        "type": "object",
+        "required": ["ciudad"],
+        "properties": {
+          "ciudad": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

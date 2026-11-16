@@ -86,6 +86,8 @@ test: tests
 	@echo ""
 	@python3 tools/test_receipts.py
 	@echo ""
+	@python3 tools/test_verify.py
+	@echo ""
 	@python3 tools/test_watchdog.py
 	@echo ""
 	@echo ">>> TODOS LOS TESTS DE AQUIFER PASARON CON ÉXITO <<<"
