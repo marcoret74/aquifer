@@ -63,7 +63,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Atención paralelizada por (token, cabeza).** Antes corría en un hilo mientras los workers esperaban; ahora usa el pool. A ctx 512 la atención baja de ~19 ms/token a ~4 ms/token (4 hilos).
 - **Decodificación especulativa por prompt-lookup (`--spec 4`, default en chat).** Propone hasta 4 tokens copiados de una repetición reciente del contexto, los verifica en una sola pasada `M=4` y acepta el prefijo correcto. En greedy genera **exactamente los mismos tokens** que sin spec. Medido: +5–15 % en texto natural y **1,5–2,2×** en salida repetitiva/código. `--spec 0` lo desactiva. Tuning: `--spec-min 2 --spec-max 8` es el default; k=6/8 y min=3/4 no fueron robustamente mejores (k=8 ayuda en listas periódicas pero castiga prosa), y una propuesta de 1 token se descarta porque no ahorra nada. `--spec-min/--spec-max` quedan expuestos para experimentar.
 - **Compactación con KV (`COMPACT`).** Al llenarse el contexto, en vez de resetear todo el KV y re-prellenar el historial, el motor conserva el system prompt y mueve al frente la cola que coincide con el prompt recortado. Las claves ya calculadas no se recalculan ni se re-rotan: se ajusta `pos_base` (desplazamiento RoPE) para que los tokens conservados mantengan su posición absoluta. Medido en Qwen 0.5B con `ctx 256`: 132 ms de TTFT tras compactar contra 1423 ms del reset completo. `--no-kv-compact` recupera el comportamiento anterior.
-- **Sesión persistente (`--session RUTA`).** Guarda y restaura el KV cache + el historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial. Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo, así que un KV de otro modelo o un archivo truncado se rechaza en vez de corromper la generación. Autoguarda al cerrar cada turno; `/reset` borra la sesión.
+- **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
 - **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
 - **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
 - **Stop sequences por texto (`--stop`, repetible).** El chat acumula el texto decodificado en un buffer rodante, detecta la parada aunque cruce varios tokens, imprime solo lo anterior, envía `STOP` al motor y drena hasta `DONE`. El historial se trunca en la parada. Es lógica de chat/orquestador: el kernel no cambia y `--eos` sigue siendo el corte por ID de token.
@@ -168,7 +168,36 @@ python3 tools/chat.py --model qwen3 --threads 4 --prefill-batch 8 --kv-dtype fp1
 * `/models` o `/list` $\to$ Ver el catálogo de modelos instalados y disponibles.
 * `/switch <modelo>` $\to$ Cambiar de modelo en caliente sin reiniciar el proceso (ej: `/switch coder`).
 * `/reset` o `/clear` $\to$ Limpiar historial de conversación y resetear el KV-cache.
+* `/sessions` $\to$ Listar las sesiones guardadas (nombre, modelo, turnos, tamaño, rama).
+* `/save <nombre>` $\to$ Guardar una instantánea de la conversación actual.
+* `/branch <nombre>` $\to$ Clonar la conversación en una sesión nueva y dejarla activa.
+* `/load <nombre>` $\to$ Cargar una sesión en caliente (mismo modelo).
+* `/session` $\to$ Ver la sesión activa, su directorio y metadatos.
+* `/delete <nombre>` $\to$ Borrar una sesión (pide confirmación).
 * `/exit` o `/quit` $\to$ Salir de la shell.
+
+#### Sesiones y ramas
+
+```bash
+# Listar sesiones guardadas y salir
+python3 tools/chat.py --sessions
+
+# Usar un directorio propio de sesiones
+python3 tools/chat.py --model qwen05 --session-dir ~/mis-sesiones
+
+# Reanudar una sesión existente (autoguarda cada turno)
+python3 tools/chat.py --model qwen05 --session ~/mis-sesiones/caso-01
+
+# Dentro de la shell:
+#   /save caso-01-previaje
+#   /branch caso-01-escenario-b
+#   /load caso-01-previaje
+```
+
+Cada sesión son dos archivos: `<nombre>.kv` (estado del motor) y `<nombre>.json`
+(historial y metadatos con `parent` para seguir el árbol de ramas). Las ramas son
+independientes: continuar una no modifica la otra. `/reset` y `/switch` desvinculan
+la sesión activa sin borrar archivos; `/delete` es explícito y confirmado.
 
 ### 4. Servidor HTTP local (API estilo OpenAI)
 El motor se puede exponer como servicio local para conectar una UI, un script o el

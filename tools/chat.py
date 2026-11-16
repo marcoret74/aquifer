@@ -21,6 +21,7 @@ Uso:
 import argparse
 import json
 import os
+import re
 import readline  # habilita flechas arriba/abajo e historial en input()
 import subprocess
 import sys
@@ -307,18 +308,114 @@ def load_session(base, model):
     return hist, None
 
 
-def write_session_meta(base, model, system_text, history):
+def read_session_meta(base):
     _, json_path = session_paths(base)
-    tmp = json_path + ".tmp"
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_session_meta(base, model, system_text, history, parent=None):
+    """Escribe el historial y metadatos. Conserva created/parent si existían."""
+    _, json_path = session_paths(base)
+    os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
+    meta = read_session_meta(base) or {}
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     payload = {
         "version": SESSION_VERSION,
         "model": model,
         "system": system_text or "",
         "history": [[r, t] for r, t in history],
+        "created": meta.get("created") or now,
+        "updated": now,
+        "parent": parent if parent is not None else meta.get("parent"),
+        "turns": sum(1 for r, _ in history if r == "user"),
     }
+    tmp = json_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)
     os.replace(tmp, json_path)
+
+
+def default_session_dir():
+    return os.path.join(os.path.expanduser("~"), ".cache", "aquifer", "sessions")
+
+
+def session_dir_for(args):
+    if getattr(args, "session_dir", None):
+        return os.path.abspath(os.path.expanduser(args.session_dir))
+    if getattr(args, "session", None):
+        return os.path.dirname(os.path.abspath(os.path.expanduser(args.session)))
+    return default_session_dir()
+
+
+SESSION_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def resolve_session_base(name, directory):
+    """Convierte un nombre simple en ruta base dentro del directorio de sesiones."""
+    name = (name or "").strip()
+    if not SESSION_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "nombre inválido: usa letras, números, punto, guion o guion bajo "
+            "(máximo 64, sin rutas)")
+    return os.path.join(directory, name)
+
+
+def list_sessions(directory):
+    rows = []
+    try:
+        entries = list(os.scandir(directory))
+    except (FileNotFoundError, NotADirectoryError):
+        return rows
+    for entry in entries:
+        if not entry.is_file() or not entry.name.endswith(".json"):
+            continue
+        base = entry.path[:-5]
+        meta = read_session_meta(base)
+        if not meta:
+            continue
+        kv_path = base + ".kv"
+        updated = meta.get("updated")
+        if not updated:
+            try:
+                updated = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        time.gmtime(entry.stat().st_mtime))
+            except OSError:
+                updated = "?"
+        rows.append({
+            "name": os.path.basename(base),
+            "base": base,
+            "model": meta.get("model", "?"),
+            "turns": meta.get("turns", len(meta.get("history", [])) // 2),
+            "updated": updated,
+            "parent": meta.get("parent"),
+            "size": os.path.getsize(kv_path) if os.path.exists(kv_path) else 0,
+            "has_kv": os.path.exists(kv_path),
+        })
+    rows.sort(key=lambda r: r["updated"], reverse=True)
+    return rows
+
+
+def print_sessions(directory, active_base=None):
+    rows = list_sessions(directory)
+    print(f"{BOLD}Sesiones en {directory}{RESET}")
+    if not rows:
+        print(f"  {DIM}(vacío){RESET}")
+        return
+    active = os.path.basename(active_base) if active_base else None
+    print(f"  {'':2}{'nombre':<20} {'modelo':<8} {'turnos':>6}  {'tamaño':>9}  actualizado")
+    for row in rows:
+        mark = "*" if row["name"] == active else " "
+        size = "%.0f KB" % (row["size"] / 1024.0) if row["size"] else "sin KV"
+        parent = f" <- {row['parent']}" if row.get("parent") else ""
+        print(f"  {mark} {row['name']:<20} {row['model']:<8} {row['turns']:>6}  "
+              f"{size:>9}  {row['updated']}{parent}")
+    if active:
+        print(f"  {DIM}* sesión activa para autoguardado{RESET}")
 
 
 def engine_save_kv(proc, base):
@@ -518,6 +615,11 @@ def main():
     ap.add_argument("--session", default=None, metavar="RUTA",
                     help="Sesión persistente: guarda/carga KV cache e historial en "
                          "RUTA.kv y RUTA.json entre ejecuciones")
+    ap.add_argument("--session-dir", default=None, metavar="DIR",
+                    help="Directorio de sesiones para /sessions, /save, /load y "
+                         "/branch (default: el de --session o ~/.cache/aquifer/sessions)")
+    ap.add_argument("--sessions", action="store_true",
+                    help="Listar las sesiones guardadas y salir")
     ap.add_argument("--stop", action="append", default=None, metavar="TEXTO",
                     help="Secuencia de parada por texto (repetible). Se detecta en streaming, "
                          "se suprime junto con lo que siga y se corta la generación")
@@ -526,6 +628,9 @@ def main():
 
     if args.list:
         print_model_catalog(resolve_artifact)
+        return 0
+    if args.sessions:
+        print_sessions(session_dir_for(args), args.session)
         return 0
 
     mcfg = get_model_config(args.model, resolve_artifact)
@@ -553,11 +658,27 @@ def main():
     print(f"    {YELLOW}/models{RESET} (or {YELLOW}/list{RESET})          -> List all available models              ")
     print(f"    {YELLOW}/switch <model>{RESET} (or {YELLOW}/model{RESET}) -> Switch active model dynamically      ")
     print(f"    {YELLOW}/reset{RESET}  (or {YELLOW}/clear{RESET})         -> Reset conversation history & KV cache  ")
+    print(f"    {YELLOW}/sessions{RESET}                     -> List saved sessions                   ")
+    print(f"    {YELLOW}/save <n>{RESET} (or {YELLOW}/branch <n>{RESET})   -> Snapshot / branch to a new session  ")
+    print(f"    {YELLOW}/load <n>{RESET}                     -> Load a saved session                  ")
     print(f"    {YELLOW}/exit{RESET}   (or {YELLOW}/quit{RESET})          -> Exit interactive shell                 ")
     print(f"{BOLD}================================================================={RESET}\n")
 
     history = session_history if session_history is not None else []
     session_dirty = False
+    session_dir = session_dir_for(args)
+
+    def current_system():
+        return args.system if args.system is not None else mcfg["system"]
+
+    def snapshot(base, parent=None):
+        """Persiste KV + historial en `base`. Devuelve (ok, mensaje)."""
+        msg = engine_save_kv(proc, base)
+        if msg and msg.startswith("SAVED"):
+            write_session_meta(base, args.model, current_system(), history,
+                               parent=parent)
+            return True, msg
+        return False, msg or "el motor no respondió"
 
     try:
         while True:
@@ -574,6 +695,139 @@ def main():
                 break
             elif user_input.lower() in ("/models", "/list", "models", "list", "/modelos", "modelos"):
                 print_model_catalog(resolve_artifact)
+                continue
+            elif user_input.lower() in ("/sessions", "/sesiones"):
+                print_sessions(session_dir, args.session)
+                continue
+            elif user_input.lower() in ("/session", "/sesion"):
+                if args.session:
+                    meta = read_session_meta(args.session) or {}
+                    kv_path, json_path = session_paths(args.session)
+                    size = os.path.getsize(kv_path) if os.path.exists(kv_path) else 0
+                    print(f"{BOLD}Sesión activa:{RESET} {os.path.basename(args.session)}")
+                    print(f"  directorio : {session_dir}")
+                    print(f"  modelo     : {args.model}")
+                    print(f"  turnos     : {meta.get('turns', '?')}")
+                    print(f"  KV         : {('%.0f KB' % (size / 1024.0)) if size else 'sin archivo'}")
+                    if meta.get("parent"):
+                        print(f"  rama de    : {meta['parent']}")
+                    print(f"  archivos   : {kv_path} · {json_path}")
+                else:
+                    print(f"{YELLOW}Sin sesión activa.{RESET} Usa {BOLD}/save <nombre>{RESET} "
+                          f"o {BOLD}/branch <nombre>{RESET}.")
+                    print(f"{DIM}Directorio: {session_dir}{RESET}")
+                continue
+            elif user_input.lower().startswith(("/save ", "/guardar ")):
+                name = user_input.split(None, 1)[1].strip()
+                try:
+                    base = resolve_session_base(name, session_dir)
+                except ValueError as err:
+                    print(f"{YELLOW}{err}{RESET}")
+                    continue
+                parent = os.path.basename(args.session) if args.session else None
+                ok, msg = snapshot(base, parent=parent)
+                if ok:
+                    print(f"{GREEN}[Guardada '{name}' · {msg} · {base}]{RESET}")
+                else:
+                    print(f"{YELLOW}[No se pudo guardar: {msg}]{RESET}")
+                continue
+            elif user_input.lower().startswith(("/branch ", "/rama ")):
+                name = user_input.split(None, 1)[1].strip()
+                try:
+                    base = resolve_session_base(name, session_dir)
+                except ValueError as err:
+                    print(f"{YELLOW}{err}{RESET}")
+                    continue
+                if any(os.path.exists(_p) for _p in session_paths(base)):
+                    print(f"{YELLOW}[Ya existe la sesión '{name}'; elige otro "
+                          f"nombre o bórrala con /delete]{RESET}")
+                    continue
+                parent = os.path.basename(args.session) if args.session else None
+                ok, msg = snapshot(base, parent=parent)
+                if ok:
+                    args.session = base
+                    session_dirty = False
+                    print(f"{GREEN}[Rama '{name}' guardada y activa · {msg}]{RESET}")
+                else:
+                    print(f"{YELLOW}[No se pudo crear la rama: {msg}]{RESET}")
+                continue
+            elif user_input.lower().startswith(("/load ", "/cargar ")):
+                name = user_input.split(None, 1)[1].strip()
+                try:
+                    base = resolve_session_base(name, session_dir)
+                except ValueError as err:
+                    print(f"{YELLOW}{err}{RESET}")
+                    continue
+                meta = read_session_meta(base)
+                kv_path, _ = session_paths(base)
+                if not meta:
+                    print(f"{YELLOW}[No existe la sesión '{name}' en {session_dir}]{RESET}")
+                    continue
+                if meta.get("model") != args.model:
+                    print(f"{YELLOW}[La sesión '{name}' es del modelo "
+                          f"'{meta.get('model')}'; cambia con /switch]{RESET}")
+                    continue
+                if not os.path.exists(kv_path):
+                    print(f"{YELLOW}[Falta el KV de la sesión '{name}']{RESET}")
+                    continue
+                try:
+                    proc.stdin.write("LOADKV %s\n" % kv_path)
+                    proc.stdin.flush()
+                except Exception:
+                    print(f"{YELLOW}[El motor no responde]{RESET}")
+                    continue
+                loaded = None
+                for rline in proc.stdout:
+                    ls = rline.strip()
+                    if ls.startswith("LOADED"):
+                        try:
+                            loaded = int(ls.split()[1])
+                        except (IndexError, ValueError):
+                            loaded = 0
+                        break
+                    if ls.startswith("LOAD_ERR"):
+                        loaded = ls
+                        break
+                if isinstance(loaded, int):
+                    history = [(str(r), str(t)) for r, t in meta.get("history", [])]
+                    args.session = base
+                    session_dirty = False
+                    print(f"{GREEN}[Sesión '{name}' cargada · {loaded} tokens de KV]{RESET}")
+                else:
+                    print(f"{YELLOW}[No se pudo cargar '{name}': {loaded}]{RESET}")
+                    if sys_tokens_str:
+                        proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
+                        proc.stdin.flush()
+                        for rline in proc.stdout:
+                            if rline.strip() == "PREWARMED":
+                                break
+                continue
+            elif user_input.lower().startswith(("/delete ", "/borrar ")):
+                name = user_input.split(None, 1)[1].strip()
+                try:
+                    base = resolve_session_base(name, session_dir)
+                except ValueError as err:
+                    print(f"{YELLOW}{err}{RESET}")
+                    continue
+                kv_path, json_path = session_paths(base)
+                if not os.path.exists(kv_path) and not os.path.exists(json_path):
+                    print(f"{YELLOW}[No existe la sesión '{name}']{RESET}")
+                    continue
+                try:
+                    ans = input(f"{BOLD}¿Borrar la sesión '{name}'? [s/N]: {RESET}").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    continue
+                if ans not in ("s", "si", "sí", "y", "yes"):
+                    continue
+                for _p in (kv_path, json_path):
+                    try:
+                        os.remove(_p)
+                    except OSError:
+                        pass
+                if args.session == base:
+                    args.session = None
+                    session_dirty = False
+                print(f"{YELLOW}[Sesión '{name}' borrada]{RESET}")
                 continue
             elif user_input.lower().startswith(("/switch", "/model", "/use", "/select")):
                 parts = user_input.split()
@@ -621,11 +875,8 @@ def main():
                 history.clear()
                 session_dirty = False
                 if args.session:
-                    for _p in session_paths(args.session):
-                        try:
-                            os.remove(_p)
-                        except OSError:
-                            pass
+                    print(f"{DIM}[Sesión desvinculada; los archivos se conservan]{RESET}")
+                    args.session = None
                 print(f"\n{GREEN}{BOLD}✓ Modelo activo cambiado a: {mcfg['title']}{RESET}")
                 print(f"  {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}\n")
                 continue
@@ -644,11 +895,8 @@ def main():
                             break
                 session_dirty = False
                 if args.session:
-                    for _p in session_paths(args.session):
-                        try:
-                            os.remove(_p)
-                        except OSError:
-                            pass
+                    args.session = None
+                    print(f"{DIM}[Sesión desvinculada; los archivos se conservan]{RESET}")
                 print(f"{YELLOW}[Memory and KV-cache reset]{RESET}\n")
                 continue
 
