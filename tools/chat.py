@@ -332,7 +332,9 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
         "--temperature", str(args.temperature),
         "--top-k", str(args.top_k),
         "--top-p", str(args.top_p),
-        "--seed", str(args.seed)
+        "--seed", str(args.seed),
+        "--repeat-penalty", str(args.repeat_penalty),
+        "--repeat-last-n", str(args.repeat_last_n)
     ]
     if args.diamond is not None:
         print(f"{YELLOW}[Experimental] El modo Diamante actual selecciona neuronas "
@@ -419,6 +421,10 @@ def main():
                     help="Nucleus sampling (solo si temperature > 0)")
     ap.add_argument("--seed", type=int, default=0,
                     help="Semilla de muestreo (0 = aleatoria)")
+    ap.add_argument("--repeat-penalty", type=float, default=1.0,
+                    help="Penalización de repetición (1.0 = off; ej. 1.15)")
+    ap.add_argument("--repeat-last-n", type=int, default=64,
+                    help="Ventana de tokens para repetition penalty")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
 
