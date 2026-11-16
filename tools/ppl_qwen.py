@@ -47,6 +47,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--model', required=True)
     ap.add_argument('--groups', default='64,32')
+    ap.add_argument('--bits', default='4', help='bits de peso a simular, ej. 4,3')
     ap.add_argument('--text', default=TEXTO_POR_DEFECTO)
     args = ap.parse_args()
 
@@ -62,13 +63,15 @@ def main():
     base = ppl(m, ids)
     print(f'{"bf16":<12} {"16.00":>7} bits   ppl {base:8.3f}   (referencia)')
 
-    for g in [int(x) for x in args.groups.split(',')]:
-        m.quant = True
-        m.qgroup = g
-        p = ppl(m, ids)
-        bits = 4.0 + 16.0 / g
-        print(f'{"int4 g" + str(g):<12} {bits:7.2f} bits   ppl {p:8.3f}   '
-              f'({100.0 * (p / base - 1.0):+.1f} %)')
+    for qbits in [int(x) for x in args.bits.split(',')]:
+        for g in [int(x) for x in args.groups.split(',')]:
+            m.quant = True
+            m.qgroup = g
+            m.qbits = qbits
+            p = ppl(m, ids)
+            bits = qbits + 16.0 / g
+            print(f'{"int" + str(qbits) + " g" + str(g):<12} {bits:7.2f} bits   ppl {p:8.3f}   '
+                  f'({100.0 * (p / base - 1.0):+.1f} %)')
 
 
 if __name__ == '__main__':

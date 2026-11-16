@@ -324,11 +324,16 @@ class Qwen:
             return t
         G = K // qg
         g = t.view(N, G, qg)
+        bits = int(getattr(self, 'qbits', 4))
+        if bits < 2 or bits > 8:
+            bits = 4
+        qmax = (1 << (bits - 1)) - 1
+        qmin = -(1 << (bits - 1))
         # Clamp en dominio fp16: 1e-8 NO es representable (min subnormal ~6e-8),
         # y los grupos con amax==0 daban sw=0 -> division por cero -> nan.
-        sw = (g.abs().amax(-1, keepdim=True) / 7.0).half()
+        sw = (g.abs().amax(-1, keepdim=True) / float(qmax)).half()
         sw = torch.clamp(sw, min=torch.finfo(torch.float16).tiny).float()
-        codes = (g / sw).round().clamp(-8, 7)
+        codes = (g / sw).round().clamp(qmin, qmax)
         return (codes * sw).view(N, K)
 
     def wb(self, name):
