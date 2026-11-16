@@ -74,6 +74,8 @@ test: tests
 	@echo ""
 	@python3 tools/test_structured.py
 	@echo ""
+	@python3 tools/test_bundle.py
+	@echo ""
 	@echo ">>> TODOS LOS TESTS DE AQUIFER PASARON CON ÉXITO <<<"
 
 clean:

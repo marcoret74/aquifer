@@ -62,6 +62,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **`--prefill-batch 8`.** El prefill procesa hasta 8 tokens por pasada: cada byte de peso leído se reutiliza 8 veces. La causalidad se mantiene porque la atención de cada token corta en `pos[i]`, aunque el KV del bloque ya esté escrito. Solo se calculan los logits del último token del bloque.
 - **Atención paralelizada por (token, cabeza).** Antes corría en un hilo mientras los workers esperaban; ahora usa el pool. A ctx 512 la atención baja de ~19 ms/token a ~4 ms/token (4 hilos).
 - **Decodificación especulativa por prompt-lookup (`--spec 4`, default en chat).** Propone hasta 4 tokens copiados de una repetición reciente del contexto, los verifica en una sola pasada `M=4` y acepta el prefijo correcto. En greedy genera **exactamente los mismos tokens** que sin spec. Medido: +5–15 % en texto natural y **1,5–2,2×** en salida repetitiva/código. `--spec 0` lo desactiva. Tuning: `--spec-min 2 --spec-max 8` es el default; k=6/8 y min=3/4 no fueron robustamente mejores (k=8 ayuda en listas periódicas pero castiga prosa), y una propuesta de 1 token se descarta porque no ahorra nada. `--spec-min/--spec-max` quedan expuestos para experimentar.
+- **Bundle auditable (`tools/bundle.py`).** Empaqueta una sesión (`session.json`, KV opcional, trazas) con un `manifest.json` de hashes SHA-256, `manifest.sha256` estilo `sha256sum` y firma opcional HMAC-SHA256 u OpenSSL (RSA/EC/Ed25519). Verifica hashes, conversación, firma y cadena de bundles padres; exporta a directorio o `.zip`. Es transporte y verificación genérica, sin lógica de dominio.
 - **Resumen de contexto antes de compactar (`--summary-tokens`, `--no-context-summary`).** Cuando el contexto se llena, el chat resume los mensajes que va a descartar con el mismo motor (greedy, presupuesto acotado), guarda y restaura el KV alrededor del resumen, e inyecta el resumen en el turno nuevo antes de compactar. Así se conservan nombres, números y decisiones aunque el hueco salga de la ventana de atención. En el servidor HTTP la historia la posee el cliente: allí se compacta el KV y el resumen queda a cargo del orquestador.
 - **Compactación con KV (`COMPACT`).** Al llenarse el contexto, en vez de resetear todo el KV y re-prellenar el historial, el motor conserva el system prompt y mueve al frente la cola que coincide con el prompt recortado. Las claves ya calculadas no se recalculan ni se re-rotan: se ajusta `pos_base` (desplazamiento RoPE) para que los tokens conservados mantengan su posición absoluta. Medido en Qwen 0.5B con `ctx 256`: 132 ms de TTFT tras compactar contra 1423 ms del reset completo. `--no-kv-compact` recupera el comportamiento anterior.
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
@@ -209,6 +210,47 @@ python3 tools/chat.py --model qwen3 --no-context-summary
 El resumen se genera con el KV de la conversación guardado a un temporal y
 restaurado después, así no se pierde la cola ya calculada. Se inyecta como
 `[Contexto previo resumido]` al inicio del turno nuevo.
+
+#### Bundle auditable de una sesión
+
+```bash
+# Empaquetar con KV y trazas, firmado con HMAC
+openssl rand -out bundle.key 32
+python3 tools/bundle.py export --session ~/sesiones/caso-01 \
+  --out ~/bundles/caso-01 --include-kv --traces ~/.cache/aquifer/traces.jsonl \
+  --note "entrega piloto" --hmac-key bundle.key
+
+# Verificar (falla si algo cambió)
+python3 tools/bundle.py verify --bundle ~/bundles/caso-01 --hmac-key bundle.key
+
+# Firma asimétrica (OpenSSL: RSA, EC o Ed25519)
+openssl genpkey -algorithm ED25519 -out ed.pem
+openssl pkey -in ed.pem -pubout -out ed.pub
+python3 tools/bundle.py export --session ~/sesiones/caso-01 \
+  --out ~/bundles/caso-01.zip --sign-key ed.pem
+python3 tools/bundle.py verify --bundle ~/bundles/caso-01.zip --pubkey ed.pub
+
+# Cadena de ramas: registrar el bundle padre
+python3 tools/bundle.py export --session ~/sesiones/rama-b \
+  --out ~/bundles/rama-b --parent-bundle ~/bundles/caso-01
+python3 tools/bundle.py verify --bundle ~/bundles/rama-b \
+  --parent-bundle ~/bundles/caso-01
+```
+
+Contenido:
+
+| Archivo | Qué es |
+| :--- | :--- |
+| `session.json` | Historial y metadatos exactos |
+| `session.kv` | Estado del motor (opcional; si no, solo se registra su hash) |
+| `traces.jsonl` | Trazas del servidor (opcional) |
+| `manifest.json` | Hashes, sesión, KV, trazas, nota y padre |
+| `manifest.sha256` | Hash del manifiesto, compatible con `sha256sum` |
+| `manifest.sig` + `signature.json` | Firma y algoritmo (si se firmó) |
+
+La firma cubre los bytes exactos de `manifest.json`; el manifiesto cubre cada
+archivo. `verify` recomputa todo, valida el hash semántico de la conversación
+(system + mensajes) y la cadena de padres si se pasa `--parent-bundle`.
 
 Cada sesión son dos archivos: `<nombre>.kv` (estado del motor) y `<nombre>.json`
 (historial y metadatos con `parent` para seguir el árbol de ramas). Las ramas son
