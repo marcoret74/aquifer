@@ -38,6 +38,7 @@ from chat import (MODELS_CATALOG, StreamDecoder, format_prompt,  # noqa: E402
                   get_model_config, start_engine, system_prompt_text)
 from structured import SchemaError, extract_json, validate  # noqa: E402
 import local_tools  # noqa: E402
+import receipts  # noqa: E402
 
 SPECIAL_MARKERS = ("<|im_end|>", "<|endoftext|>", "<｜end", "<think>",
                    "</s>", "<|user|>", "<|assistant|>")
@@ -86,6 +87,7 @@ class Metrics:
         self.schema_streamed = 0
         self.compactions = 0
         self.timeouts = 0
+        self.receipts = 0
         self.tool_requests = 0
         self.tool_calls = 0
         self.tool_local_calls = 0
@@ -137,6 +139,8 @@ class Metrics:
             self.tool_local_calls += int(trace.get("tool_local_calls") or 0)
             if trace.get("error_type") == "generation_timeout":
                 self.timeouts += 1
+            if trace.get("receipt"):
+                self.receipts += 1
             self.tokens_in += int(trace.get("prompt_tokens") or 0)
             self.tokens_out += int(trace.get("completion_tokens") or 0)
             lat = trace.get("latency_ms")
@@ -207,6 +211,7 @@ class Metrics:
                           "local_calls": self.tool_local_calls},
                 "compactions": self.compactions,
                 "timeouts": self.timeouts,
+                "receipts": self.receipts,
             }
 
     @staticmethod
@@ -237,6 +242,7 @@ class Metrics:
                 "tool_calls": self.tool_calls,
                 "tool_local_calls": self.tool_local_calls,
                 "timeouts": self.timeouts,
+                "receipts": self.receipts,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
                 "in_flight": self.in_flight,
                 "lat_sum": self.latency_sum, "lat_count": self.latency_count,
@@ -275,6 +281,7 @@ class Metrics:
                 ("aquifer_tool_calls_total", "Llamadas de herramienta emitidas"),
                 ("aquifer_tool_local_calls_total", "Herramientas ejecutadas localmente"),
                 ("aquifer_timeouts_total", "Generaciones cortadas por timeout"),
+                ("aquifer_receipts_total", "Requests con recibo firmado"),
                 ("aquifer_compactions_total", "Compactaciones de KV")):
             kind = "gauge" if name.endswith("in_flight") else "counter"
             add("# HELP %s %s" % (name, help_text))
@@ -291,6 +298,7 @@ class Metrics:
                    "aquifer_tool_calls_total": "tool_calls",
                    "aquifer_tool_local_calls_total": "tool_local_calls",
                    "aquifer_timeouts_total": "timeouts",
+                   "aquifer_receipts_total": "receipts",
                    "aquifer_compactions_total": "compactions"}[name]
             add("%s %d" % (name, data[key]))
 
@@ -792,6 +800,15 @@ class State:
             if len(self.trace_hmac_key) < 16:
                 raise SystemExit("la clave de trazas debe tener al menos 16 bytes")
         self.chain_seq, self.chain_last = read_last_chain(self.trace_path)
+        self.receipt_key = None
+        receipt_path = getattr(args, "receipt_key", None)
+        if receipt_path:
+            with open(receipt_path, "rb") as f:
+                self.receipt_key = f.read()
+            if len(self.receipt_key) < 16:
+                raise SystemExit("la clave de recibos debe tener al menos 16 bytes")
+        elif self.trace_hmac_key:
+            self.receipt_key = self.trace_hmac_key
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -832,12 +849,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, err):
+    def _error(self, err, receipt=None):
         # Si no se consumió el cuerpo, cerrar evita desincronizar keep-alive.
         self.close_connection = True
         payload = {"message": err.message, "type": err.kind, "code": err.status}
         if err.details is not None:
             payload["details"] = err.details
+        if receipt:
+            payload["receipt"] = receipt
         self._send_json(err.status, {"error": payload})
 
     def _auth(self):
@@ -889,12 +908,22 @@ class Handler(BaseHTTPRequestHandler):
         if "latency_ms" not in trace:
             trace["latency_ms"] = round(
                 (time.monotonic() - trace["_t0"]) * 1000.0, 1)
+        if err is not None and not trace.get("response_sha256"):
+            trace["response_sha256"] = receipts.sha256_hex(
+                receipts.canonical_bytes({"error": {
+                    "type": err.kind, "message": err.message}}))
+        if not trace.get("ts"):
+            trace["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if self.state.receipt_key and not trace.get("receipt"):
+            trace["receipt"] = receipts.sign(
+                trace, self.state.receipt_key, status)
         self.state.metrics.record(trace)
         path = self.state.trace_path
         if not path:
             return
         row = {k: v for k, v in trace.items() if not k.startswith("_")}
-        row["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        row["ts"] = trace.get("ts") or time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         try:
             with self.state.trace_lock:
                 seq = self.state.chain_seq + 1
@@ -921,7 +950,8 @@ class Handler(BaseHTTPRequestHandler):
                 "conversation_sha256", "response_format", "schema_name",
                 "schema_sha256", "schema_attempts", "compact", "tools",
                 "tool_choice", "tool_calls", "tool_name", "tool_attempts",
-                "tool_execution", "tool_rounds", "tool_local_calls")
+                "tool_execution", "tool_rounds", "tool_local_calls", "ts",
+                "response_sha256", "receipt")
         return {k: trace[k] for k in keys if trace.get(k) is not None}
 
     # --- rutas -------------------------------------------------------------
@@ -1013,7 +1043,7 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as err:
             self._record(trace, err.status, err)
             try:
-                self._error(err)
+                self._error(err, trace.get("receipt"))
             except BrokenPipeError:
                 pass
         except BrokenPipeError:
@@ -1502,6 +1532,22 @@ class Handler(BaseHTTPRequestHandler):
         if gen.compact:
             trace["compact"] = gen.compact
 
+    def _set_response_hash(self, trace, content=None, tool_calls=None):
+        payload = {"content": content}
+        if tool_calls:
+            payload["tool_calls"] = tool_calls
+        trace["response_sha256"] = receipts.sha256_hex(
+            receipts.canonical_bytes(payload))
+
+    def _seal(self, trace, status=200):
+        trace["status"] = status
+        if not trace.get("ts"):
+            trace["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if self.state.receipt_key:
+            trace["receipt"] = receipts.sign(
+                trace, self.state.receipt_key, status)
+        return trace
+
     def _structured(self, history, system_text, opts, fmt, trace):
         max_attempts = 1 + max(0, int(self.state.args.json_retries))
         base_history = list(history)
@@ -1596,6 +1642,8 @@ class Handler(BaseHTTPRequestHandler):
         self._stamp(trace, gen)
         if gen.error:
             trace["error_type"] = "generation_timeout"
+            self._set_response_hash(trace, content=text)
+            self._seal(trace, 200)
             meta = self._public_trace(trace)
             meta["valid"] = False
             meta["error"] = {"type": "generation_timeout",
@@ -1610,6 +1658,8 @@ class Handler(BaseHTTPRequestHandler):
             trace["schema_errors"] = errors[:10]
         if self.state.trace_content:
             trace["content"] = text
+        self._set_response_hash(trace, content=text)
+        self._seal(trace, 200)
         meta = self._public_trace(trace)
         meta["valid"] = valid
         meta["attempts"] = 1
@@ -1646,6 +1696,9 @@ class Handler(BaseHTTPRequestHandler):
         if meta is not None:
             payload["x_aquifer"] = meta
         headers = {"x-aquifer-request-id": cid}
+        if meta and meta.get("receipt"):
+            headers["x-aquifer-receipt"] = meta["receipt"]["sig"]
+            headers["x-aquifer-receipt-key"] = meta["receipt"]["key_sha256"]
         if trace:
             for key, header in (
                     ("latency_ms", "x-aquifer-latency-ms"),
@@ -1719,6 +1772,7 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         cid = trace["request_id"]
         created = int(time.time())
+        trace["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         trace["model"] = self.state.model
         trace["stream"] = stream
@@ -1746,6 +1800,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._stamp(trace, gen)
                 if self.state.trace_content:
                     trace["content"] = text
+                self._set_response_hash(trace, content=text)
+                self._seal(trace, 200)
                 meta = self._public_trace(trace)
                 meta["valid"] = True
                 meta["attempts"] = attempts
@@ -1783,6 +1839,9 @@ class Handler(BaseHTTPRequestHandler):
                 trace["tool_name"] = call["function"]["name"]
             if self.state.trace_content:
                 trace["content"] = raw_text
+            self._set_response_hash(trace, content=content,
+                                    tool_calls=[call] if call else None)
+            self._seal(trace, 200)
             meta = self._public_trace(trace)
             if executed:
                 meta["tool_trace"] = executed
@@ -1826,6 +1885,8 @@ class Handler(BaseHTTPRequestHandler):
             self._stamp(trace, gen)
             if self.state.trace_content:
                 trace["content"] = text
+            self._set_response_hash(trace, content=text)
+            self._seal(trace, 200)
             meta = self._public_trace(trace)
             self._send_completion(cid, created, text, gen, tokens, meta, trace)
             return
@@ -1835,27 +1896,31 @@ class Handler(BaseHTTPRequestHandler):
         self._sse(dict(base, choices=[{
             "index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
         streamer = self.state.engine.stream(tokens, opts, gen)
-        parts = [] if self.state.trace_content else None
+        parts = []
         try:
             for piece in streamer:
-                if parts is not None:
-                    parts.append(piece)
+                parts.append(piece)
                 self._sse(dict(base, choices=[{
                     "index": 0, "delta": {"content": piece}, "finish_reason": None}]))
         finally:
             trace["completion_tokens"] = gen.tokens
             trace["finish_reason"] = gen.finish
             streamer.close()
+        text = "".join(parts)
         self._stamp(trace, gen)
         if gen.error:
             trace["error_type"] = "generation_timeout"
+            self._set_response_hash(trace, content=text)
+            self._seal(trace, 200)
             meta = self._public_trace(trace)
             meta["error"] = {"type": "generation_timeout",
                              "message": "el motor no respondió a tiempo"}
             self._finish_sse(base, gen, tokens, body, meta, finish="error")
             return
-        if parts is not None:
-            trace["content"] = "".join(parts)
+        if self.state.trace_content:
+            trace["content"] = text
+        self._set_response_hash(trace, content=text)
+        self._seal(trace, 200)
         self._finish_sse(base, gen, tokens, body, self._public_trace(trace))
 
 
@@ -1914,6 +1979,9 @@ def build_parser(repo_dir):
                     help="Escribe una línea JSON por request (traza auditable)")
     ap.add_argument("--trace-content", action="store_true",
                     help="Incluye el contenido de la respuesta en el trace log")
+    ap.add_argument("--receipt-key", default=None, metavar="CLAVE",
+                    help="Firma cada request con HMAC-SHA256 (si no se define, "
+                         "usa --trace-hmac-key)")
     ap.add_argument("--trace-hmac-key", default=None, metavar="CLAVE",
                     help="Firma cada entrada del trace con HMAC-SHA256")
     return ap

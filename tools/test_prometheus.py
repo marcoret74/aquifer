@@ -33,6 +33,7 @@ def main():
         "compact": {"status": "ok", "kept": 50},
         "tools": ["sumar"], "tool_calls": 1, "tool_name": "sumar",
         "tool_local_calls": 1,
+        "receipt": {"alg": "hmac-sha256", "sig": "x", "key_sha256": "y"},
     })
     m.begin()
     m.record({
@@ -62,6 +63,8 @@ def main():
     check("compactions", "aquifer_compactions_total 1" in text)
     check("tool requests", "aquifer_tool_requests_total 1" in text)
     check("tool calls", "aquifer_tool_calls_total 1" in text)
+    check("tool local calls", "aquifer_tool_local_calls_total 1" in text)
+    check("receipts", "aquifer_receipts_total 1" in text)
     check("schema failed", "aquifer_schema_failed_total 2" in text)
     check("schema streamed", "aquifer_schema_streamed_total 1" in text)
     check("latencia count",
@@ -95,6 +98,7 @@ def main():
     # Snapshots JSON siguen funcionando.
     snap = m.snapshot()
     check("snapshot in_flight", snap["requests"]["in_flight"] == 0)
+    check("snapshot receipts", snap["receipts"] == 1, snap.get("receipts"))
     check("snapshot schema", snap["schema"]["failed"] == 2)
     check("snapshot tools", snap["tools"] == {"requests": 1, "calls": 1,
                                               "local_calls": 1},

@@ -39,6 +39,8 @@ import tempfile
 import time
 import zipfile
 
+import receipts
+
 BUNDLE_VERSION = 1
 GENERATOR = "aquifer-tools/bundle"
 
@@ -313,6 +315,11 @@ def export_bundle(session_base, out, include_kv=False, traces=None, note=None,
             if not chain["ok"]:
                 raise BundleError("la cadena de trazas está rota: %s" %
                                   "; ".join(chain["problems"][:3]))
+            receipt_check = receipts.verify_lines(
+                traces_raw.splitlines(), chain_key)
+            if receipt_check["verified"] and not receipt_check["ok"]:
+                raise BundleError("recibos inválidos: %s" %
+                                  "; ".join(receipt_check["problems"][:3]))
             with open(os.path.join(stage, "traces.jsonl"), "wb") as f:
                 f.write(traces_raw)
             traces_meta = {
@@ -325,6 +332,11 @@ def export_bundle(session_base, out, include_kv=False, traces=None, note=None,
                     "ok": chain["ok"],
                     "entries": chain["entries"],
                     "head": chain["head"],
+                },
+                "receipts": {
+                    "ok": receipt_check["ok"],
+                    "entries": receipt_check["entries"],
+                    "verified": receipt_check["verified"],
                 },
             }
             entries.append({"path": "traces.jsonl",
@@ -500,11 +512,21 @@ def verify_bundle(bundle, hmac_key=None, pubkey=None, parent_bundle=None,
         if traces_hmac_key:
             with open(traces_hmac_key, "rb") as f:
                 chain_key = f.read()
-        chain = verify_trace_chain(files["traces.jsonl"].splitlines(), chain_key)
+        trace_lines = files["traces.jsonl"].splitlines()
+        chain = verify_trace_chain(trace_lines, chain_key)
         check("cadena de trazas", chain["ok"],
               "%d entradas, head %s" % (chain["entries"], chain["head"][:16]))
         for warn in chain["warnings"][:3]:
             checks.append(("traza (aviso)", True, warn))
+        receipt_check = receipts.verify_lines(trace_lines, chain_key)
+        if receipt_check["entries"]:
+            if receipt_check["verified"]:
+                check("recibos", receipt_check["ok"],
+                      "%d recibos" % receipt_check["entries"])
+            else:
+                check("recibos", True,
+                      "%d presentes; falta --traces-hmac-key"
+                      % receipt_check["entries"])
 
     parent = manifest.get("parent") or {}
     if parent.get("manifest_sha256"):
@@ -617,13 +639,18 @@ def main():
                 with open(args.hmac_key, "rb") as f:
                     key = f.read()
             result = verify_trace_chain(lines, key)
+            receipt_check = receipts.verify_lines(lines, key)
             print("Entradas : %d" % result["entries"])
             print("Head     : %s" % result["head"])
+            print("Recibos  : %d%s" % (
+                receipt_check["entries"],
+                "" if receipt_check["verified"] else " (sin clave; no verificados)"))
             for warn in result["warnings"][:10]:
                 print("  [aviso] %s" % warn)
-            if result["problems"]:
+            problems = list(result["problems"]) + list(receipt_check["problems"])
+            if problems:
                 print("PROBLEMAS:")
-                for problem in result["problems"][:20]:
+                for problem in problems[:20]:
                     print("  - %s" % problem)
                 return 1
             print("CADENA OK")
