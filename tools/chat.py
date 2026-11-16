@@ -19,6 +19,7 @@ Uso:
 """
 
 import argparse
+import json
 import os
 import readline  # habilita flechas arriba/abajo e historial en input()
 import subprocess
@@ -269,7 +270,65 @@ def get_model_config(model_name, resolve_artifact):
     return cfg
 
 
-def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
+SESSION_VERSION = 1
+
+
+def session_paths(base):
+    """Un archivo pareja: <base>.kv (binario del motor) y <base>.json (historial)."""
+    return base + ".kv", base + ".json"
+
+
+def load_session(base, model):
+    """Devuelve (history, motivo_de_omision). None en history = no restaurar."""
+    kv_path, json_path = session_paths(base)
+    if not os.path.exists(json_path):
+        return None, None
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None, "archivo de sesión ilegible"
+    if data.get("version") != SESSION_VERSION:
+        return None, "versión de sesión distinta"
+    if data.get("model") != model:
+        return None, "pertenece al modelo '%s'" % data.get("model")
+    if not os.path.exists(kv_path):
+        return None, "falta el KV de la sesión"
+    hist = [(str(r), str(t)) for r, t in data.get("history", [])]
+    return hist, None
+
+
+def write_session_meta(base, model, system_text, history):
+    _, json_path = session_paths(base)
+    tmp = json_path + ".tmp"
+    payload = {
+        "version": SESSION_VERSION,
+        "model": model,
+        "system": system_text or "",
+        "history": [[r, t] for r, t in history],
+    }
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, json_path)
+
+
+def engine_save_kv(proc, base):
+    """Pide al motor que persista su KV. Devuelve la línea de respuesta."""
+    kv_path, _ = session_paths(base)
+    os.makedirs(os.path.dirname(os.path.abspath(kv_path)), exist_ok=True)
+    try:
+        proc.stdin.write("SAVEKV %s\n" % kv_path)
+        proc.stdin.flush()
+    except Exception:
+        return None
+    for line in proc.stdout:
+        line = line.strip()
+        if line.startswith(("SAVED", "SAVE_ERR")):
+            return line
+    return None
+
+
+def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact, restore=False):
     bin_path = args.bin
     if args.diamond is not None and bin_path == default_bin:
         diamond_bin = os.path.join(repo_dir, "build", "generate_aquifer_diamond")
@@ -367,6 +426,27 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
             sys_str = f"<|im_start|>system\n{system_text}<|im_end|>\n"
         sys_tokens = tok.encode(sys_str)
         sys_tokens_str = ",".join(map(str, sys_tokens))
+
+    restored = 0
+    if restore and args.session:
+        kv_path, _ = session_paths(args.session)
+        if os.path.exists(kv_path):
+            proc.stdin.write("LOADKV %s\n" % kv_path)
+            proc.stdin.flush()
+            for line in proc.stdout:
+                ls = line.strip()
+                if ls.startswith("LOADED"):
+                    try:
+                        restored = int(ls.split()[1])
+                    except (IndexError, ValueError):
+                        restored = 0
+                    break
+                if ls.startswith("LOAD_ERR"):
+                    print(f"{YELLOW}[Sesión: {ls} — se ignora el KV guardado]{RESET}")
+                    break
+    if restored:
+        print(f"{DIM}[Sesión restaurada: {restored} tokens de KV reutilizados]{RESET}")
+    elif sys_tokens_str:
         proc.stdin.write(f"PREWARM {sys_tokens_str}\n")
         proc.stdin.flush()
         for line in proc.stdout:
@@ -425,6 +505,9 @@ def main():
                     help="Penalización de repetición (1.0 = off; ej. 1.15)")
     ap.add_argument("--repeat-last-n", type=int, default=64,
                     help="Ventana de tokens para repetition penalty")
+    ap.add_argument("--session", default=None, metavar="RUTA",
+                    help="Sesión persistente: guarda/carga KV cache e historial en "
+                         "RUTA.kv y RUTA.json entre ejecuciones")
     ap.add_argument("--stop", action="append", default=None, metavar="TEXTO",
                     help="Secuencia de parada por texto (repetible). Se detecta en streaming, "
                          "se suprime junto con lo que siga y se corta la generación")
@@ -441,7 +524,15 @@ def main():
     if args.tokenizer:
         mcfg["tokenizer"] = args.tokenizer
 
-    proc, tok, sys_tokens_str = start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact)
+    session_history = None
+    if args.session:
+        session_history, session_skip = load_session(args.session, args.model)
+        if session_skip:
+            print(f"{YELLOW}[Sesión no restaurada: {session_skip}]{RESET}")
+
+    proc, tok, sys_tokens_str = start_engine(
+        mcfg, args, repo_dir, default_bin, resolve_artifact,
+        restore=session_history is not None)
     if proc is None:
         return 1
 
@@ -455,7 +546,8 @@ def main():
     print(f"    {YELLOW}/exit{RESET}   (or {YELLOW}/quit{RESET})          -> Exit interactive shell                 ")
     print(f"{BOLD}================================================================={RESET}\n")
 
-    history = []
+    history = session_history if session_history is not None else []
+    session_dirty = False
 
     try:
         while True:
@@ -505,7 +597,8 @@ def main():
 
                 args.model = target_key
                 mcfg = get_model_config(args.model, resolve_artifact)
-                new_proc, new_tok, new_sys_tokens_str = start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact)
+                new_proc, new_tok, new_sys_tokens_str = start_engine(
+                    mcfg, args, repo_dir, default_bin, resolve_artifact, restore=False)
                 if new_proc is None:
                     print(f"Error al iniciar '{target_key}'. Restaurando qwen05...")
                     args.model = "qwen05"
@@ -516,6 +609,13 @@ def main():
                     tok = new_tok
                     sys_tokens_str = new_sys_tokens_str
                 history.clear()
+                session_dirty = False
+                if args.session:
+                    for _p in session_paths(args.session):
+                        try:
+                            os.remove(_p)
+                        except OSError:
+                            pass
                 print(f"\n{GREEN}{BOLD}✓ Modelo activo cambiado a: {mcfg['title']}{RESET}")
                 print(f"  {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}\n")
                 continue
@@ -532,6 +632,13 @@ def main():
                     for line in proc.stdout:
                         if line.strip() == "PREWARMED":
                             break
+                session_dirty = False
+                if args.session:
+                    for _p in session_paths(args.session):
+                        try:
+                            os.remove(_p)
+                        except OSError:
+                            pass
                 print(f"{YELLOW}[Memory and KV-cache reset]{RESET}\n")
                 continue
 
@@ -686,8 +793,24 @@ def main():
             else:
                 assistant_text = tok.decode(resp_tokens).replace("<|im_end|>", "").replace("</s>", "").strip()
             history.append(("assistant", assistant_text))
+            session_dirty = True
+            if args.session:
+                msg = engine_save_kv(proc, args.session)
+                if msg and msg.startswith("SAVED"):
+                    write_session_meta(args.session, args.model, sys_text, history)
+                    session_dirty = False
+                elif msg:
+                    print(f"{YELLOW}[Sesión: {msg}]{RESET}")
 
     finally:
+        if args.session and session_dirty:
+            try:
+                msg = engine_save_kv(proc, args.session)
+                if msg and msg.startswith("SAVED"):
+                    _sys = args.system if args.system is not None else mcfg["system"]
+                    write_session_meta(args.session, args.model, _sys, history)
+            except Exception:
+                pass
         try:
             proc.stdin.write("QUIT\n")
             proc.stdin.flush()

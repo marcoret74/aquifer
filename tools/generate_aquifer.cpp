@@ -228,6 +228,142 @@ struct KvRings {
     }
 };
 
+// --- persistencia del KV: formato propio AQKV v1 -----------------------------
+// Cabecera little-endian, tokens del prefijo y luego, por capa, el bloque K y
+// el bloque V de las primeras n_tokens posiciones. Cierra con FNV-1a de todo
+// lo anterior, para detectar archivos truncados o de otro modelo.
+constexpr std::uint32_t kKvVersion = 1;
+constexpr std::uint64_t kFnvBasis = 1469598103934665603ull;
+constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+
+static std::uint64_t fnv_bytes(std::uint64_t h, const void* p, std::size_t n) {
+    const auto* b = static_cast<const std::uint8_t*>(p);
+    for (std::size_t i = 0; i < n; ++i) h = (h ^ b[i]) * kFnvPrime;
+    return h;
+}
+
+static std::uint64_t kv_model_sig(const std::string& art, std::size_t wsize,
+                                  std::size_t ssize, std::size_t esize, const Cfg& cfg) {
+    std::uint64_t h = kFnvBasis;
+    h = fnv_bytes(h, art.data(), art.size());
+    const std::size_t sz[3] = {wsize, ssize, esize};
+    h = fnv_bytes(h, sz, sizeof(sz));
+    const std::size_t dims[6] = {cfg.H, cfg.NLY, cfg.NH, cfg.NKV, cfg.DH, cfg.V};
+    h = fnv_bytes(h, dims, sizeof(dims));
+    return h;
+}
+
+struct KvWriter {
+    FILE* f{nullptr};
+    bool ok{true};
+    std::uint64_t h{kFnvBasis};
+    void raw(const void* p, std::size_t n) {
+        if (!ok || n == 0) return;
+        if (std::fwrite(p, 1, n, f) != n) { ok = false; return; }
+        h = fnv_bytes(h, p, n);
+    }
+    void u32(std::uint32_t v) { raw(&v, 4); }
+    void u64(std::uint64_t v) { raw(&v, 8); }
+    void i32(std::int32_t v) { raw(&v, 4); }
+};
+
+struct KvReader {
+    FILE* f{nullptr};
+    bool ok{true};
+    std::uint64_t h{kFnvBasis};
+    void raw(void* p, std::size_t n) {
+        if (!ok || n == 0) return;
+        if (std::fread(p, 1, n, f) != n) { ok = false; return; }
+        h = fnv_bytes(h, p, n);
+    }
+    std::uint32_t u32() { std::uint32_t v = 0; raw(&v, 4); return v; }
+    std::uint64_t u64() { std::uint64_t v = 0; raw(&v, 8); return v; }
+    std::int32_t i32() { std::int32_t v = 0; raw(&v, 4); return v; }
+};
+
+static bool kv_save(const std::string& path, const KvRings& kv, const Cfg& cfg,
+                    std::uint64_t sig, const std::vector<int>& toks,
+                    std::size_t n, std::string& msg) {
+    if (n > kv.cap_tok) n = kv.cap_tok;
+    if (n > toks.size()) n = toks.size();
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { msg = "SAVE_ERR no se pudo abrir " + path; return false; }
+    KvWriter w{f};
+    w.raw("AQKV", 4);
+    w.u32(kKvVersion);
+    w.u32(kv.elem == sizeof(_Float16) ? 1u : 0u);
+    w.u32(std::uint32_t(kv.cap_tok));
+    w.u32(std::uint32_t(cfg.NLY));
+    w.u32(std::uint32_t(cfg.NKV));
+    w.u32(std::uint32_t(cfg.DH));
+    w.u32(std::uint32_t(kv.elem));
+    w.u32(std::uint32_t(n));
+    w.u32(std::uint32_t(cfg.V));
+    w.u64(sig);
+    for (std::size_t i = 0; i < n; ++i) w.i32(toks[i]);
+    const std::size_t row = n * kv.stride;
+    for (std::size_t L = 0; L < cfg.NLY && w.ok; ++L)
+        for (int isv = 0; isv < 2 && w.ok; ++isv)
+            w.raw(kv.slot(0, L, isv != 0, 0), row);
+    const std::uint64_t digest = w.h;
+    if (w.ok && std::fwrite(&digest, sizeof(digest), 1, f) != 1) w.ok = false;
+    if (std::fclose(f) != 0) w.ok = false;
+    if (!w.ok) { msg = "SAVE_ERR escritura incompleta"; return false; }
+    msg = "SAVED " + std::to_string(n);
+    return true;
+}
+
+static bool kv_load(const std::string& path, const KvRings& kv, const Cfg& cfg,
+                    std::uint64_t sig, std::vector<int>& toks, std::string& msg) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { msg = "LOAD_ERR no existe " + path; return false; }
+    KvReader r{f};
+    char magic[4] = {0, 0, 0, 0};
+    r.raw(magic, 4);
+    const auto fail = [&](const char* why) {
+        std::fclose(f);
+        toks.clear();
+        msg = std::string("LOAD_ERR ") + why;
+        return false;
+    };
+    if (!r.ok || std::memcmp(magic, "AQKV", 4) != 0) return fail("cabecera invalida");
+    const std::uint32_t ver = r.u32();
+    const std::uint32_t flags = r.u32();
+    const std::uint32_t cap = r.u32();
+    const std::uint32_t nly = r.u32();
+    const std::uint32_t nkv = r.u32();
+    const std::uint32_t dh = r.u32();
+    const std::uint32_t elem = r.u32();
+    const std::uint32_t n = r.u32();
+    const std::uint32_t vocab = r.u32();
+    const std::uint64_t saved_sig = r.u64();
+    if (!r.ok) return fail("cabecera truncada");
+    if (ver != kKvVersion) return fail("version no soportada");
+    if (flags != (kv.elem == sizeof(_Float16) ? 1u : 0u)) return fail("dtype de KV distinto");
+    if (cap != kv.cap_tok)
+        return fail("ctx distinto al de la sesion (reejecuta con el mismo --ctx)");
+    if (nly != cfg.NLY || nkv != cfg.NKV || dh != cfg.DH ||
+        elem != kv.elem || vocab != cfg.V)
+        return fail("dimensiones distintas al modelo actual");
+    if (saved_sig != sig) return fail("pertenece a otro modelo");
+    if (n > cap) return fail("n_tokens > ctx");
+    std::vector<int> tmp(n);
+    for (std::uint32_t i = 0; i < n && r.ok; ++i) tmp[i] = r.i32();
+    if (!r.ok) return fail("lista de tokens truncada");
+    const std::size_t row = std::size_t(n) * kv.stride;
+    for (std::size_t L = 0; L < cfg.NLY && r.ok; ++L)
+        for (int isv = 0; isv < 2 && r.ok; ++isv)
+            r.raw(kv.slot(0, L, isv != 0, 0), row);
+    std::uint64_t digest = 0;
+    if (r.ok && std::fread(&digest, sizeof(digest), 1, f) != 1) r.ok = false;
+    std::fclose(f);
+    if (!r.ok) { toks.clear(); msg = "LOAD_ERR payload truncado"; return false; }
+    if (digest != r.h) { toks.clear(); msg = "LOAD_ERR checksum no coincide"; return false; }
+    toks = std::move(tmp);
+    msg = "LOADED " + std::to_string(n);
+    return true;
+}
+
 // El buffer de pesos usa mmap + MADV_HUGEPAGE en MMapFile. Medido en este
 // kernel: FilePmdMapped sube a ~742 MB de 969 MB, así que las páginas grandes
 // sí se materializan para el mapping de archivo read-only.
@@ -1327,6 +1463,8 @@ int main(int argc, char** argv) {
         std::printf("READY\n");
         std::fflush(stdout);
         std::vector<int> cached_tokens;
+        std::size_t kv_written = 0;   // posiciones del anillo con KV válido
+        const std::uint64_t kv_sig = kv_model_sig(A, c.w_file.size, c.s_file.size, c.e_file.size, cfg);
         std::string line;
         for (;;) {
             pool.pause(); // Pone los workers a dormir mientras espera comando (0% CPU, ventilador silencioso)
@@ -1339,7 +1477,31 @@ int main(int argc, char** argv) {
             ss >> cmd;
             if (cmd == "RESET") {
                 cached_tokens.clear();
+                kv_written = 0;
                 std::printf("RESET_OK\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (cmd == "SAVEKV" || cmd == "LOADKV") {
+                std::string rest;
+                std::getline(ss, rest);
+                const std::size_t first = rest.find_first_not_of(" \t");
+                const std::string path = (first == std::string::npos)
+                                             ? std::string() : rest.substr(first);
+                std::string msg;
+                if (path.empty()) {
+                    msg = "SAVE_ERR falta ruta";
+                    if (cmd == "LOADKV") msg = "LOAD_ERR falta ruta";
+                } else if (cmd == "SAVEKV") {
+                    const std::size_t n = std::min(cached_tokens.size(), kv_written);
+                    kv_save(path, kv, cfg, kv_sig, cached_tokens, n, msg);
+                } else if (kv_load(path, kv, cfg, kv_sig, cached_tokens, msg)) {
+                    kv_written = cached_tokens.size();
+                } else {
+                    cached_tokens.clear();
+                    kv_written = 0;
+                }
+                std::printf("%s\n", msg.c_str());
                 std::fflush(stdout);
                 continue;
             }
@@ -1359,6 +1521,7 @@ int main(int argc, char** argv) {
                 }
                 prefill_range(0, ptokens, 0, ptokens.size());
                 cached_tokens = ptokens;
+                kv_written = ptokens.size();
                 std::printf("PREWARMED\n");
                 std::fflush(stdout);
                 continue;
@@ -1402,6 +1565,7 @@ int main(int argc, char** argv) {
 
                 // Prefill unicamente de los tokens nuevos (los anteriores ya estan en KV)
                 prefill_range(0, ptokens, common, ptokens.size() - 1);
+                kv_written = ptokens.size();   // prefill cubre todo el prefijo
 
                 cached_tokens.resize(ptokens.size() - 1);
                 for (std::size_t i = common; i + 1 < ptokens.size(); ++i) {
@@ -1433,6 +1597,7 @@ int main(int argc, char** argv) {
                         (void)step({0u}, {last_tok}, {cur_pos});
                         if (cached_tokens.size() <= cur_pos) cached_tokens.resize(cur_pos + 1);
                         cached_tokens[cur_pos] = last_tok;
+                        kv_written = std::max(kv_written, cur_pos + 1);
                         have_logits = true;
                     }
                     const int y = argmax_row(logits.data());
@@ -1462,6 +1627,7 @@ int main(int argc, char** argv) {
                                     emit(prop[j]);
                                     cached_tokens.push_back(prop[j]);
                                 }
+                                kv_written = std::max(kv_written, cur_pos + 1 + a);
                                 cur_pos += a;
                                 last_tok = prop[a - 1];
                                 if (!stop && generated < ngen) {
