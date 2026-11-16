@@ -25,6 +25,7 @@ import re
 import readline  # habilita flechas arriba/abajo e historial en input()
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -280,6 +281,10 @@ def get_model_config(model_name, resolve_artifact):
     return cfg
 
 
+SUMMARY_SYSTEM = ("Resume conversaciones con hechos concretos: nombres, "
+                  "números, preferencias y decisiones. No saludes, no preguntes "
+                  "y no inventes información.")
+
 SESSION_VERSION = 1
 
 
@@ -338,6 +343,26 @@ def write_session_meta(base, model, system_text, history, parent=None):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)
     os.replace(tmp, json_path)
+
+
+def clean_summary(text):
+    for mark in ("<|im_end|>", "<|endoftext|>", "</s>", "<|assistant|>",
+                 "<|user|>", "<think>", "</think>"):
+        text = text.replace(mark, "")
+    text = " ".join(text.split())
+    if text.lower().startswith("resumen:"):
+        text = text[len("resumen:"):].strip()
+    # Un resumen no debería ser un saludo ni una pregunta: esos turnos
+    # confunden al modelo en la siguiente respuesta.
+    parts = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        low = sentence.strip().lower()
+        if not low or low.endswith("?"):
+            continue
+        if low.startswith(("hola", "claro", "por supuesto", "aquí tienes")):
+            continue
+        parts.append(sentence.strip())
+    return " ".join(parts).strip()
 
 
 def default_session_dir():
@@ -418,9 +443,7 @@ def print_sessions(directory, active_base=None):
         print(f"  {DIM}* sesión activa para autoguardado{RESET}")
 
 
-def engine_save_kv(proc, base):
-    """Pide al motor que persista su KV. Devuelve la línea de respuesta."""
-    kv_path, _ = session_paths(base)
+def engine_save_kv_path(proc, kv_path):
     os.makedirs(os.path.dirname(os.path.abspath(kv_path)), exist_ok=True)
     try:
         proc.stdin.write("SAVEKV %s\n" % kv_path)
@@ -432,6 +455,44 @@ def engine_save_kv(proc, base):
         if line.startswith(("SAVED", "SAVE_ERR")):
             return line
     return None
+
+
+def engine_load_kv_path(proc, kv_path):
+    try:
+        proc.stdin.write("LOADKV %s\n" % kv_path)
+        proc.stdin.flush()
+    except Exception:
+        return None
+    for line in proc.stdout:
+        line = line.strip()
+        if line.startswith(("LOADED", "LOAD_ERR")):
+            return line
+    return None
+
+
+def engine_save_kv(proc, base):
+    """Pide al motor que persista su KV. Devuelve la línea de respuesta."""
+    kv_path, _ = session_paths(base)
+    return engine_save_kv_path(proc, kv_path)
+
+
+def engine_config(proc, n, temperature, top_k, top_p, seed,
+                  repeat_penalty, repeat_last_n):
+    """Ajusta n y sampling en caliente. Devuelve True si el motor aceptó."""
+    line = "CONFIG %d %.6g %d %.6g %d %.6g %d" % (
+        n, temperature, top_k, top_p, seed, repeat_penalty, repeat_last_n)
+    try:
+        proc.stdin.write(line + "\n")
+        proc.stdin.flush()
+    except Exception:
+        return False
+    for raw in proc.stdout:
+        s = raw.strip()
+        if s == "CONFIG_OK":
+            return True
+        if s == "CONFIG_ERR":
+            return False
+    return False
 
 
 def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact, restore=False):
@@ -608,6 +669,11 @@ def main():
                     help="Penalización de repetición (1.0 = off; ej. 1.15)")
     ap.add_argument("--repeat-last-n", type=int, default=64,
                     help="Ventana de tokens para repetition penalty")
+    ap.add_argument("--no-context-summary", dest="context_summary",
+                    action="store_false", default=True,
+                    help="No resumir el contexto descartado antes de compactar")
+    ap.add_argument("--summary-tokens", type=int, default=160,
+                    help="Tokens máximos del resumen de contexto (default: 160)")
     ap.add_argument("--no-kv-compact", dest="kv_compact", action="store_false",
                     default=True,
                     help="Al llenarse el contexto, resetear el KV en vez de "
@@ -679,6 +745,76 @@ def main():
                                parent=parent)
             return True, msg
         return False, msg or "el motor no respondió"
+
+    def summarize(messages, budget, gen_n):
+        """Resume `messages` con el mismo motor, sin perder el KV actual.
+
+        Guarda el KV a un temporal, genera el resumen, lo restaura y devuelve
+        el texto. Si algo falla, devuelve None y el KV se restaura igual.
+        """
+        if not messages or budget <= 0:
+            return None
+        transcript = "\n".join(
+            ("Usuario: " if r == "user" else "Asistente: ") + t
+            for r, t in messages)
+        overhead = len(tok.encode(format_prompt(
+            [("user", "")], args.model, SUMMARY_SYSTEM)))
+        max_ctx = args.ctx - budget - 16
+        if max_ctx <= overhead + 32:
+            return None
+        ids = tok.encode(transcript)
+        if len(ids) + overhead > max_ctx:
+            keep = max_ctx - overhead
+            if keep < 32:
+                return None
+            transcript = ("[...inicio del contexto recortado...]\n" +
+                          tok.decode(ids[-keep:]))
+        instruction = ("Resume la conversación en 2-4 frases factuales. Incluye "
+                       "nombres, números y decisiones. No saludes ni hagas "
+                       "preguntas. Devuelve solo el resumen.\n\n" + transcript)
+        prompt = format_prompt([("user", instruction)], args.model, SUMMARY_SYSTEM)
+        ptokens = tok.encode(prompt)
+        if len(ptokens) + budget >= args.ctx:
+            return None
+
+        fd, tmp = tempfile.mkstemp(prefix="aquifer-ctx-", suffix=".kv")
+        os.close(fd)
+        saved = engine_save_kv_path(proc, tmp)
+        if not (saved and saved.startswith("SAVED")):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return None
+        text = ""
+        try:
+            if not engine_config(proc, budget, 0.0, 40, 0.9, 0, 1.0, 64):
+                return None
+            proc.stdin.write("PROMPT " + ",".join(map(str, ptokens)) + "\n")
+            proc.stdin.flush()
+            out_ids = []
+            for line in proc.stdout:
+                line = line.strip()
+                if line == "DONE":
+                    break
+                if line.startswith("TOKEN "):
+                    try:
+                        out_ids.append(int(line.split()[1]))
+                    except (IndexError, ValueError):
+                        pass
+            text = tok.decode(out_ids)
+        finally:
+            loaded = engine_load_kv_path(proc, tmp)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            engine_config(proc, gen_n, args.temperature, args.top_k,
+                          args.top_p, args.seed, args.repeat_penalty,
+                          args.repeat_last_n)
+            if not (loaded and loaded.startswith("LOADED")):
+                text = ""
+        return clean_summary(text) or None
 
     try:
         while True:
@@ -912,12 +1048,39 @@ def main():
             if len(tokens) >= args.ctx - gen_n:
                 print(f"{YELLOW}[Aviso: Contexto largo ({len(tokens)} tokens), compactando historia]{RESET}")
                 prev_len = len(history)
+                dropped = []
                 while len(tokens) >= args.ctx - gen_n and len(history) > 1:
-                    history.pop(0)
+                    dropped.append(history.pop(0))
                     while len(history) > 1 and history[0][0] != "user":
-                        history.pop(0)
+                        dropped.append(history.pop(0))
                     full_prompt = format_prompt(history, args.model, sys_text)
                     tokens = tok.encode(full_prompt)
+
+                summary = None
+                if args.context_summary and dropped and args.summary_tokens > 0:
+                    budget = min(args.summary_tokens, max(48, args.ctx // 4))
+                    print(f"{DIM}[Resumiendo {len(dropped)} mensajes descartados "
+                          f"(≤{budget} tokens)...]{RESET}")
+                    summary = summarize(dropped, budget, gen_n)
+                if summary:
+                    user_text = history[-1][1]
+                    history[-1] = ("user", "[Contexto previo resumido]\n" +
+                                   summary + "\n\n" + user_text)
+                    tokens = tok.encode(format_prompt(history, args.model, sys_text))
+                    while len(tokens) >= args.ctx - gen_n and len(history) > 1:
+                        history.pop(0)
+                        while len(history) > 1 and history[0][0] != "user":
+                            history.pop(0)
+                        tokens = tok.encode(format_prompt(history, args.model, sys_text))
+                    if len(tokens) >= args.ctx - gen_n:
+                        history[-1] = ("user", user_text)
+                        tokens = tok.encode(format_prompt(history, args.model, sys_text))
+                        summary = None
+                        print(f"{YELLOW}[El resumen no cupo; se descarta]{RESET}")
+                    else:
+                        print(f"{DIM}[Contexto resumido: {len(summary)} caracteres]{RESET}")
+                elif args.context_summary and dropped:
+                    print(f"{DIM}[No se pudo generar resumen; se compacta sin él]{RESET}")
 
                 compacted = False
                 # Conserva el system prompt en el KV y la cola que coincide con
