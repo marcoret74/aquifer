@@ -139,9 +139,11 @@ public:
                 for (;;) {
                     if (sleeping_.load(std::memory_order_acquire)) {
                         std::unique_lock<std::mutex> lk(sleep_m_);
+                        sleep_ack_.fetch_add(1, std::memory_order_release);
                         sleep_cv_.wait(lk, [this] {
                             return !sleeping_.load(std::memory_order_acquire) || stop_;
                         });
+                        wake_ack_.fetch_add(1, std::memory_order_release);
                     }
                     go_.wait();
                     if (stop_) return;
@@ -157,14 +159,19 @@ public:
 
     void pause() {
         if (T_ <= 1 || sleeping_.load(std::memory_order_acquire)) return;
+        sleep_ack_.store(0, std::memory_order_relaxed);
         sleeping_.store(true, std::memory_order_release);
         run([](unsigned) {}); // despierta workers de go_ para que entren en sleep
+        // Esperar a que TODOS estén dormidos: si no, un resume seguido de un
+        // pause (comandos sin inferencia) puede perder el wake y colgar.
+        while (sleep_ack_.load(std::memory_order_acquire) < T_ - 1) _mm_pause();
     }
 
     void resume() {
-        if (!sleeping_.load(std::memory_order_acquire)) return;
-        sleeping_.store(false, std::memory_order_release);
+        if (!sleeping_.exchange(false, std::memory_order_acq_rel)) return;
+        wake_ack_.store(0, std::memory_order_relaxed);
         sleep_cv_.notify_all();
+        while (wake_ack_.load(std::memory_order_acquire) < T_ - 1) _mm_pause();
     }
 
     void run(std::function<void(unsigned)> f) {
@@ -177,6 +184,7 @@ private:
     std::function<void(unsigned)> job_;
     bool stop_ = false;
     std::atomic<bool> sleeping_{false};
+    std::atomic<unsigned> sleep_ack_{0}, wake_ack_{0};
     std::mutex sleep_m_;
     std::condition_variable sleep_cv_;
 };
