@@ -425,6 +425,9 @@ def main():
                     help="Penalización de repetición (1.0 = off; ej. 1.15)")
     ap.add_argument("--repeat-last-n", type=int, default=64,
                     help="Ventana de tokens para repetition penalty")
+    ap.add_argument("--stop", action="append", default=None, metavar="TEXTO",
+                    help="Secuencia de parada por texto (repetible). Se detecta en streaming, "
+                         "se suprime junto con lo que siga y se corta la generación")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
 
@@ -576,6 +579,10 @@ def main():
             ttft = None
             resp_tokens = []
             streamer = StreamDecoder(tok)
+            stop_seqs = [x for x in (args.stop or []) if x]
+            stop_buf = ""
+            answer_parts = []
+            stopped_by_seq = False
             for line in proc.stdout:
                 line_str = line.strip()
                 if line_str == "DONE":
@@ -618,8 +625,54 @@ def main():
                     # No imprimir etiquetas especiales
                     if any(sp in token_text for sp in ["<|im_end|>", "<|endoftext|>", "<｜end", "<think>", "</s>", "<|user|>", "<|assistant|>"]):
                         continue
-                    sys.stdout.write(token_text)
-                    sys.stdout.flush()
+
+                    if stop_seqs:
+                        # Buffer rodante: detecta la parada aunque cruce tokens.
+                        stop_buf += token_text
+                        hit = None
+                        for seq in stop_seqs:
+                            idx = stop_buf.find(seq)
+                            if idx != -1 and (hit is None or idx < hit[0]):
+                                hit = (idx, seq)
+                        if hit is not None:
+                            prefix = stop_buf[:hit[0]]
+                            if prefix:
+                                answer_parts.append(prefix)
+                                sys.stdout.write(prefix)
+                                sys.stdout.flush()
+                            stopped_by_seq = True
+                            try:
+                                proc.stdin.write("STOP\n")
+                                proc.stdin.flush()
+                            except Exception:
+                                pass
+                            for extra in proc.stdout:
+                                if extra.strip() == "DONE":
+                                    break
+                            break
+                        # Retiene solo el sufijo que podría ser prefijo de una parada.
+                        keep = 0
+                        for seq in stop_seqs:
+                            for k in range(min(len(seq) - 1, len(stop_buf)), 0, -1):
+                                if stop_buf.endswith(seq[:k]):
+                                    keep = max(keep, k)
+                                    break
+                        emit = len(stop_buf) - keep
+                        if emit > 0:
+                            out = stop_buf[:emit]
+                            stop_buf = stop_buf[emit:]
+                            answer_parts.append(out)
+                            sys.stdout.write(out)
+                            sys.stdout.flush()
+                    else:
+                        answer_parts.append(token_text)
+                        sys.stdout.write(token_text)
+                        sys.stdout.flush()
+            if stop_seqs and stop_buf and not stopped_by_seq:
+                answer_parts.append(stop_buf)
+                sys.stdout.write(stop_buf)
+                sys.stdout.flush()
+                stop_buf = ""
             t_end = time.time()
             ttft_val = ttft if ttft is not None else 0.0
             gen_time = (t_end - (t_start + ttft_val)) if len(resp_tokens) > 1 else max(0.001, t_end - t_start)
@@ -628,7 +681,10 @@ def main():
             sys.stdout.write(f"\n{BOLD}\033[90m[inicio: {ttft_val*1000:.0f}ms | {len(resp_tokens)} toks | {tok_s:.1f} tok/s]{RESET}\n\n")
             sys.stdout.flush()
 
-            assistant_text = tok.decode(resp_tokens).replace("<|im_end|>", "").replace("</s>", "").strip()
+            if stop_seqs:
+                assistant_text = "".join(answer_parts).strip()
+            else:
+                assistant_text = tok.decode(resp_tokens).replace("<|im_end|>", "").replace("</s>", "").strip()
             history.append(("assistant", assistant_text))
 
     finally:
