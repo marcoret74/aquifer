@@ -29,6 +29,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chat import (MODELS_CATALOG, StreamDecoder, format_prompt,  # noqa: E402
@@ -64,9 +65,10 @@ class Generation:
 
 
 class Metrics:
-    """Contadores agregados y percentiles simples, con lock."""
+    """Contadores agregados, histogramas y percentiles simples, con lock."""
 
     MAX_SAMPLES = 2000
+    BUCKETS_MS = (50, 100, 200, 400, 800, 1600, 3200, 6400, 12800)
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -84,6 +86,17 @@ class Metrics:
         self.by_status = {}
         self.latencies = []
         self.ttfts = []
+        self.latency_buckets = [0] * len(self.BUCKETS_MS)
+        self.ttft_buckets = [0] * len(self.BUCKETS_MS)
+        self.latency_sum = 0.0
+        self.ttft_sum = 0.0
+        self.latency_count = 0
+        self.ttft_count = 0
+        self.in_flight = 0
+
+    def begin(self):
+        with self.lock:
+            self.in_flight += 1
 
     def record(self, trace):
         with self.lock:
@@ -111,8 +124,25 @@ class Metrics:
                 self.compactions += 1
             self.tokens_in += int(trace.get("prompt_tokens") or 0)
             self.tokens_out += int(trace.get("completion_tokens") or 0)
-            self._push(self.latencies, trace.get("latency_ms"))
-            self._push(self.ttfts, trace.get("ttft_ms"))
+            lat = trace.get("latency_ms")
+            ttft = trace.get("ttft_ms")
+            self._push(self.latencies, lat)
+            self._push(self.ttfts, ttft)
+            if isinstance(lat, (int, float)):
+                self.latency_sum += float(lat)
+                self.latency_count += 1
+                self._bucket(self.latency_buckets, float(lat))
+            if isinstance(ttft, (int, float)):
+                self.ttft_sum += float(ttft)
+                self.ttft_count += 1
+                self._bucket(self.ttft_buckets, float(ttft))
+            self.in_flight = max(0, self.in_flight - 1)
+
+    @classmethod
+    def _bucket(cls, counts, value):
+        for i, limit in enumerate(cls.BUCKETS_MS):
+            if value <= limit:
+                counts[i] += 1
 
     @classmethod
     def _push(cls, values, v):
@@ -138,6 +168,7 @@ class Metrics:
                 "requests": {
                     "total": self.total, "ok": self.ok, "errors": self.errors,
                     "stream": self.streamed, "structured": self.structured,
+                    "in_flight": self.in_flight,
                 },
                 "by_status": dict(sorted(self.by_status.items())),
                 "tokens": {"prompt": self.tokens_in, "completion": self.tokens_out,
@@ -158,6 +189,101 @@ class Metrics:
                            "streamed": self.schema_streamed},
                 "compactions": self.compactions,
             }
+
+    @staticmethod
+    def _fmt(value):
+        if isinstance(value, float):
+            if value == int(value) and abs(value) < 1e15:
+                return str(int(value))
+            return ("%.3f" % value).rstrip("0").rstrip(".")
+        return str(value)
+
+    @staticmethod
+    def _label(value):
+        return (str(value).replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n"))
+
+    def prometheus(self, model, ctx, uptime_s, started_epoch):
+        """Exposición en formato Prometheus (text/plain 0.0.4)."""
+        with self.lock:
+            lat_b = list(self.latency_buckets)
+            ttft_b = list(self.ttft_buckets)
+            data = {
+                "total": self.total, "ok": self.ok, "errors": self.errors,
+                "stream": self.streamed, "structured": self.structured,
+                "retried": self.schema_retried, "failed": self.schema_failed,
+                "schema_streamed": self.schema_streamed,
+                "compactions": self.compactions,
+                "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
+                "in_flight": self.in_flight,
+                "lat_sum": self.latency_sum, "lat_count": self.latency_count,
+                "ttft_sum": self.ttft_sum, "ttft_count": self.ttft_count,
+                "by_status": dict(self.by_status),
+            }
+        out = []
+        add = out.append
+
+        add("# HELP aquifer_info Servidor y modelo")
+        add("# TYPE aquifer_info gauge")
+        add('aquifer_info{model="%s",ctx="%d"} 1' %
+            (self._label(model), int(ctx)))
+        add("# HELP aquifer_uptime_seconds Segundos desde el arranque")
+        add("# TYPE aquifer_uptime_seconds gauge")
+        add("aquifer_uptime_seconds %s" % self._fmt(float(uptime_s)))
+        add("# HELP aquifer_start_time_seconds Arranque (epoch)")
+        add("# TYPE aquifer_start_time_seconds gauge")
+        add("aquifer_start_time_seconds %s" % self._fmt(float(started_epoch)))
+
+        add("# HELP aquifer_requests_total Peticiones por estado HTTP")
+        add("# TYPE aquifer_requests_total counter")
+        for status, count in sorted(data["by_status"].items()):
+            add('aquifer_requests_total{status="%s"} %d' %
+                (self._label(status), count))
+        for name, help_text in (
+                ("aquifer_requests_ok_total", "Peticiones 2xx"),
+                ("aquifer_requests_errors_total", "Peticiones no 2xx"),
+                ("aquifer_requests_in_flight", "Peticiones en curso"),
+                ("aquifer_stream_requests_total", "Peticiones en streaming"),
+                ("aquifer_structured_requests_total", "Peticiones estructuradas"),
+                ("aquifer_schema_retried_total", "Peticiones con reintento de esquema"),
+                ("aquifer_schema_failed_total", "Salidas estructuradas inválidas"),
+                ("aquifer_schema_streamed_total", "Salidas estructuradas en streaming"),
+                ("aquifer_compactions_total", "Compactaciones de KV")):
+            kind = "gauge" if name.endswith("in_flight") else "counter"
+            add("# HELP %s %s" % (name, help_text))
+            add("# TYPE %s %s" % (name, kind))
+            key = {"aquifer_requests_ok_total": "ok",
+                   "aquifer_requests_errors_total": "errors",
+                   "aquifer_requests_in_flight": "in_flight",
+                   "aquifer_stream_requests_total": "stream",
+                   "aquifer_structured_requests_total": "structured",
+                   "aquifer_schema_retried_total": "retried",
+                   "aquifer_schema_failed_total": "failed",
+                   "aquifer_schema_streamed_total": "schema_streamed",
+                   "aquifer_compactions_total": "compactions"}[name]
+            add("%s %d" % (name, data[key]))
+
+        add("# HELP aquifer_tokens_total Tokens procesados o generados")
+        add("# TYPE aquifer_tokens_total counter")
+        add('aquifer_tokens_total{direction="prompt"} %d' % data["tokens_in"])
+        add('aquifer_tokens_total{direction="completion"} %d' % data["tokens_out"])
+
+        for name, buckets, total_sum, count, help_text in (
+                ("aquifer_request_latency_ms", lat_b, data["lat_sum"],
+                 data["lat_count"],
+                 "Latencia total del request en milisegundos"),
+                ("aquifer_ttft_ms", ttft_b, data["ttft_sum"],
+                 data["ttft_count"],
+                 "Tiempo hasta el primer token en milisegundos")):
+            add("# HELP %s %s" % (name, help_text))
+            add("# TYPE %s histogram" % name)
+            for limit, count_b in zip(self.BUCKETS_MS, buckets):
+                add('%s_bucket{le="%d"} %d' % (name, limit, count_b))
+            add('%s_bucket{le="+Inf"} %d' % (name, count))
+            add("%s_sum %s" % (name, self._fmt(float(total_sum))))
+            add("%s_count %d" % (name, count))
+
+        return "\n".join(out) + "\n"
 
 
 def stop_hit(buf, stops):
@@ -478,6 +604,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_text(self, status, text, content_type="text/plain; charset=utf-8"):
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
     def _error(self, err):
         # Si no se consumió el cuerpo, cerrar evita desincronizar keep-alive.
         self.close_connection = True
@@ -563,7 +698,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path in ("/health", "/healthz"):
+            parsed = urlsplit(self.path)
+            path = parsed.path
+            if path in ("/health", "/healthz"):
                 st = self.state
                 self._send_json(200, {
                     "status": "ok" if st.engine.alive() else "engine_down",
@@ -571,22 +708,32 @@ class Handler(BaseHTTPRequestHandler):
                     "ctx": st.ctx,
                     "uptime_s": round(time.time() - st.started, 1),
                 })
-            elif self.path == "/metrics":
-                snap = self.state.metrics.snapshot()
-                snap["uptime_s"] = round(time.time() - self.state.started, 1)
-                snap["model"] = self.state.model
-                snap["ctx"] = self.state.ctx
-                self._send_json(200, snap)
-            elif self.path.startswith("/v1/") and not self._auth():
+            elif path in ("/metrics", "/metrics/prometheus"):
+                want_prom = (path == "/metrics/prometheus" or
+                             "prometheus" in parse_qs(parsed.query).get("format", []))
+                st = self.state
+                if want_prom:
+                    text = st.metrics.prometheus(
+                        st.model, st.ctx, time.time() - st.started, st.started)
+                    self._send_text(
+                        200, text,
+                        "text/plain; version=0.0.4; charset=utf-8")
+                else:
+                    snap = st.metrics.snapshot()
+                    snap["uptime_s"] = round(time.time() - st.started, 1)
+                    snap["model"] = st.model
+                    snap["ctx"] = st.ctx
+                    self._send_json(200, snap)
+            elif path.startswith("/v1/") and not self._auth():
                 raise ApiError(401, "API key inválida", "authentication_error")
-            elif self.path == "/v1/models":
+            elif path == "/v1/models":
                 self._send_json(200, {"object": "list", "data": [{
                     "id": self.state.model,
                     "object": "model",
                     "created": self.state.created,
                     "owned_by": "semantic-geometry",
                 }]})
-            elif self.path == "/v1/models/catalog":
+            elif path == "/v1/models/catalog":
                 data = []
                 for m in MODELS_CATALOG:
                     data.append({
@@ -615,6 +762,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
         trace = self._new_trace()
+        self.state.metrics.begin()
         try:
             if not self._auth():
                 raise ApiError(401, "API key inválida", "authentication_error")
@@ -1198,8 +1346,8 @@ def main():
     print("  escucha : http://%s:%d" % (args.host, args.port))
     print("  modelo  : %s   ctx: %d   default n: %d" %
           (args.model, args.ctx, engine_args.n))
-    print("  rutas   : GET /health · GET /metrics · GET /v1/models · "
-          "POST /v1/chat/completions")
+    print("  rutas   : GET /health · GET /metrics (JSON) · "
+          "GET /metrics/prometheus · GET /v1/models · POST /v1/chat/completions")
     if args.trace_log:
         print("  trazas  : %s%s" % (
             args.trace_log, " (con contenido)" if args.trace_content else ""))

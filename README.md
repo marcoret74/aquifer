@@ -66,7 +66,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Resumen de contexto antes de compactar (`--summary-tokens`, `--no-context-summary`).** Cuando el contexto se llena, el chat resume los mensajes que va a descartar con el mismo motor (greedy, presupuesto acotado), guarda y restaura el KV alrededor del resumen, e inyecta el resumen en el turno nuevo antes de compactar. Así se conservan nombres, números y decisiones aunque el hueco salga de la ventana de atención. En el servidor HTTP la historia la posee el cliente: allí se compacta el KV y el resumen queda a cargo del orquestador.
 - **Compactación con KV (`COMPACT`).** Al llenarse el contexto, en vez de resetear todo el KV y re-prellenar el historial, el motor conserva el system prompt y mueve al frente la cola que coincide con el prompt recortado. Las claves ya calculadas no se recalculan ni se re-rotan: se ajusta `pos_base` (desplazamiento RoPE) para que los tokens conservados mantengan su posición absoluta. Medido en Qwen 0.5B con `ctx 256`: 132 ms de TTFT tras compactar contra 1423 ms del reset completo. `--no-kv-compact` recupera el comportamiento anterior.
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
-- **Métricas y trazas por request (`/metrics`, `--trace-log`).** Cada llamada registra latencia total, TTFT, cola, tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256 de prompt, conversación y esquema, intentos de esquema y compactaciones de KV. Agregados en `/metrics` (p50/p95) y traza JSONL opcional con `--trace-log` (`--trace-content` para incluir la respuesta). Pensado para auditar pilotos y depurar el orquestador.
+- **Métricas y trazas por request (`/metrics`, `/metrics/prometheus`, `--trace-log`).** Cada llamada registra latencia total, TTFT, cola, tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256 de prompt, conversación y esquema, intentos de esquema y compactaciones de KV. Agregados en `/metrics` (p50/p95) y `/metrics/prometheus` (histogramas, contadores, in-flight), y traza JSONL opcional con `--trace-log` (`--trace-content` para incluir la respuesta). Pensado para auditar pilotos y depurar el orquestador.
 - **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. Con `stream: true` emite el JSON incremental, corta al cerrar el objeto y publica el veredicto en `x_aquifer.valid` (sin reintentos). El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
 - **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
 - **Stop sequences por texto (`--stop`, repetible).** El chat acumula el texto decodificado en un buffer rodante, detecta la parada aunque cruce varios tokens, imprime solo lo anterior, envía `STOP` al motor y drena hasta `DONE`. El historial se trunca en la parada. Es lógica de chat/orquestador: el kernel no cambia y `--eos` sigue siendo el corte por ID de token.
@@ -275,7 +275,8 @@ Rutas:
 | Método | Ruta | Descripción |
 | :--- | :--- | :--- |
 | `GET` | `/health` | Estado del motor, modelo y `ctx`. |
-| `GET` | `/metrics` | Contadores, tokens, latencias p50/p95, esquema y compactaciones. |
+| `GET` | `/metrics` | Contadores, tokens, latencias p50/p95, esquema y compactaciones (JSON). |
+| `GET` | `/metrics/prometheus` | Mismo estado en formato Prometheus 0.0.4 (`?format=prometheus` también). |
 | `GET` | `/v1/models` | Modelo servido, formato OpenAI. |
 | `GET` | `/v1/models/catalog` | Catálogo local de modelos disponibles. |
 | `POST` | `/v1/chat/completions` | Chat con `stream: true` o `false`. |
@@ -330,6 +331,36 @@ curl -s localhost:8080/metrics | python3 -m json.tool
   "schema": {"retried": 1, "failed": 2, "streamed": 4},
   "compactions": 2
 }
+```
+
+Formato Prometheus (histogramas reales de latencia y TTFT):
+
+```bash
+curl -s localhost:8080/metrics/prometheus
+# o
+curl -s 'localhost:8080/metrics?format=prometheus'
+```
+
+```text
+# TYPE aquifer_requests_total counter
+aquifer_requests_total{status="200"} 11
+# TYPE aquifer_request_latency_ms histogram
+aquifer_request_latency_ms_bucket{le="200"} 8
+aquifer_request_latency_ms_bucket{le="+Inf"} 12
+aquifer_request_latency_ms_sum 9608.4
+aquifer_request_latency_ms_count 12
+```
+
+También expone `aquifer_tokens_total{direction="prompt|completion"}`,
+`aquifer_schema_{retried,failed,streamed}_total`, `aquifer_compactions_total`,
+`aquifer_requests_in_flight`, `aquifer_uptime_seconds` y `aquifer_info{model,ctx}`.
+Se puede apuntar Prometheus directo:
+
+```yaml
+scrape_configs:
+  - job_name: aquifer
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
 ```
 
 Las respuestas incluyen `x_aquifer` con los mismos datos de la traza, y las
