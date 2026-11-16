@@ -31,6 +31,7 @@ def main():
         "prompt_tokens": 10, "completion_tokens": 5,
         "latency_ms": 120.0, "ttft_ms": 40.0, "schema_attempts": 1,
         "compact": {"status": "ok", "kept": 50},
+        "tools": ["sumar"], "tool_calls": 1, "tool_name": "sumar",
     })
     m.begin()
     m.record({
@@ -58,6 +59,8 @@ def main():
     check("tokens completion",
           'aquifer_tokens_total{direction="completion"} 8' in text)
     check("compactions", "aquifer_compactions_total 1" in text)
+    check("tool requests", "aquifer_tool_requests_total 1" in text)
+    check("tool calls", "aquifer_tool_calls_total 1" in text)
     check("schema failed", "aquifer_schema_failed_total 2" in text)
     check("schema streamed", "aquifer_schema_streamed_total 1" in text)
     check("latencia count",
@@ -92,6 +95,8 @@ def main():
     snap = m.snapshot()
     check("snapshot in_flight", snap["requests"]["in_flight"] == 0)
     check("snapshot schema", snap["schema"]["failed"] == 2)
+    check("snapshot tools", snap["tools"] == {"requests": 1, "calls": 1},
+          snap.get("tools"))
 
     if FAILED:
         print("FALLARON %d de %d pruebas:" % (len(FAILED), TOTAL))

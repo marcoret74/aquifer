@@ -64,6 +64,69 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def canonical_hash(value):
+    return sha256_bytes(canonical_bytes(value))
+
+
+def verify_trace_chain(lines, hmac_key=None):
+    """Verifica una cadena de trazas: prev, seq, sha256 y HMAC opcional."""
+    zeros = "0" * 64
+    prev = zeros
+    expected_seq = 1
+    entries = 0
+    head = zeros
+    problems = []
+    warnings = []
+    for lineno, raw in enumerate(lines, 1):
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                problems.append("línea %d: UTF-8 inválido" % lineno)
+                continue
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            problems.append("línea %d: JSON inválido" % lineno)
+            continue
+        chain = data.get("chain")
+        if not isinstance(chain, dict):
+            # Prefijo legado sin cadena: se ignora para la verificación.
+            continue
+        body = {k: v for k, v in data.items() if k != "chain"}
+        entry = canonical_hash({"prev": chain.get("prev"), "body": body})
+        if chain.get("prev") != prev:
+            problems.append("línea %d: prev no continúa la cadena" % lineno)
+        if chain.get("sha256") != entry:
+            problems.append("línea %d: hash de entrada no coincide" % lineno)
+        if chain.get("seq") != expected_seq:
+            problems.append("línea %d: seq %r != %d" %
+                            (lineno, chain.get("seq"), expected_seq))
+        sig = chain.get("sig")
+        if sig:
+            if not hmac_key:
+                warnings.append("línea %d: firma HMAC no verificada" % lineno)
+            else:
+                expected = hmac.new(hmac_key, entry.encode("ascii"),
+                                    hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(expected, sig):
+                    problems.append("línea %d: HMAC no coincide" % lineno)
+        prev = str(chain.get("sha256") or "")
+        head = prev
+        expected_seq += 1
+        entries += 1
+    return {
+        "ok": not problems,
+        "entries": entries,
+        "head": head,
+        "problems": problems,
+        "warnings": warnings,
+    }
+
+
 def conversation_hash(session):
     messages = [[str(r), str(t)] for r, t in session.get("history", [])]
     return sha256_bytes(canonical_bytes({
@@ -180,7 +243,8 @@ def _write_bundle(stage, out):
 
 
 def export_bundle(session_base, out, include_kv=False, traces=None, note=None,
-                  hmac_key=None, sign_key=None, parent_bundle=None):
+                  hmac_key=None, sign_key=None, parent_bundle=None,
+                  traces_hmac_key=None):
     kv_path = session_base + ".kv"
     json_path = session_base + ".json"
     if not os.path.exists(json_path):
@@ -241,6 +305,14 @@ def export_bundle(session_base, out, include_kv=False, traces=None, note=None,
                 raise BundleError("no existe el trace log: %s" % traces)
             with open(traces, "rb") as f:
                 traces_raw = f.read()
+            chain_key = None
+            if traces_hmac_key:
+                with open(traces_hmac_key, "rb") as f:
+                    chain_key = f.read()
+            chain = verify_trace_chain(traces_raw.splitlines(), chain_key)
+            if not chain["ok"]:
+                raise BundleError("la cadena de trazas está rota: %s" %
+                                  "; ".join(chain["problems"][:3]))
             with open(os.path.join(stage, "traces.jsonl"), "wb") as f:
                 f.write(traces_raw)
             traces_meta = {
@@ -249,6 +321,11 @@ def export_bundle(session_base, out, include_kv=False, traces=None, note=None,
                 "included": True,
                 "lines": traces_raw.count(b"\n"),
                 "source": os.path.basename(traces),
+                "chain": {
+                    "ok": chain["ok"],
+                    "entries": chain["entries"],
+                    "head": chain["head"],
+                },
             }
             entries.append({"path": "traces.jsonl",
                             "sha256": traces_meta["sha256"],
@@ -331,7 +408,8 @@ def export_bundle(session_base, out, include_kv=False, traces=None, note=None,
     }
 
 
-def verify_bundle(bundle, hmac_key=None, pubkey=None, parent_bundle=None):
+def verify_bundle(bundle, hmac_key=None, pubkey=None, parent_bundle=None,
+                  traces_hmac_key=None):
     files = _read_bundle(bundle)
     problems = []
     checks = []
@@ -417,6 +495,17 @@ def verify_bundle(bundle, hmac_key=None, pubkey=None, parent_bundle=None):
     else:
         check("firma", True, "sin firma (solo hashes)")
 
+    if "traces.jsonl" in files and manifest.get("traces"):
+        chain_key = None
+        if traces_hmac_key:
+            with open(traces_hmac_key, "rb") as f:
+                chain_key = f.read()
+        chain = verify_trace_chain(files["traces.jsonl"].splitlines(), chain_key)
+        check("cadena de trazas", chain["ok"],
+              "%d entradas, head %s" % (chain["entries"], chain["head"][:16]))
+        for warn in chain["warnings"][:3]:
+            checks.append(("traza (aviso)", True, warn))
+
     parent = manifest.get("parent") or {}
     if parent.get("manifest_sha256"):
         if parent_bundle:
@@ -466,6 +555,8 @@ def main():
     ex.add_argument("--traces", default=None, metavar="JSONL",
                     help="Incluir un trace log del servidor")
     ex.add_argument("--note", default=None, help="Nota libre en el manifiesto")
+    ex.add_argument("--traces-hmac-key", default=None, metavar="CLAVE",
+                    help="Clave HMAC para verificar la cadena de trazas")
     ex.add_argument("--hmac-key", default=None, metavar="CLAVE",
                     help="Firmar con HMAC-SHA256 usando esta clave")
     ex.add_argument("--sign-key", default=None, metavar="PEM",
@@ -478,9 +569,15 @@ def main():
     ve.add_argument("--hmac-key", default=None, metavar="CLAVE")
     ve.add_argument("--pubkey", default=None, metavar="PEM")
     ve.add_argument("--parent-bundle", default=None, metavar="BUNDLE")
+    ve.add_argument("--traces-hmac-key", default=None, metavar="CLAVE")
 
     ins = sub.add_parser("inspect", help="Mostrar el manifiesto")
     ins.add_argument("--bundle", required=True, metavar="DESTINO")
+
+    vt = sub.add_parser("verify-traces",
+                        help="Verificar una cadena de trazas JSONL")
+    vt.add_argument("--file", required=True, metavar="JSONL")
+    vt.add_argument("--hmac-key", default=None, metavar="CLAVE")
 
     args = ap.parse_args()
     try:
@@ -489,7 +586,8 @@ def main():
                 args.session, args.out, include_kv=args.include_kv,
                 traces=args.traces, note=args.note,
                 hmac_key=args.hmac_key, sign_key=args.sign_key,
-                parent_bundle=args.parent_bundle)
+                parent_bundle=args.parent_bundle,
+                traces_hmac_key=args.traces_hmac_key)
             print("Bundle   : %s" % result["bundle"])
             print("Manifest : %s" % result["manifest_sha256"])
             print("Conversa : %s" % result["conversation_sha256"])
@@ -501,7 +599,8 @@ def main():
         if args.cmd == "verify":
             result = verify_bundle(args.bundle, hmac_key=args.hmac_key,
                                    pubkey=args.pubkey,
-                                   parent_bundle=args.parent_bundle)
+                                   parent_bundle=args.parent_bundle,
+                                   traces_hmac_key=args.traces_hmac_key)
             _print_checks(result)
             return 0 if result["ok"] else 1
         if args.cmd == "inspect":
@@ -509,6 +608,25 @@ def main():
             manifest = _parse_manifest(files["manifest.json"])
             print(json.dumps(manifest, ensure_ascii=False, indent=2,
                              sort_keys=True))
+            return 0
+        if args.cmd == "verify-traces":
+            with open(args.file, "rb") as f:
+                lines = f.read().splitlines()
+            key = None
+            if args.hmac_key:
+                with open(args.hmac_key, "rb") as f:
+                    key = f.read()
+            result = verify_trace_chain(lines, key)
+            print("Entradas : %d" % result["entries"])
+            print("Head     : %s" % result["head"])
+            for warn in result["warnings"][:10]:
+                print("  [aviso] %s" % warn)
+            if result["problems"]:
+                print("PROBLEMAS:")
+                for problem in result["problems"][:20]:
+                    print("  - %s" % problem)
+                return 1
+            print("CADENA OK")
             return 0
     except BundleError as err:
         print("Error: %s" % err, file=sys.stderr)

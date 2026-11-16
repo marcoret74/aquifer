@@ -78,6 +78,8 @@ test: tests
 	@echo ""
 	@python3 tools/test_prometheus.py
 	@echo ""
+	@python3 tools/test_tools.py
+	@echo ""
 	@echo ">>> TODOS LOS TESTS DE AQUIFER PASARON CON ÉXITO <<<"
 
 clean:

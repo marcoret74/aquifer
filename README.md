@@ -66,6 +66,8 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Resumen de contexto antes de compactar (`--summary-tokens`, `--no-context-summary`).** Cuando el contexto se llena, el chat resume los mensajes que va a descartar con el mismo motor (greedy, presupuesto acotado), guarda y restaura el KV alrededor del resumen, e inyecta el resumen en el turno nuevo antes de compactar. Así se conservan nombres, números y decisiones aunque el hueco salga de la ventana de atención. En el servidor HTTP la historia la posee el cliente: allí se compacta el KV y el resumen queda a cargo del orquestador.
 - **Compactación con KV (`COMPACT`).** Al llenarse el contexto, en vez de resetear todo el KV y re-prellenar el historial, el motor conserva el system prompt y mueve al frente la cola que coincide con el prompt recortado. Las claves ya calculadas no se recalculan ni se re-rotan: se ajusta `pos_base` (desplazamiento RoPE) para que los tokens conservados mantengan su posición absoluta. Medido en Qwen 0.5B con `ctx 256`: 132 ms de TTFT tras compactar contra 1423 ms del reset completo. `--no-kv-compact` recupera el comportamiento anterior.
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
+- **Tool calling local (`tools` en `/v1/chat/completions`).** El modelo emite `<tool_call>{...}</tool_call>`; el servidor parsea (incluye reparación de JSON laxo), valida argumentos contra el esquema de la herramienta y devuelve `tool_calls` estilo OpenAI. Soporta `tool_choice` auto/none/forzado, mensajes `role:"tool"`, streaming bufferizado y `422 invalid_tool_call` con detalles. Sin ejecutar herramientas: eso queda en el orquestador.
+- **Cadena de trazas append-only (`--trace-log` + `--trace-hmac-key`).** Cada traza enlaza el hash de la anterior (`seq`, `prev`, `sha256`) y opcionalmente se firma con HMAC. `bundle.py verify-traces` detecta borrados, alteraciones y reordenamientos; la cadena se reanuda tras reiniciar el servidor.
 - **Métricas y trazas por request (`/metrics`, `/metrics/prometheus`, `--trace-log`).** Cada llamada registra latencia total, TTFT, cola, tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256 de prompt, conversación y esquema, intentos de esquema y compactaciones de KV. Agregados en `/metrics` (p50/p95) y `/metrics/prometheus` (histogramas, contadores, in-flight), y traza JSONL opcional con `--trace-log` (`--trace-content` para incluir la respuesta). Pensado para auditar pilotos y depurar el orquestador.
 - **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. Con `stream: true` emite el JSON incremental, corta al cerrar el objeto y publica el veredicto en `x_aquifer.valid` (sin reintentos). El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
 - **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
@@ -299,6 +301,62 @@ r = client.chat.completions.create(
 print(r.choices[0].message.content)
 ```
 
+#### Tool calling (function calling)
+
+```bash
+curl -s localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "¿Cuánto es 2 + 3? Usa sumar."}],
+    "max_tokens": 80,
+    "tools": [{"type": "function", "function": {
+      "name": "sumar",
+      "description": "Suma dos números.",
+      "parameters": {
+        "type": "object", "required": ["a", "b"],
+        "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+        "additionalProperties": false
+      }
+    }}]
+  }'
+```
+
+El modelo responde con un marcador:
+
+```text
+<tool_call>{"name":"sumar","arguments":{"a":2,"b":3}}</tool_call>
+```
+
+y el servidor devuelve formato OpenAI:
+
+```json
+{"choices": [{
+  "message": {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [{
+      "id": "call_...",
+      "type": "function",
+      "function": {"name": "sumar", "arguments": "{\"a\": 2, \"b\": 3}"}
+    }]
+  },
+  "finish_reason": "tool_calls"
+}]}
+```
+
+- `tool_choice`: `auto` (default), `none`, o
+  `{"type":"function","function":{"name":"sumar"}}` para forzar.
+- Los argumentos se validan contra `parameters` (mismo subconjunto de JSON
+  Schema). Si la llamada es inválida se reintenta con feedback
+  (`--json-retries`) y luego se responde `422 invalid_tool_call` con detalles.
+- Para continuar, el cliente manda el mensaje del asistente con `tool_calls` y
+  un mensaje `{"role":"tool","tool_call_id":"...","content":"5"}`.
+- Con `stream: true` la llamada se bufferea y se entrega en un chunk
+  `delta.tool_calls`, con `finish_reason: "tool_calls"`.
+- Se aceptan claves sin comillas o comillas simples en el JSON generado
+  (`{a:10,b:5}`) y se reparan antes de validar.
+- Métricas: `aquifer_tool_requests_total`, `aquifer_tool_calls_total`.
+
 #### Métricas y trazas
 
 Cada request deja una **traza** con latencia total, TTFT, tiempo de cola,
@@ -333,6 +391,24 @@ curl -s localhost:8080/metrics | python3 -m json.tool
 }
 ```
 
+#### Cadena de trazas append-only
+
+```bash
+python3 tools/serve.py --model qwen05 --port 8080 \
+  --trace-log ~/.cache/aquifer/traces.jsonl \
+  --trace-hmac-key ~/.cache/aquifer/trace.key
+
+python3 tools/bundle.py verify-traces \
+  --file ~/.cache/aquifer/traces.jsonl \
+  --hmac-key ~/.cache/aquifer/trace.key
+```
+
+Cada línea incluye `chain: {seq, prev, sha256, sig?}`: `prev` es el hash de la
+entrada anterior, así que borrar, alterar o reordenar líneas rompe la
+verificación. Con `--trace-hmac-key` cada entrada también se firma. La cadena
+se reanuda al reiniciar el servidor. Al exportar un bundle con `--traces`, una
+cadena rota se rechaza; `verify` también la comprueba.
+
 Formato Prometheus (histogramas reales de latencia y TTFT):
 
 ```bash
@@ -362,6 +438,10 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:8080"]
 ```
+
+Ejemplos listos para el piloto en [`docs/monitoring/`](docs/monitoring/):
+scrape de Prometheus, alertas, dashboard de Grafana (13 paneles) y
+`docker-compose.yml` con provisioning automático.
 
 Las respuestas incluyen `x_aquifer` con los mismos datos de la traza, y las
 cabeceras `x-aquifer-request-id`, `x-aquifer-latency-ms`, `x-aquifer-prompt-sha256`,

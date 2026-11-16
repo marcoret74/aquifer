@@ -14,6 +14,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUNDLE = os.path.join(HERE, "bundle.py")
+sys.path.insert(0, HERE)
+import bundle as B  # noqa: E402
 FAILED = []
 TOTAL = 0
 
@@ -83,9 +85,11 @@ def test_hmac(root):
     check("hmac re-export", r.returncode == 0, r.stderr)
     out2 = os.path.join(root, "b_hmac2")
     sig = os.path.join(out2, "manifest.sig")
-    with open(sig, "r+b") as f:
-        f.seek(0)
-        f.write(b"\x00")
+    with open(sig, "rb") as f:
+        data = bytearray(f.read())
+    data[0] ^= 0xFF
+    with open(sig, "wb") as f:
+        f.write(data)
     r = run("verify", "--bundle", out2, "--hmac-key", key)
     check("hmac detecta firma alterada", r.returncode == 1, r.stdout)
 
@@ -128,6 +132,67 @@ def test_parent(root):
     r = run("verify", "--bundle", child, "--parent-bundle",
             os.path.join(root, "b_kv"))
     check("cadena rota", r.returncode == 1, r.stdout)
+
+
+def make_chain(path, key, count=3):
+    prev = "0" * 64
+    lines = []
+    for i in range(count):
+        body = {"ts": "2026-01-01T00:00:0%dZ" % i, "status": 200, "n": i}
+        entry = B.canonical_hash({"prev": prev, "body": body})
+        chain = {"seq": i + 1, "prev": prev, "sha256": entry}
+        if key:
+            import hashlib
+            import hmac as hm
+            chain["sig"] = hm.new(key, entry.encode("ascii"),
+                                  hashlib.sha256).hexdigest()
+        lines.append(json.dumps(dict(body, chain=chain), ensure_ascii=False))
+        prev = entry
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return lines
+
+
+def test_chain(root):
+    key = os.urandom(32)
+    key_path = os.path.join(root, "chain.key")
+    with open(key_path, "wb") as f:
+        f.write(key)
+    path = os.path.join(root, "traces.jsonl")
+    lines = make_chain(path, key)
+
+    result = B.verify_trace_chain([l.encode() for l in lines], key)
+    check("cadena válida", result["ok"], result["problems"])
+    check("cadena entradas", result["entries"] == 3, result["entries"])
+
+    bad = [l.encode() for l in lines]
+    bad[1] = bad[1].replace(b'"status": 200', b'"status": 500')
+    result = B.verify_trace_chain(bad, key)
+    check("cadena detecta tamper", not result["ok"])
+
+    result = B.verify_trace_chain([l.encode() for l in lines], os.urandom(32))
+    check("cadena detecta clave errónea", not result["ok"])
+
+    r = run("verify-traces", "--file", path, "--hmac-key", key_path)
+    check("verify-traces CLI", r.returncode == 0, r.stderr or r.stdout)
+
+    tampered = os.path.join(root, "traces_bad.jsonl")
+    with open(tampered, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).replace('"n": 1', '"n": 99') + "\n")
+    r = run("verify-traces", "--file", tampered, "--hmac-key", key_path)
+    check("verify-traces tamper", r.returncode == 1, r.stdout)
+
+    base = make_session(root, "ses_chain")
+    out = os.path.join(root, "b_chain")
+    r = run("export", "--session", base, "--out", out, "--traces", path,
+            "--traces-hmac-key", key_path)
+    check("bundle con cadena", r.returncode == 0, r.stderr)
+    r = run("verify", "--bundle", out, "--traces-hmac-key", key_path)
+    check("bundle verify cadena", r.returncode == 0, r.stdout)
+
+    r = run("export", "--session", base, "--out", os.path.join(root, "b_bad"),
+            "--traces", tampered, "--traces-hmac-key", key_path)
+    check("bundle rechaza cadena rota", r.returncode == 2, r.stdout + r.stderr)
 
 
 def test_openssl(root):
@@ -177,6 +242,7 @@ def main():
         test_hmac(root)
         test_kv_and_zip(root)
         test_parent(root)
+        test_chain(root)
         test_openssl(root)
     if FAILED:
         print("FALLARON %d de %d pruebas:" % (len(FAILED), TOTAL))

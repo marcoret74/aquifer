@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -81,6 +82,8 @@ class Metrics:
         self.schema_failed = 0
         self.schema_streamed = 0
         self.compactions = 0
+        self.tool_requests = 0
+        self.tool_calls = 0
         self.tokens_in = 0
         self.tokens_out = 0
         self.by_status = {}
@@ -122,6 +125,10 @@ class Metrics:
             compact = trace.get("compact") or {}
             if compact.get("status") == "ok":
                 self.compactions += 1
+            if trace.get("tools"):
+                self.tool_requests += 1
+            if trace.get("tool_calls"):
+                self.tool_calls += 1
             self.tokens_in += int(trace.get("prompt_tokens") or 0)
             self.tokens_out += int(trace.get("completion_tokens") or 0)
             lat = trace.get("latency_ms")
@@ -187,6 +194,8 @@ class Metrics:
                 "schema": {"retried": self.schema_retried,
                            "failed": self.schema_failed,
                            "streamed": self.schema_streamed},
+                "tools": {"requests": self.tool_requests,
+                          "calls": self.tool_calls},
                 "compactions": self.compactions,
             }
 
@@ -214,6 +223,8 @@ class Metrics:
                 "retried": self.schema_retried, "failed": self.schema_failed,
                 "schema_streamed": self.schema_streamed,
                 "compactions": self.compactions,
+                "tool_requests": self.tool_requests,
+                "tool_calls": self.tool_calls,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
                 "in_flight": self.in_flight,
                 "lat_sum": self.latency_sum, "lat_count": self.latency_count,
@@ -248,6 +259,8 @@ class Metrics:
                 ("aquifer_schema_retried_total", "Peticiones con reintento de esquema"),
                 ("aquifer_schema_failed_total", "Salidas estructuradas inválidas"),
                 ("aquifer_schema_streamed_total", "Salidas estructuradas en streaming"),
+                ("aquifer_tool_requests_total", "Peticiones con herramientas"),
+                ("aquifer_tool_calls_total", "Llamadas de herramienta emitidas"),
                 ("aquifer_compactions_total", "Compactaciones de KV")):
             kind = "gauge" if name.endswith("in_flight") else "counter"
             add("# HELP %s %s" % (name, help_text))
@@ -260,6 +273,8 @@ class Metrics:
                    "aquifer_schema_retried_total": "retried",
                    "aquifer_schema_failed_total": "failed",
                    "aquifer_schema_streamed_total": "schema_streamed",
+                   "aquifer_tool_requests_total": "tool_requests",
+                   "aquifer_tool_calls_total": "tool_calls",
                    "aquifer_compactions_total": "compactions"}[name]
             add("%s %d" % (name, data[key]))
 
@@ -370,6 +385,47 @@ class JsonStreamFilter:
         emitted = "".join(out)
         self.text += emitted
         return emitted
+
+
+def read_last_chain(path):
+    """Devuelve (seq, hash) del último eslabón, o (0, ceros) si no hay."""
+    zeros = "0" * 64
+    if not path or not os.path.exists(path):
+        return 0, zeros
+    last = None
+    try:
+        with open(path, "rb") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    last = line
+    except OSError as err:
+        raise SystemExit("no se pudo leer el trace log: %s" % err)
+    if not last:
+        return 0, zeros
+    try:
+        data = json.loads(last.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise SystemExit(
+            "trace log corrupto en la última línea; usa otro --trace-log")
+    chain = data.get("chain") or {}
+    if chain.get("sha256"):
+        return int(chain.get("seq", 0)), str(chain["sha256"])
+    return 0, zeros
+
+
+def relaxed_json(text):
+    """Repara JSON laxo típico de modelos chicos (claves sin comillas, etc.)."""
+    s = text.strip()
+    if not s:
+        raise SchemaError("salida vacía")
+    s = re.sub(r"([{,{]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:", r'\1"\2":', s)
+    s = s.replace("'", '"')
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    s = re.sub(r"\bTrue\b", "true", s)
+    s = re.sub(r"\bFalse\b", "false", s)
+    s = re.sub(r"\bNone\b", "null", s)
+    return extract_json(s)
 
 
 def content_text(content):
@@ -573,6 +629,13 @@ class State:
         self.trace_path = args.trace_log
         self.trace_content = args.trace_content
         self.trace_lock = threading.Lock()
+        self.trace_hmac_key = None
+        if getattr(args, "trace_hmac_key", None):
+            with open(args.trace_hmac_key, "rb") as f:
+                self.trace_hmac_key = f.read()
+            if len(self.trace_hmac_key) < 16:
+                raise SystemExit("la clave de trazas debe tener al menos 16 bytes")
+        self.chain_seq, self.chain_last = read_last_chain(self.trace_path)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -660,10 +723,13 @@ class Handler(BaseHTTPRequestHandler):
             trace["error_type"] = err.kind
             trace["error_message"] = err.message
             if isinstance(err.details, dict):
+                tool_err = err.kind == "invalid_tool_call"
                 if "attempts" in err.details:
-                    trace["schema_attempts"] = err.details["attempts"]
+                    trace["tool_attempts" if tool_err else "schema_attempts"] = \
+                        err.details["attempts"]
                 if "errors" in err.details:
-                    trace["schema_errors"] = err.details["errors"][:10]
+                    trace["tool_errors" if tool_err else "schema_errors"] = \
+                        err.details["errors"][:10]
         if "latency_ms" not in trace:
             trace["latency_ms"] = round(
                 (time.monotonic() - trace["_t0"]) * 1000.0, 1)
@@ -675,6 +741,17 @@ class Handler(BaseHTTPRequestHandler):
         row["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         try:
             with self.state.trace_lock:
+                seq = self.state.chain_seq + 1
+                prev = self.state.chain_last
+                entry = canonical_hash({"prev": prev, "body": row})
+                chain = {"seq": seq, "prev": prev, "sha256": entry}
+                if self.state.trace_hmac_key:
+                    chain["sig"] = hmac.new(
+                        self.state.trace_hmac_key, entry.encode("ascii"),
+                        hashlib.sha256).hexdigest()
+                row["chain"] = chain
+                self.state.chain_seq = seq
+                self.state.chain_last = entry
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(row, ensure_ascii=False) + "\n")
         except OSError as exc:
@@ -686,7 +763,8 @@ class Handler(BaseHTTPRequestHandler):
                 "queue_ms", "prompt_tokens", "completion_tokens",
                 "tokens_per_s", "finish_reason", "prompt_sha256",
                 "conversation_sha256", "response_format", "schema_name",
-                "schema_sha256", "schema_attempts", "compact")
+                "schema_sha256", "schema_attempts", "compact", "tools",
+                "tool_choice", "tool_calls", "tool_name", "tool_attempts")
         return {k: trace[k] for k in keys if trace.get(k) is not None}
 
     # --- rutas -------------------------------------------------------------
@@ -850,8 +928,37 @@ class Handler(BaseHTTPRequestHandler):
             text = content_text(msg.get("content", ""))
             if role == "system":
                 system_parts.append(text)
-            elif role in ("user", "assistant"):
-                history.append((role, text))
+            elif role == "user":
+                history.append(("user", text))
+            elif role == "assistant":
+                calls = msg.get("tool_calls")
+                if isinstance(calls, list) and calls:
+                    rendered = []
+                    for call in calls:
+                        if not isinstance(call, dict):
+                            continue
+                        fn = call.get("function") or {}
+                        name = str(fn.get("name", ""))
+                        args = fn.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except ValueError:
+                                args = {}
+                        if not isinstance(args, dict):
+                            args = {}
+                        rendered.append("<tool_call>" + json.dumps(
+                            {"name": name, "arguments": args},
+                            ensure_ascii=False, separators=(",", ":")) +
+                            "</tool_call>")
+                    if rendered:
+                        text = ((text + "\n") if text else "") + "".join(rendered)
+                history.append(("assistant", text))
+            elif role == "tool":
+                call_id = str(msg.get("tool_call_id", "") or "")
+                label = (" " + call_id) if call_id else ""
+                history.append(("user",
+                                "[Resultado de herramienta%s]\n%s" % (label, text)))
             else:
                 raise ApiError(400, "rol no soportado: %r" % role)
         if not history:
@@ -931,6 +1038,200 @@ class Handler(BaseHTTPRequestHandler):
             instr = ("Devuelve exclusivamente un objeto JSON válido. No uses "
                      "markdown ni ``` y no agregues texto fuera del JSON.")
         return (system_text + "\n\n" + instr).strip() if system_text else instr
+
+    # --- herramientas (function calling) ----------------------------------
+    def _tools(self, body):
+        raw = body.get("tools")
+        if raw is None:
+            return None, "auto"
+        if not isinstance(raw, list):
+            raise ApiError(400, "tools debe ser una lista")
+        specs = []
+        for entry in raw:
+            if not isinstance(entry, dict) or entry.get("type") != "function":
+                raise ApiError(400, "cada tool debe ser "
+                                    "{type:'function', function:{...}}")
+            fn = entry.get("function")
+            if not isinstance(fn, dict):
+                raise ApiError(400, "tool.function debe ser un objeto")
+            name = fn.get("name")
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+                raise ApiError(400, "nombre de herramienta inválido")
+            if any(spec["name"] == name for spec in specs):
+                raise ApiError(400, "herramienta duplicada: %s" % name)
+            params = fn.get("parameters")
+            if params is None:
+                params = {"type": "object", "properties": {}}
+            if not isinstance(params, dict):
+                raise ApiError(400, "parameters debe ser un objeto JSON Schema")
+            specs.append({
+                "name": name,
+                "description": str(fn.get("description") or ""),
+                "parameters": params,
+            })
+        choice = body.get("tool_choice", "auto")
+        if isinstance(choice, dict):
+            fn = choice.get("function") or {}
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if choice.get("type") != "function" or not name:
+                raise ApiError(400, "tool_choice inválido")
+            if not any(spec["name"] == name for spec in specs):
+                raise ApiError(400, "tool_choice apunta a una herramienta inexistente")
+            choice = name
+        elif choice not in ("auto", "none"):
+            raise ApiError(400, "tool_choice inválido")
+        if not specs:
+            return None, "auto"
+        return specs, choice
+
+    @staticmethod
+    def _tool_signature(spec):
+        params = spec.get("parameters") or {}
+        props = params.get("properties") or {}
+        required = params.get("required") or list(props.keys())
+        bits = []
+        for key in required:
+            typ = (props.get(key) or {}).get("type", "any")
+            if isinstance(typ, list):
+                typ = "/".join(str(t) for t in typ)
+            bits.append("%s: %s" % (key, typ))
+        return "%s(%s)" % (spec["name"], ", ".join(bits))
+
+    @staticmethod
+    def _example_args(params):
+        props = params.get("properties") or {}
+        out = {}
+        for key in params.get("required", []) or []:
+            typ = (props.get(key) or {}).get("type")
+            if typ in ("number", "integer"):
+                out[key] = 1
+            elif typ == "string":
+                out[key] = "texto"
+            elif typ == "boolean":
+                out[key] = True
+            elif typ == "array":
+                out[key] = []
+            else:
+                out[key] = {}
+        return out
+
+    def _tools_system(self, system_text, specs, choice):
+        lines = ["Herramientas disponibles:"]
+        for spec in specs:
+            lines.append("- %s: %s" % (self._tool_signature(spec),
+                                       spec["description"]))
+        lines.append("")
+        lines.append("Si necesitas una herramienta, responde SOLO con:")
+        lines.append('<tool_call>{"name":"<herramienta>","arguments":{...}}'
+                     '</tool_call>')
+        lines.append("No agregues texto fuera de la llamada. Si no necesitas "
+                     "herramienta, responde normalmente.")
+        if isinstance(choice, str) and choice not in ("auto", "none"):
+            lines.append("En este turno DEBES llamar a la herramienta '%s'." % choice)
+        example = "<tool_call>" + json.dumps(
+            {"name": specs[0]["name"],
+             "arguments": self._example_args(specs[0]["parameters"])},
+            ensure_ascii=False, separators=(",", ":")) + "</tool_call>"
+        lines.append("")
+        lines.append("Ejemplo:")
+        lines.append("Usuario: necesito usar %s" % specs[0]["name"])
+        lines.append("Asistente: " + example)
+        instr = "\n".join(lines)
+        return (system_text + "\n\n" + instr).strip() if system_text else instr
+
+    def _parse_tool_call(self, text, specs, choice):
+        start = text.find("<tool_call>")
+        if start == -1:
+            if isinstance(choice, str) and choice not in ("auto", "none"):
+                return None, ["no se encontró la llamada forzada a '%s'" % choice]
+            return None, []
+        end = text.find("</tool_call>", start)
+        if end == -1:
+            # Algunos modelos cierran con EOS sin repetir el tag: se intenta
+            # parsear el objeto JSON que sigue.
+            payload = text[start + len("<tool_call>"):].strip()
+        else:
+            payload = text[start + len("<tool_call>"):end].strip()
+        try:
+            data = extract_json(payload)
+        except SchemaError:
+            try:
+                data = relaxed_json(payload)
+            except SchemaError as err:
+                return None, [str(err)]
+        if not isinstance(data, dict):
+            return None, ["la llamada debe ser un objeto JSON"]
+        name = data.get("name")
+        args = data.get("arguments", {})
+        if not isinstance(name, str) or not name:
+            return None, ["falta 'name' en la llamada"]
+        spec = next((s for s in specs if s["name"] == name), None)
+        if spec is None:
+            return None, ["herramienta desconocida: %s" % name]
+        if isinstance(choice, str) and choice not in ("auto", "none") and name != choice:
+            return None, ["se esperaba la herramienta '%s', llegó '%s'" %
+                          (choice, name)]
+        if not isinstance(args, dict):
+            return None, ["'arguments' debe ser un objeto"]
+        errors = validate(args, spec["parameters"])
+        if errors:
+            return None, errors
+        return {
+            "id": "call_" + uuid.uuid4().hex[:24],
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args, ensure_ascii=False),
+            },
+        }, []
+
+    def _tool_corrective(self, errors, specs, choice, raw=""):
+        parts = ["Tu respuesta anterior no produjo una llamada de herramienta válida."]
+        snippet = (raw or "").strip()
+        if snippet:
+            if len(snippet) > 300:
+                snippet = snippet[:300] + "…"
+            parts.append("Respuesta anterior (recortada):\n" + snippet)
+        if errors:
+            parts.append("Errores:\n" + "\n".join("- " + e for e in errors[:8]))
+        parts.append("Herramientas disponibles: " +
+                     ", ".join(s["name"] for s in specs))
+        if isinstance(choice, str) and choice not in ("auto", "none"):
+            parts.append("Debes llamar a '%s'." % choice)
+        parts.append('Responde SOLO con <tool_call>{"name":"...",'
+                     '"arguments":{...}}</tool_call>.')
+        return "\n\n".join(parts)
+
+    def _tool_generation(self, history, system_text, opts, specs, choice, trace):
+        max_attempts = 1 + max(0, int(self.state.args.json_retries))
+        base_history = list(history)
+        attempt = 0
+        errors = []
+        text = ""
+        gen = Generation()
+        while attempt < max_attempts:
+            attempt += 1
+            trace["tool_attempts"] = attempt
+            tokens, opts["compact"] = self._tokens(system_text, base_history, opts)
+            trace["prompt_tokens"] = len(tokens)
+            trace["prompt_sha256"] = canonical_hash(tokens)
+            gen = Generation()
+            text = "".join(self.state.engine.stream(tokens, opts, gen))
+            trace["completion_tokens"] = gen.tokens
+            trace["finish_reason"] = gen.finish
+            call, errors = self._parse_tool_call(text, specs, choice)
+            if not errors:
+                return call, text, gen, attempt, tokens
+            if attempt < max_attempts:
+                base_history = list(history) + [
+                    ("user", self._tool_corrective(errors, specs, choice, text))]
+        raise ApiError(
+            422,
+            "no se pudo obtener una llamada de herramienta válida tras %d intento(s)"
+            % attempt,
+            "invalid_tool_call",
+            details={"attempts": attempt, "errors": errors,
+                     "content": (text or "")[-2000:]})
 
     def _corrective(self, errors, fmt, raw):
         parts = ["Tu respuesta anterior no cumplió el formato exigido."]
@@ -1073,7 +1374,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # --- respuesta ---------------------------------------------------------
     def _send_completion(self, cid, created, text, gen, tokens, meta,
-                         trace=None):
+                         trace=None, tool_calls=None, finish=None):
+        message = {"role": "assistant", "content": text}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         payload = {
             "id": cid,
             "object": "chat.completion",
@@ -1081,8 +1385,8 @@ class Handler(BaseHTTPRequestHandler):
             "model": self.state.model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": gen.finish,
+                "message": message,
+                "finish_reason": finish or gen.finish,
             }],
             "usage": {
                 "prompt_tokens": len(tokens),
@@ -1123,9 +1427,9 @@ class Handler(BaseHTTPRequestHandler):
             "model": self.state.model,
         }
 
-    def _finish_sse(self, base, gen, tokens, body, meta):
+    def _finish_sse(self, base, gen, tokens, body, meta, finish=None):
         final = dict(base, choices=[{
-            "index": 0, "delta": {}, "finish_reason": gen.finish}])
+            "index": 0, "delta": {}, "finish_reason": finish or gen.finish}])
         if meta is not None:
             final["x_aquifer"] = meta
         self._sse(final)
@@ -1153,6 +1457,15 @@ class Handler(BaseHTTPRequestHandler):
         fmt = self._response_format(body)
         opts = self._opts(body)
         system_text, history = self._prompt(body, opts)
+        tool_specs, tool_choice = self._tools(body)
+        tool_mode = bool(tool_specs) and tool_choice != "none"
+        if fmt and tool_mode:
+            raise ApiError(400, "response_format y tools no se combinan")
+        if tool_specs:
+            trace["tools"] = [spec["name"] for spec in tool_specs]
+            trace["tool_choice"] = tool_choice
+        if tool_mode:
+            system_text = self._tools_system(system_text, tool_specs, tool_choice)
         stream = bool(body.get("stream", False))
         cid = trace["request_id"]
         created = int(time.time())
@@ -1192,6 +1505,48 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._structured_stream(cid, created, history, system_text, opts,
                                     fmt, body, trace)
+            return
+
+        if tool_mode:
+            call, raw_text, gen, attempts, tokens = self._tool_generation(
+                history, system_text, opts, tool_specs, tool_choice, trace)
+            self._stamp(trace, gen)
+            trace["tool_calls"] = 1 if call else 0
+            finish = "tool_calls" if call else gen.finish
+            trace["finish_reason"] = finish
+            content = None if call else raw_text.strip()
+            if call:
+                trace["tool_name"] = call["function"]["name"]
+            if self.state.trace_content:
+                trace["content"] = raw_text
+            meta = self._public_trace(trace)
+            if not stream:
+                self._send_completion(
+                    cid, created, content, gen, tokens, meta, trace,
+                    tool_calls=[call] if call else None, finish=finish)
+                return
+            self._begin_sse(self._sse_headers(trace))
+            base = self._chunk_base(cid, created)
+            self._sse(dict(base, choices=[{
+                "index": 0, "delta": {"role": "assistant"},
+                "finish_reason": None}]))
+            if call:
+                self._sse(dict(base, choices=[{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": call["id"],
+                        "type": "function",
+                        "function": call["function"],
+                    }]},
+                    "finish_reason": None}]))
+            elif content:
+                for i in range(0, len(content), 80):
+                    self._sse(dict(base, choices=[{
+                        "index": 0,
+                        "delta": {"content": content[i:i + 80]},
+                        "finish_reason": None}]))
+            self._finish_sse(base, gen, tokens, body, meta, finish=finish)
             return
 
         tokens, opts["compact"] = self._tokens(system_text, history, opts)
@@ -1272,6 +1627,8 @@ def build_parser(repo_dir):
                     help="Escribe una línea JSON por request (traza auditable)")
     ap.add_argument("--trace-content", action="store_true",
                     help="Incluye el contenido de la respuesta en el trace log")
+    ap.add_argument("--trace-hmac-key", default=None, metavar="CLAVE",
+                    help="Firma cada entrada del trace con HMAC-SHA256")
     return ap
 
 
