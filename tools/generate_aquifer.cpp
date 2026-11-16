@@ -32,6 +32,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -715,6 +716,10 @@ static int g_stepn = 0;
 static int g_spec_min = 2;
 static int g_spec_max = 8;
 static bool g_prefix_report = false;
+static float g_temperature = 0.0f;   // 0 = greedy (default)
+static int g_top_k = 40;
+static float g_top_p = 0.9f;
+static std::uint64_t g_seed = 0;
 static std::size_t g_spec_prop = 0, g_spec_acc = 0, g_spec_rounds = 0;
 
 int main(int argc, char** argv) {
@@ -737,6 +742,10 @@ int main(int argc, char** argv) {
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--spec") spec = std::atoi(next().c_str());
         else if (a == "--prefix-report") g_prefix_report = true;
+        else if (a == "--temperature") g_temperature = float(std::atof(next().c_str()));
+        else if (a == "--top-k") g_top_k = std::atoi(next().c_str());
+        else if (a == "--top-p") g_top_p = float(std::atof(next().c_str()));
+        else if (a == "--seed") g_seed = std::strtoull(next().c_str(), nullptr, 10);
         else if (a == "--spec-min") g_spec_min = std::atoi(next().c_str());
         else if (a == "--spec-max") g_spec_max = std::atoi(next().c_str());
         else if (a == "--dump") g_dump = true;
@@ -950,6 +959,51 @@ int main(int argc, char** argv) {
 
     // Instancia el Portero Asíncrono (hilo de I/O desacoplado)
     AsyncPrefetcher prefetcher(c);
+
+    std::mt19937_64 rng(g_seed ? g_seed
+        : (std::uint64_t(std::random_device{}()) << 32) ^ std::random_device{}());
+    std::vector<std::pair<float, int>> cand(cfg.V);
+    std::vector<float> probs;
+    auto sample_token = [&](const float* lg) -> int {
+        const std::size_t V = cfg.V;
+        if (g_temperature <= 0.0f) {
+            std::size_t best = 0;
+            for (std::size_t j = 1; j < V; ++j) if (lg[j] > lg[best]) best = j;
+            return int(best);
+        }
+        const std::size_t k = std::min<std::size_t>(
+            V, std::max(1, g_top_k > 0 ? g_top_k : 40));
+        for (std::size_t j = 0; j < V; ++j) cand[j] = {lg[j], int(j)};
+        std::partial_sort(cand.begin(), cand.begin() + k, cand.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+        const float mx = cand[0].first;
+        probs.resize(k);
+        double sum = 0.0;
+        for (std::size_t j = 0; j < k; ++j) {
+            const double p = std::exp(double(cand[j].first - mx) / double(g_temperature));
+            probs[j] = float(p);
+            sum += p;
+        }
+        std::size_t m = k;
+        if (g_top_p > 0.0f && g_top_p < 1.0f) {
+            double c = 0.0;
+            for (std::size_t j = 0; j < k; ++j) {
+                c += probs[j];
+                if (c >= g_top_p * sum) { m = j + 1; break; }
+            }
+        }
+        std::uniform_real_distribution<double> dist(0.0, sum);
+        double r = dist(rng), c = 0.0;
+        for (std::size_t j = 0; j < m; ++j) {
+            c += probs[j];
+            if (r <= c) return cand[j].second;
+        }
+        return cand[m - 1].second;
+    };
+    if (g_temperature > 0.0f)
+        std::printf("sampling : T=%.2f top-k=%d top-p=%.2f seed=%llu\n",
+                    g_temperature, g_top_k, g_top_p,
+                    (unsigned long long)(g_seed ? g_seed : 0));
 
     // Un paso para M secuencias en posiciones propias.
     auto step = [&](const std::vector<unsigned>& seq,
@@ -1205,9 +1259,7 @@ int main(int argc, char** argv) {
         std::vector<int> out(m, -1);
         for (unsigned i = 0; i < m - l0; ++i) {
             const float* lg = logits.data() + std::size_t(i) * cfg.V;
-            std::size_t best = 0;
-            for (std::size_t j = 1; j < cfg.V; ++j) if (lg[j] > lg[best]) best = j;
-            out[l0 + i] = int(best);
+            out[l0 + i] = sample_token(lg);
         }
         if (g_dump && g_stepn == 0) {
             const float* lg = logits.data();
@@ -1355,7 +1407,7 @@ int main(int argc, char** argv) {
                     const int y = argmax_row(logits.data());
 
                     bool speculated = false;
-                    if (spec > 0 && cur_pos + 1 < std::size_t(ctx)) {
+                    if (spec > 0 && g_temperature <= 0.0f && cur_pos + 1 < std::size_t(ctx)) {
                         auto prop = prompt_lookup(cached_tokens, spec, g_spec_min, g_spec_max);
                         if (prop.size() >= 2 && prop[0] == y) {
                             std::size_t k = prop.size();

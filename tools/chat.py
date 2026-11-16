@@ -328,7 +328,11 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact):
         "--kv-dtype", args.kv_dtype,
         "--spec", str(args.spec),
         "--spec-min", str(args.spec_min),
-        "--spec-max", str(args.spec_max)
+        "--spec-max", str(args.spec_max),
+        "--temperature", str(args.temperature),
+        "--top-k", str(args.top_k),
+        "--top-p", str(args.top_p),
+        "--seed", str(args.seed)
     ]
     if args.diamond is not None:
         print(f"{YELLOW}[Experimental] El modo Diamante actual selecciona neuronas "
@@ -407,6 +411,14 @@ def main():
                     help="Longitud mínima del n-grama para especular")
     ap.add_argument("--spec-max", type=int, default=8,
                     help="Longitud máxima del n-grama a buscar")
+    ap.add_argument("--temperature", type=float, default=0.0,
+                    help="Temperatura de muestreo (0 = greedy, default)")
+    ap.add_argument("--top-k", type=int, default=40,
+                    help="Top-k de muestreo (solo si temperature > 0)")
+    ap.add_argument("--top-p", type=float, default=0.9,
+                    help="Nucleus sampling (solo si temperature > 0)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Semilla de muestreo (0 = aleatoria)")
     ap.add_argument("--diamond", type=float, default=None, help="Porcentaje de volumen del haz óptico en el Diamante 3D (ej: 85)")
     args = ap.parse_args()
 
