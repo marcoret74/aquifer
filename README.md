@@ -76,17 +76,18 @@ Hasta entonces, `--diamond` queda como experimental y no se recomienda para prod
 
 ### Caché de prefijo: la diferencia real con Ollama
 
-Medición en 3B, 3 turnos de chat, mismo system prompt:
+Bench reproducible: `python3 bench/prefix_cache.py --artifact <art> --tokenizer <tok> --ollama-model qwen2.5:3b`. Usa un nonce único en el system para forzar prompt frío y mide 3 turnos.
 
-| Turno | Aquifer: prefijo reutilizado | Aquifer TTFT | Ollama: prompt | Ollama prefill |
-| :--- | :---: | :---: | :---: | :---: |
-| 1 | 11/27 tok (system prewarm) | **501 ms** | 27 tok | 0,700 s |
-| 2 | 39/57 tok | **637 ms** | 56 tok | 0,456 s |
-| 3 | 69/85 tok | **531 ms** | 84 tok | 0,424 s |
+| Turno | Aquifer: prefijo | Aquifer TTFT | Ollama: prompt | Ollama prefill | Ollama TTFT |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| 1 | 35/50 tok | **490 ms** | 50 tok | 1,459 s (34,3 tok/s) | 1,58 s |
+| 2 | 58/78 tok | **676 ms** | 78 tok | 1,007 s (77,4 tok/s) | 1,13 s |
+| 3 | 90/106 tok | **521 ms** | 106 tok | 0,994 s (106,7 tok/s) | 1,10 s |
 
-- El chat reutiliza **system + historial + respuesta previa**: en el turno 3 solo prellena los ~16 tokens nuevos. El TTFT queda en 0,5–0,64 s, comparable a Ollama (0,46–0,70 s de prompt + primer token).
-- En frío, ambos están en ~40 tok/s de prefill (Aquifer ~42; Ollama 38,6).
-- El famoso “10× de prefill” era **prompt cache** de Ollama, no un GEMM mágico. Nuestro motor ya está en paridad en frío y también cachea prefijo.
+- El chat de Aquifer reutiliza **system + historial + respuesta previa**: en el turno 3 solo prellena ~16 tokens nuevos.
+- En frío, Aquifer prefill ~43 tok/s vs Ollama 34,3 tok/s; decode ~10 tok/s en ambos.
+- El “10× de prefill” era **prompt cache** de Ollama, no un GEMM mágico. Con prompts fríos, Aquifer no está detrás; con prefijo, ambos cachean.
+- **No necesitamos colgarnos de llama.cpp para el prefill.**
 
 ### Límites medidos (para no repetir el camino)
 

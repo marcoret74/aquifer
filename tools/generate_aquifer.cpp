@@ -714,6 +714,7 @@ static bool g_dump = false;
 static int g_stepn = 0;
 static int g_spec_min = 2;
 static int g_spec_max = 8;
+static bool g_prefix_report = false;
 static std::size_t g_spec_prop = 0, g_spec_acc = 0, g_spec_rounds = 0;
 
 int main(int argc, char** argv) {
@@ -735,6 +736,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads") reqT = std::atoi(next().c_str());
         else if (a == "--ctx") ctx = std::atoi(next().c_str());
         else if (a == "--spec") spec = std::atoi(next().c_str());
+        else if (a == "--prefix-report") g_prefix_report = true;
         else if (a == "--spec-min") g_spec_min = std::atoi(next().c_str());
         else if (a == "--spec-max") g_spec_max = std::atoi(next().c_str());
         else if (a == "--dump") g_dump = true;
@@ -1304,6 +1306,8 @@ int main(int argc, char** argv) {
                        cached_tokens[common] == ptokens[common]) {
                     ++common;
                 }
+                if (g_prefix_report)
+                    std::fprintf(stderr, "PREFIX %zu %zu\n", common, ptokens.size());
 
                 if (ptokens.size() > std::size_t(ctx)) {
                     std::fprintf(stderr, "PROMPT: %zu tokens > ctx %d\n",
