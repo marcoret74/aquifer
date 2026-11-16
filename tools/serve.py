@@ -18,6 +18,7 @@ Uso:
 """
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -48,14 +49,110 @@ class ApiError(Exception):
 
 
 class Generation:
-    """Estado de una generación: tokens emitidos y motivo de corte."""
+    """Estado de una generación: tokens, tiempos y compactación."""
 
-    __slots__ = ("tokens", "finish", "done")
+    __slots__ = ("tokens", "finish", "done", "first_token_at", "queue_ms",
+                 "compact")
 
     def __init__(self):
         self.tokens = 0
         self.finish = "stop"
         self.done = False
+        self.first_token_at = None
+        self.queue_ms = 0.0
+        self.compact = None
+
+
+class Metrics:
+    """Contadores agregados y percentiles simples, con lock."""
+
+    MAX_SAMPLES = 2000
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.total = 0
+        self.ok = 0
+        self.errors = 0
+        self.streamed = 0
+        self.structured = 0
+        self.schema_retried = 0
+        self.schema_failed = 0
+        self.compactions = 0
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.by_status = {}
+        self.latencies = []
+        self.ttfts = []
+
+    def record(self, trace):
+        with self.lock:
+            self.total += 1
+            status = trace.get("status", 0)
+            key = str(status)
+            self.by_status[key] = self.by_status.get(key, 0) + 1
+            if 200 <= status < 300:
+                self.ok += 1
+            else:
+                self.errors += 1
+            if trace.get("stream"):
+                self.streamed += 1
+            if trace.get("response_format"):
+                self.structured += 1
+            if (trace.get("schema_attempts") or 0) > 1:
+                self.schema_retried += 1
+            if trace.get("error_type") == "invalid_schema_output":
+                self.schema_failed += 1
+            compact = trace.get("compact") or {}
+            if compact.get("status") == "ok":
+                self.compactions += 1
+            self.tokens_in += int(trace.get("prompt_tokens") or 0)
+            self.tokens_out += int(trace.get("completion_tokens") or 0)
+            self._push(self.latencies, trace.get("latency_ms"))
+            self._push(self.ttfts, trace.get("ttft_ms"))
+
+    @classmethod
+    def _push(cls, values, v):
+        if not isinstance(v, (int, float)):
+            return
+        values.append(float(v))
+        if len(values) > cls.MAX_SAMPLES:
+            del values[:len(values) - cls.MAX_SAMPLES]
+
+    @staticmethod
+    def _pct(values, p):
+        if not values:
+            return None
+        data = sorted(values)
+        idx = min(len(data) - 1, max(0, int(round((p / 100.0) * (len(data) - 1)))))
+        return round(data[idx], 1)
+
+    def snapshot(self):
+        with self.lock:
+            lat = list(self.latencies)
+            ttft = list(self.ttfts)
+            return {
+                "requests": {
+                    "total": self.total, "ok": self.ok, "errors": self.errors,
+                    "stream": self.streamed, "structured": self.structured,
+                },
+                "by_status": dict(sorted(self.by_status.items())),
+                "tokens": {"prompt": self.tokens_in, "completion": self.tokens_out,
+                           "total": self.tokens_in + self.tokens_out},
+                "latency_ms": {
+                    "avg": round(sum(lat) / len(lat), 1) if lat else None,
+                    "p50": self._pct(lat, 50), "p95": self._pct(lat, 95),
+                    "max": round(max(lat), 1) if lat else None,
+                    "samples": len(lat),
+                },
+                "ttft_ms": {
+                    "avg": round(sum(ttft) / len(ttft), 1) if ttft else None,
+                    "p50": self._pct(ttft, 50), "p95": self._pct(ttft, 95),
+                    "samples": len(ttft),
+                },
+                "schema": {"retried": self.schema_retried,
+                           "failed": self.schema_failed},
+                "compactions": self.compactions,
+            }
 
 
 def stop_hit(buf, stops):
@@ -76,6 +173,12 @@ def stop_keep(buf, stops):
                 keep = max(keep, k)
                 break
     return keep
+
+
+def canonical_hash(value):
+    data = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def content_text(content):
@@ -142,7 +245,9 @@ class Engine:
         """Genera texto. Debe consumirse entero o cerrarse (envía STOP)."""
         stops = opts.get("stop") or []
         hit_stop = False
+        t_wait = time.monotonic()
         with self.lock:
+            gen.queue_ms = (time.monotonic() - t_wait) * 1000.0
             try:
                 if not self.alive():
                     raise ApiError(503, "el motor no está disponible", "server_error")
@@ -155,6 +260,21 @@ class Engine:
                             ",".join(map(str, compact["tokens"]))))
                         line = self._read_until(
                             ("COMPACTED", "COMPACT_NOMATCH", "COMPACT_ERR"))
+                        if line.startswith("COMPACTED"):
+                            parts = line.split()
+                            try:
+                                gen.compact = {
+                                    "status": "ok",
+                                    "kept": int(parts[1]),
+                                    "start": int(parts[2]),
+                                    "pos_base": int(parts[3]),
+                                }
+                            except (IndexError, ValueError):
+                                gen.compact = {"status": "ok"}
+                        elif line.startswith("COMPACT_NOMATCH"):
+                            gen.compact = {"status": "nomatch"}
+                        else:
+                            gen.compact = {"status": "error"}
                         sys.stderr.write("[compact] %s\n" % line)
                     except ApiError:
                         pass
@@ -173,6 +293,8 @@ class Engine:
                     except (IndexError, ValueError):
                         continue
                     gen.tokens += 1
+                    if gen.first_token_at is None:
+                        gen.first_token_at = time.monotonic()
                     text = streamer.decode(tid)
                     if any(mark in text for mark in SPECIAL_MARKERS):
                         continue
@@ -256,6 +378,10 @@ class State:
         self.cors = args.cors
         self.created = int(time.time())
         self.started = time.time()
+        self.metrics = Metrics()
+        self.trace_path = args.trace_log
+        self.trace_content = args.trace_content
+        self.trace_lock = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -276,11 +402,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
-    def _send_json(self, status, payload):
+    def _send_json(self, status, payload, headers=None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, str(value))
         self._cors()
         self.end_headers()
         self.wfile.write(body)
@@ -321,6 +449,46 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data.encode("utf-8"))
         self.wfile.flush()
 
+    # --- trazas ------------------------------------------------------------
+    def _new_trace(self):
+        return {"_t0": time.monotonic(),
+                "request_id": "chatcmpl-" + uuid.uuid4().hex[:24]}
+
+    def _record(self, trace, status, err=None):
+        trace["status"] = status
+        if err is not None:
+            trace["error_type"] = err.kind
+            trace["error_message"] = err.message
+            if isinstance(err.details, dict):
+                if "attempts" in err.details:
+                    trace["schema_attempts"] = err.details["attempts"]
+                if "errors" in err.details:
+                    trace["schema_errors"] = err.details["errors"][:10]
+        if "latency_ms" not in trace:
+            trace["latency_ms"] = round(
+                (time.monotonic() - trace["_t0"]) * 1000.0, 1)
+        self.state.metrics.record(trace)
+        path = self.state.trace_path
+        if not path:
+            return
+        row = {k: v for k, v in trace.items() if not k.startswith("_")}
+        row["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            with self.state.trace_lock:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            sys.stderr.write("[trace] no se pudo escribir: %s\n" % exc)
+
+    @staticmethod
+    def _public_trace(trace):
+        keys = ("request_id", "model", "stream", "latency_ms", "ttft_ms",
+                "queue_ms", "prompt_tokens", "completion_tokens",
+                "tokens_per_s", "finish_reason", "prompt_sha256",
+                "conversation_sha256", "response_format", "schema_name",
+                "schema_sha256", "schema_attempts", "compact")
+        return {k: trace[k] for k in keys if trace.get(k) is not None}
+
     # --- rutas -------------------------------------------------------------
     def do_OPTIONS(self):
         self.send_response(204)
@@ -338,6 +506,12 @@ class Handler(BaseHTTPRequestHandler):
                     "ctx": st.ctx,
                     "uptime_s": round(time.time() - st.started, 1),
                 })
+            elif self.path == "/metrics":
+                snap = self.state.metrics.snapshot()
+                snap["uptime_s"] = round(time.time() - self.state.started, 1)
+                snap["model"] = self.state.model
+                snap["ctx"] = self.state.ctx
+                self._send_json(200, snap)
             elif self.path.startswith("/v1/") and not self._auth():
                 raise ApiError(401, "API key inválida", "authentication_error")
             elif self.path == "/v1/models":
@@ -369,23 +543,32 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if self.path != "/v1/chat/completions":
+            try:
+                self._error(ApiError(404, "ruta no encontrada", "not_found"))
+            except BrokenPipeError:
+                pass
+            return
+        trace = self._new_trace()
         try:
-            if self.path != "/v1/chat/completions":
-                raise ApiError(404, "ruta no encontrada", "not_found")
             if not self._auth():
                 raise ApiError(401, "API key inválida", "authentication_error")
             body = self._body()
-            self._chat(body)
+            self._chat(body, trace)
+            self._record(trace, 200)
         except ApiError as err:
+            self._record(trace, err.status, err)
             try:
                 self._error(err)
             except BrokenPipeError:
                 pass
         except BrokenPipeError:
-            pass
+            self._record(trace, 499)
         except Exception as err:  # noqa: BLE001
+            wrapped = ApiError(500, "error interno: %s" % err, "server_error")
+            self._record(trace, 500, wrapped)
             try:
-                self._error(ApiError(500, "error interno: %s" % err, "server_error"))
+                self._error(wrapped)
             except BrokenPipeError:
                 pass
 
@@ -550,7 +733,23 @@ class Handler(BaseHTTPRequestHandler):
                      "ni texto adicional.")
         return "\n\n".join(parts)
 
-    def _structured(self, history, system_text, opts, fmt):
+    def _stamp(self, trace, gen):
+        now = time.monotonic()
+        trace["latency_ms"] = round((now - trace["_t0"]) * 1000.0, 1)
+        if gen.first_token_at is not None:
+            trace["ttft_ms"] = round(
+                (gen.first_token_at - trace["_t0"]) * 1000.0, 1)
+            gen_ms = (now - gen.first_token_at) * 1000.0
+            if gen_ms > 0 and gen.tokens > 1:
+                trace["tokens_per_s"] = round(
+                    (gen.tokens - 1) / (gen_ms / 1000.0), 1)
+        trace["completion_tokens"] = gen.tokens
+        trace["finish_reason"] = gen.finish
+        trace["queue_ms"] = round(gen.queue_ms, 1)
+        if gen.compact:
+            trace["compact"] = gen.compact
+
+    def _structured(self, history, system_text, opts, fmt, trace):
         max_attempts = 1 + max(0, int(self.state.args.json_retries))
         base_history = list(history)
         attempt = 0
@@ -561,9 +760,14 @@ class Handler(BaseHTTPRequestHandler):
         gen = Generation()
         while attempt < max_attempts:
             attempt += 1
+            trace["schema_attempts"] = attempt
             tokens, opts["compact"] = self._tokens(system_text, base_history, opts)
+            trace["prompt_tokens"] = len(tokens)
+            trace["prompt_sha256"] = canonical_hash(tokens)
             gen = Generation()
             raw = "".join(self.state.engine.stream(tokens, opts, gen))
+            trace["completion_tokens"] = gen.tokens
+            trace["finish_reason"] = gen.finish
             try:
                 value = extract_json(raw)
             except SchemaError as err:
@@ -576,6 +780,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     errors = validate(value, fmt["schema"])
                 if not errors:
+                    trace["schema_valid"] = True
                     return raw, value, gen, attempt, tokens
             if attempt < max_attempts:
                 base_history = list(history) + [
@@ -588,7 +793,8 @@ class Handler(BaseHTTPRequestHandler):
                      "content": (raw or "")[-2000:]})
 
     # --- respuesta ---------------------------------------------------------
-    def _send_completion(self, cid, created, text, gen, tokens, meta):
+    def _send_completion(self, cid, created, text, gen, tokens, meta,
+                         trace=None):
         payload = {
             "id": cid,
             "object": "chat.completion",
@@ -607,14 +813,25 @@ class Handler(BaseHTTPRequestHandler):
         }
         if meta is not None:
             payload["x_aquifer"] = meta
-        self._send_json(200, payload)
+        headers = {"x-aquifer-request-id": cid}
+        if trace:
+            for key, header in (
+                    ("latency_ms", "x-aquifer-latency-ms"),
+                    ("conversation_sha256", "x-aquifer-conversation-sha256"),
+                    ("prompt_sha256", "x-aquifer-prompt-sha256"),
+                    ("schema_sha256", "x-aquifer-schema-sha256")):
+                if trace.get(key) is not None:
+                    headers[header] = trace[key]
+        self._send_json(200, payload, headers)
 
-    def _begin_sse(self):
+    def _begin_sse(self, headers=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
+        for key, value in (headers or {}).items():
+            self.send_header(key, str(value))
         self._cors()
         self.end_headers()
         self.close_connection = True
@@ -642,31 +859,59 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
-    def _chat(self, body):
+    def _sse_headers(self, trace):
+        headers = {"x-aquifer-request-id": trace["request_id"]}
+        for key, header in (
+                ("conversation_sha256", "x-aquifer-conversation-sha256"),
+                ("schema_sha256", "x-aquifer-schema-sha256")):
+            if trace.get(key) is not None:
+                headers[header] = trace[key]
+        return headers
+
+    def _chat(self, body, trace):
         if not self.state.engine.alive():
             raise ApiError(503, "el motor no está disponible", "server_error")
         fmt = self._response_format(body)
         opts = self._opts(body)
         system_text, history = self._prompt(body, opts)
-        if fmt:
-            system_text = self._json_system(system_text, fmt)
         stream = bool(body.get("stream", False))
-        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        cid = trace["request_id"]
         created = int(time.time())
+
+        trace["model"] = self.state.model
+        trace["stream"] = stream
+        trace["history_turns"] = sum(1 for r, _ in history if r == "user")
+        trace["conversation_sha256"] = canonical_hash(
+            {"system": system_text, "messages": history})
+        trace["settings"] = {k: opts[k] for k in (
+            "max_tokens", "temperature", "top_k", "top_p", "seed",
+            "repeat_penalty", "repeat_last_n")}
+        trace["stop_sequences"] = len(opts.get("stop") or [])
+        if fmt:
+            trace["response_format"] = fmt["type"]
+            if fmt.get("schema") is not None:
+                trace["schema_name"] = fmt["schema_name"]
+                trace["schema_sha256"] = canonical_hash(fmt["schema"])
+            system_text = self._json_system(system_text, fmt)
 
         if fmt:
             raw, value, gen, attempts, tokens = self._structured(
-                history, system_text, opts, fmt)
-            # El contenido se canonicaliza: lo que recibe el cliente ya es
-            # JSON parseable, sin markdown ni texto alrededor.
+                history, system_text, opts, fmt, trace)
             text = json.dumps(value, ensure_ascii=False)
-            meta = {"valid": True, "attempts": attempts, "value": value}
+            self._stamp(trace, gen)
+            if self.state.trace_content:
+                trace["content"] = text
+            meta = self._public_trace(trace)
+            meta["valid"] = True
+            meta["attempts"] = attempts
+            meta["value"] = value
             if fmt.get("schema_name"):
                 meta["schema_name"] = fmt["schema_name"]
             if not stream:
-                self._send_completion(cid, created, text, gen, tokens, meta)
+                self._send_completion(cid, created, text, gen, tokens, meta,
+                                      trace)
                 return
-            self._begin_sse()
+            self._begin_sse(self._sse_headers(trace))
             base = self._chunk_base(cid, created)
             self._sse(dict(base, choices=[{
                 "index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
@@ -676,24 +921,38 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         tokens, opts["compact"] = self._tokens(system_text, history, opts)
+        trace["prompt_tokens"] = len(tokens)
+        trace["prompt_sha256"] = canonical_hash(tokens)
         gen = Generation()
         if not stream:
             text = "".join(self.state.engine.stream(tokens, opts, gen))
-            self._send_completion(cid, created, text, gen, tokens, None)
+            self._stamp(trace, gen)
+            if self.state.trace_content:
+                trace["content"] = text
+            meta = self._public_trace(trace)
+            self._send_completion(cid, created, text, gen, tokens, meta, trace)
             return
 
-        self._begin_sse()
+        self._begin_sse(self._sse_headers(trace))
         base = self._chunk_base(cid, created)
         self._sse(dict(base, choices=[{
             "index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
         streamer = self.state.engine.stream(tokens, opts, gen)
+        parts = [] if self.state.trace_content else None
         try:
             for piece in streamer:
+                if parts is not None:
+                    parts.append(piece)
                 self._sse(dict(base, choices=[{
                     "index": 0, "delta": {"content": piece}, "finish_reason": None}]))
         finally:
+            trace["completion_tokens"] = gen.tokens
+            trace["finish_reason"] = gen.finish
             streamer.close()
-        self._finish_sse(base, gen, tokens, body, None)
+        self._stamp(trace, gen)
+        if parts is not None:
+            trace["content"] = "".join(parts)
+        self._finish_sse(base, gen, tokens, body, self._public_trace(trace))
 
 
 def build_parser(repo_dir):
@@ -735,6 +994,10 @@ def build_parser(repo_dir):
                     help="Si se define, exige 'Authorization: Bearer <key>'")
     ap.add_argument("--cors", action="store_true",
                     help="Habilita CORS para UIs locales en el navegador")
+    ap.add_argument("--trace-log", default=None, metavar="RUTA",
+                    help="Escribe una línea JSON por request (traza auditable)")
+    ap.add_argument("--trace-content", action="store_true",
+                    help="Incluye el contenido de la respuesta en el trace log")
     return ap
 
 
@@ -790,6 +1053,10 @@ def main():
         repeat_penalty=args.repeat_penalty, repeat_last_n=args.repeat_last_n,
         session=None,
     )
+    if args.trace_log:
+        trace_dir = os.path.dirname(os.path.abspath(args.trace_log))
+        os.makedirs(trace_dir, exist_ok=True)
+
     engine = Engine(mcfg, engine_args, repo_dir, default_bin, resolve_artifact)
     state = State(engine, args, mcfg, args.ctx, system_text)
 
@@ -805,7 +1072,11 @@ def main():
     print("  escucha : http://%s:%d" % (args.host, args.port))
     print("  modelo  : %s   ctx: %d   default n: %d" %
           (args.model, args.ctx, engine_args.n))
-    print("  rutas   : GET /health · GET /v1/models · POST /v1/chat/completions")
+    print("  rutas   : GET /health · GET /metrics · GET /v1/models · "
+          "POST /v1/chat/completions")
+    if args.trace_log:
+        print("  trazas  : %s%s" % (
+            args.trace_log, " (con contenido)" if args.trace_content else ""))
     if args.api_key:
         print("  auth    : Bearer token requerido")
     print("  Ctrl+C para detener.\n", flush=True)

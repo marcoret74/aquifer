@@ -64,6 +64,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 - **Decodificación especulativa por prompt-lookup (`--spec 4`, default en chat).** Propone hasta 4 tokens copiados de una repetición reciente del contexto, los verifica en una sola pasada `M=4` y acepta el prefijo correcto. En greedy genera **exactamente los mismos tokens** que sin spec. Medido: +5–15 % en texto natural y **1,5–2,2×** en salida repetitiva/código. `--spec 0` lo desactiva. Tuning: `--spec-min 2 --spec-max 8` es el default; k=6/8 y min=3/4 no fueron robustamente mejores (k=8 ayuda en listas periódicas pero castiga prosa), y una propuesta de 1 token se descarta porque no ahorra nada. `--spec-min/--spec-max` quedan expuestos para experimentar.
 - **Compactación con KV (`COMPACT`).** Al llenarse el contexto, en vez de resetear todo el KV y re-prellenar el historial, el motor conserva el system prompt y mueve al frente la cola que coincide con el prompt recortado. Las claves ya calculadas no se recalculan ni se re-rotan: se ajusta `pos_base` (desplazamiento RoPE) para que los tokens conservados mantengan su posición absoluta. Medido en Qwen 0.5B con `ctx 256`: 132 ms de TTFT tras compactar contra 1423 ms del reset completo. `--no-kv-compact` recupera el comportamiento anterior.
 - **Sesiones persistentes y branching (`--session`, `/save`, `/branch`, `/load`).** Guarda y restaura el KV cache + historial entre ejecuciones, en un formato binario propio `AQKV v2` (`RUTA.kv`) con cabecera, tokens del prefijo, `pos_base` de RoPE y checksum FNV-1a, más un `RUTA.json` con el historial y metadatos (`created`, `updated`, `turns`, `parent`). Al reanudar, el motor reutiliza el prefijo ya calculado y solo prellena lo nuevo; el archivo se valida contra dimensiones, dtype y firma del modelo. `/sessions` lista, `/save` toma una instantánea, `/branch` clona y queda activa, `/load` cambia de sesión en caliente. Autoguarda cada turno; `/reset` y `/switch` desvinculan la sesión pero **conservan los archivos**.
+- **Métricas y trazas por request (`/metrics`, `--trace-log`).** Cada llamada registra latencia total, TTFT, cola, tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256 de prompt, conversación y esquema, intentos de esquema y compactaciones de KV. Agregados en `/metrics` (p50/p95) y traza JSONL opcional con `--trace-log` (`--trace-content` para incluir la respuesta). Pensado para auditar pilotos y depurar el orquestador.
 - **Salida JSON estructurada (`response_format`).** El servidor valida la respuesta contra un subconjunto de JSON Schema (`tools/structured.py`), reintenta con feedback de errores y devuelve `content` ya canonicalizado (JSON parseable, sin markdown). Si tras los intentos no cumple, responde `422` con `attempts`, `errors` y el contenido crudo. El esquema lo define el orquestador/Juez: el motor no sabe de dominio.
 - **Servidor HTTP local (`tools/serve.py`).** API de chat compatible con OpenAI sobre el motor, sin dependencias externas: `/v1/chat/completions` con SSE, sampling y stop sequences por request, `/v1/models` y `/health`. Bind a `127.0.0.1` por defecto, API key opcional y CORS opcional. El kernel no cambia; el servidor es orquestador.
 - **Stop sequences por texto (`--stop`, repetible).** El chat acumula el texto decodificado en un buffer rodante, detecta la parada aunque cruce varios tokens, imprime solo lo anterior, envía `STOP` al motor y drena hasta `DONE`. El historial se trunca en la parada. Es lógica de chat/orquestador: el kernel no cambia y `--eos` sigue siendo el corte por ID de token.
@@ -217,6 +218,7 @@ Rutas:
 | Método | Ruta | Descripción |
 | :--- | :--- | :--- |
 | `GET` | `/health` | Estado del motor, modelo y `ctx`. |
+| `GET` | `/metrics` | Contadores, tokens, latencias p50/p95, esquema y compactaciones. |
 | `GET` | `/v1/models` | Modelo servido, formato OpenAI. |
 | `GET` | `/v1/models/catalog` | Catálogo local de modelos disponibles. |
 | `POST` | `/v1/chat/completions` | Chat con `stream: true` o `false`. |
@@ -238,6 +240,45 @@ r = client.chat.completions.create(
 )
 print(r.choices[0].message.content)
 ```
+
+#### Métricas y trazas
+
+Cada request deja una **traza** con latencia total, TTFT, tiempo de cola,
+tokens de prompt/completitud, `tokens_per_s`, `finish_reason`, hashes SHA-256
+del prompt, de la conversación y del esquema, intentos de esquema y detalles de
+compactación del KV.
+
+```bash
+# Traza JSONL (una línea por request), sin contenido por defecto
+python3 tools/serve.py --model qwen05 --port 8080 \
+  --trace-log ~/.cache/aquifer/traces.jsonl
+
+# Incluir también el contenido de la respuesta (para auditoría de piloto)
+python3 tools/serve.py --model qwen05 --port 8080 \
+  --trace-log ~/.cache/aquifer/traces.jsonl --trace-content
+
+# Agregados en vivo
+curl -s localhost:8080/metrics | python3 -m json.tool
+```
+
+`/metrics` devuelve:
+
+```json
+{
+  "requests": {"total": 12, "ok": 11, "errors": 1, "stream": 1, "structured": 2},
+  "by_status": {"200": 11, "422": 1},
+  "tokens": {"prompt": 1439, "completion": 165, "total": 1604},
+  "latency_ms": {"avg": 800.7, "p50": 583.5, "p95": 1058.0, "max": 3486.3},
+  "ttft_ms": {"avg": 237.5, "p50": 152.7, "p95": 858.1},
+  "schema": {"retried": 1, "failed": 1},
+  "compactions": 2
+}
+```
+
+Las respuestas incluyen `x_aquifer` con los mismos datos de la traza, y las
+cabeceras `x-aquifer-request-id`, `x-aquifer-latency-ms`, `x-aquifer-prompt-sha256`,
+`x-aquifer-conversation-sha256` y `x-aquifer-schema-sha256` (según corresponda).
+El log de trazas no guarda contenido salvo que se pase `--trace-content`.
 
 Acepta por request `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`,
 `repeat_penalty`, `repeat_last_n`, `stop` (string o lista) y `stream`. El sampling
