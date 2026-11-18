@@ -130,3 +130,66 @@ Por eso `auto` gana cuando el modelo entra, y `paged` gana cuando no entra.
 - No reduce el tráfico de DRAM.
 - No hace que una capa «quepa» en L3.
 - No reemplaza batching/serving (lo complementa).
+
+---
+
+## 9. Revisión externa (Gemini, 2026-11-18)
+
+### Lo que validó (y coincide con lo medido)
+
+- **Literatura**: FlexGen (ICML 2023), LLM in a flash (Apple, 2023), Orca
+  (OSDI 2022), PagedAttention/vLLM (SOSP 2023), ZeRO-Inference.
+- **Decode M=1 es GEMV**: ~0,5 FLOP/byte ⇒ *bandwidth-bound*. Correcto.
+- **Modelo de I/O**: 4,4 GB a 2 GB/s = 2,2 s/token. Medido en `paged`:
+  **2,5 s/token**. El modelo acierta.
+- **`auto` vive de page cache**: 2,8 tok/s × 4,4 GB = **12,3 GB/s efectivos**,
+  consistente con DRAM y no con NVMe.
+- **`DONTNEED` no libera RAM**: destruye PTEs; las páginas quedan en page cache
+  y el re-uso es *minor fault*.
+
+### Tres correcciones
+
+1. **KV cache mal calculada.** No es `2·L·hidden·2`, es
+   `2·L·(kv_heads·head_dim)·2`:
+
+   | Modelo | KV/token real | Gemini asumió | 8 streams × 2048 |
+   |---|---|---|---|
+   | 3B | **36 KB** | 288 KB (8×) | **0,60 GB** (no 4,8) |
+   | 7B | **56 KB** | 392 KB (7×) | **0,94 GB** (no 3,2) |
+
+   Usó `hidden_size` en vez de `kv_heads·head_dim`. La KV sigue siendo un
+   problema, pero 7–8 veces menor.
+
+2. **«Miles de minor faults por capa»**: con `MADV_HUGEPAGE` (2 MB) una capa de
+   160 MB son ~80 PTEs, no miles. 28 capas ≈ 2.240 faults/token ≈ pocos ms.
+   El costo existe, pero 1–2 órdenes de magnitud menor.
+
+3. **«2 streams no dan ganancia porque compiten por DRAM»**: depende de la
+   saturación. Hoy el 7B usa 12,3 GB/s efectivos contra un pico de ~20–25 GB/s:
+   **hay margen**. La ganancia de entrelazar streams es ocultar latencia, no
+   sumar ancho de banda. El experimento (GB/s efectivos) lo decide, no el
+   argumento.
+
+### Alternativas que propone (válidas)
+
+- **A. `O_DIRECT` + io_uring + doble buffer**: memoria fija 2×capa, cero page
+  faults, I/O asíncrono. Requiere lote grande (80 ms de I/O por capa vs 5,5 ms
+  de cómputo en M=1). Detalle práctico: `O_DIRECT` exige alineación (probado:
+  `dd iflag=direct` falla sin alinear el buffer).
+- **B. Bloques (macro-capas)**: si entra, `auto`; si no, partir en 2–4 bloques
+  y batchear por bloque. Reduce switches de 28–36 a 2–4 por token.
+- **C. Sparsity de activaciones en MLP** (Apple): 20–30 % de los pesos por
+  capa; requiere predictor y validación de calidad.
+
+### Protocolo de medición actualizado
+
+| Métrica | Fuente |
+|---|---|
+| `majflt/s` | `/proc/vmstat` (`pgmajfault`) |
+| `minflt/s` | `/proc/<pid>/stat` |
+| ciclos, instrucciones, cache-misses | `perf stat` |
+| TTFT e inter-token (p50/p99) | timestamps del cliente |
+| GB/s efectivos | `bytes_artefacto × tok/s` |
+
+**Criterio**: agregado > 1,3× **y** GB/s efectivos < 80 % del pico. Si ya
+satura, no hay ganancia posible: el cuello es el bus, no el scheduler.
