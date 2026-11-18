@@ -8,9 +8,11 @@ TESTS = $(BUILD_DIR)/test_morton $(BUILD_DIR)/test_portero $(BUILD_DIR)/test_pag
         $(BUILD_DIR)/test_doublemap $(BUILD_DIR)/check_g32M
 BINS = $(BUILD_DIR)/generate_aquifer $(BUILD_DIR)/generate_aquifer_sse $(BUILD_DIR)/generate_aquifer_diamond
 
-.PHONY: all clean test tests bins sse
+.PHONY: all clean test tests bins sse static
 
 all: tests bins
+
+static: $(BUILD_DIR)/generate_aquifer.static
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -41,6 +43,11 @@ $(BUILD_DIR)/check_g32M: tests/check_g32M.cpp | $(BUILD_DIR)
 
 $(BUILD_DIR)/generate_aquifer: tools/generate_aquifer.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $< -o $@
+
+# Estático: sin dependencia de la versión de glibc del host (el binario viaja
+# a otra máquina, p. ej. en un contenedor con otra base).
+$(BUILD_DIR)/generate_aquifer.static: tools/generate_aquifer.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< -o $@ -static -lm
 
 $(BUILD_DIR)/generate_aquifer_sse: tools/generate_aquifer.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_SSE) $< -o $@

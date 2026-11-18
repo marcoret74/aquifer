@@ -1,33 +1,73 @@
-# Aquifer 🌊
-**Zero-Copy HiperRAM Paging & 3D Morton Inference Engine in C++23**  
-*Sub-100MB VmRSS @ 15W · Hardware-Software Co-Design for Silicon CPUs*
+# Aquifer
+
+**Motor de inferencia de LLMs en C++23 para CPU x86-64 (AVX2), con pesos
+mapeados desde disco y política de memoria configurable.**
 
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)](https://en.cppreference.com/w/cpp/23)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Architecture: AVX2/BMI2](https://img.shields.io/badge/Architecture-x86__64%20%7C%20ARM64-orange.svg)]()
-[![Memory: <100MB VmRSS](https://img.shields.io/badge/Memory-Sub--100MB%20VmRSS-purple.svg)]()
+[![Architecture: x86-64 AVX2](https://img.shields.io/badge/Architecture-x86__64%20AVX2-orange.svg)]()
+[![Estado: experimental](https://img.shields.io/badge/Estado-experimental-yellow.svg)]()
 
-> *"Caudal corre a la velocidad de la luz; Aquifer es la reserva profunda que dosifica el flujo."*  
-> **⚡ Powered by Semantic Geometry Chile** · Autor: Marco Retamales
+Autor: Marco Retamales · Licencia MIT
 
 ---
 
-## 🏛️ ¿Qué es Aquifer?
+## ¿Qué es Aquifer?
 
-**Aquifer** es un motor de inferencia de modelos masivos de lenguaje (LLMs de 0.5B a 70B) escrito en **C++23 estricto sin dependencias externas**, diseñado para superar el **Muro de Von Neumann (Memory Wall)** en procesadores convencionales de 15 Watts (sin GPUs dedicadas ni centros de datos masivos).
+Un **motor de inferencia** (no un framework de entrenamiento) para modelos
+Qwen/SmolLM/TinyLlama en CPU, que:
 
-A diferencia de los motores tradicionales (llama.cpp, Ollama, vLLM) que obligan a cargar varios gigabytes de pesos permanentemente en memoria física (RAM/VRAM), Aquifer demuestra que **la decodificación autorregresiva es un problema topológico y de física de silicio**.
+- lee un artefacto cuantizado desde disco con `mmap` y lo pagina por capas,
+  de modo que la memoria residente (VmRSS) puede quedar por debajo del tamaño
+  del modelo;
+- expone un servidor local compatible con OpenAI (`/v1/chat/completions`);
+- incluye sesiones persistentes, trazas y bundles verificables.
+
+La implementación está en C++23, sin dependencias externas más allá de libc y
+pthreads. El artefacto lo produce un empaquetador aparte; el motor solo lo
+consume.
+
+## Qué no es y qué no promete
+
+- **No elimina el ancho de banda de memoria.** Paginar reduce el RSS, no el
+  tráfico a DRAM: si el artefacto no cabe en page cache, cada token vuelve a
+  leer pesos desde disco. La velocidad depende de eso.
+- **No es más rápido que llama.cpp en todos los casos.** En frío rinde
+  parecido; la ventaja medida aparece al reutilizar prefijo (ver «Caché de
+  prefijo»).
+- **No reemplaza una GPU para modelos grandes.** Lo medido es 0.5B–3B en CPU.
+  No hay mediciones de modelos de 70B; no se afirma nada sobre ellos.
+- **No es un avance teórico sobre la decodificación autorregresiva.** Usa
+  técnicas conocidas (cuantización por grupos, page cache, prefetch, keys
+  Morton para localidad, decodificación especulativa) con mediciones propias.
+- **No corre sin AVX2 + FMA + F16C + BMI2.** No hay build para ARM ni para
+  x86 sin AVX2. Hay un build SSE4.2 parcial para artefactos SSE.
+
+## Estado
+
+| Parte | Estado |
+|---|---|
+| Decode denso (0.5B–3B) | medido y usable |
+| Prefill batcheado, KV fp16, hilos físicos | medido y usable |
+| Caché de prefijo y compactación de KV | medido |
+| Decodificación especulativa n-gram | medido, default en chat |
+| Modo Diamante (`--diamond`) | experimental, no acelera hoy |
+| Atención GQA online | experimental, más lenta (rama aparte) |
+| Afín grupo 64, 4-bit/3-bit | evaluados y descartados (calidad/velocidad) |
 
 ### Los Pilares de Aquifer:
 1. **El Portero (Zero-Copy Kernel Ring-Buffer):** Mediante `mmap(MAP_SHARED)`, el modelo se proyecta en el espacio virtual: la ventana activa son pocos MB y el resto vive en page cache. Mientras se computa la capa $L$, un hilo desacoplado (`AsyncPrefetcher`) notifica al kernel con `madvise(..., MADV_WILLNEED)` para precalentar la capa $L+1$. En modo `--mem-policy paged`, al terminar la capa $L$ el Portero ejecuta `madvise(..., MADV_DONTNEED)` y purga las páginas físicas; en `auto` las conserva si hay RAM libre (el kernel las reclama bajo presión). La memoria residente (**VmRSS**) queda en **< 90 MB en modo `paged` a ctx 512**; el KV cache crece linealmente con el contexto y `auto` puede retener el artefacto completo para evitar page faults.
-2. **Indexación Espacial 3D (Curva de Morton & BMI2 `_pdep_u64`):** Proyecta la topología de pesos en el hipercubo $[-1, 1]^3$, mapeando coordenadas euclidianas a claves contiguas de 64 bits en **~48 nanosegundos** directamente en silicio. El reordenamiento espacial por Z-Order preserva la función matemática con **isomorfismo exacto** ($\Delta < 1.34 \times 10^{-9}$, similaridad coseno $= 1.0000000000$).
+2. **Indexación Espacial 3D (Curva de Morton & BMI2 `_pdep_u64`):** Proyecta la topología de pesos en el hipercubo $[-1, 1]^3$, mapeando coordenadas euclidianas a claves contiguas de 64 bits en **~48 nanosegundos** directamente en silicio. Reordenar es una **permutación** del cómputo, así que no cambia el
+resultado (verificado: $\Delta < 1.34 \times 10^{-9}$ frente al orden
+original). No mejora la aritmética; sirve para que los pesos activos queden
+contiguos en memoria.
 3. **Mecánica Óptica del Diamante 3D (Experimental):** En capas MLP intermedias, un cono de refracción óptica en $[-1, 1]^3$ selecciona las neuronas alineadas con el haz. El objetivo es saltar el 10 % de neuronas que concentra poca energía y acelerar la decodificación. La implementación actual (`--diamond N`) selecciona filas dispersas sin reordenarlas, así que **todavía no acelera** (ver nota de rendimiento); para que el cono sea un prefijo contiguo hay que permutar las neuronas por alineación al empaquetar.
 
 ---
 
-## 📊 Benchmarks Medidos en Silicio Real (15 Watts CPU)
+## Benchmarks medidos (i7-10510U, 15 W, CPU)
 
-Pruebas empíricas reproducibles en procesadores de consumo alimentados por batería (Intel / AMD AVX2 + BMI2):
+Cifras del autor en un i7-10510U (4C/8T, 15 W). No son un benchmark independiente ni comparan contra otros motores en igualdad de condiciones:
 
 | Modelo | Parámetros | RAM Tradicional | RAM Aquifer (VmRSS) | Reducción RAM | Velocidad / Latencia | Modo |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -94,7 +134,7 @@ Medición reproducible con `--prompt` de 24 tokens, `--n` corto y `--time`. "Ant
 
 Hasta entonces, `--diamond` queda como experimental y no se recomienda para producción.
 
-### Caché de prefijo: la diferencia real con Ollama
+### Caché de prefijo: comparación medida con Ollama (3 turnos)
 
 Bench reproducible: `python3 bench/prefix_cache.py --artifact <art> --tokenizer <tok> --ollama-model qwen2.5:3b`. Usa un nonce único en el system para forzar prompt frío y mide 3 turnos.
 
@@ -107,7 +147,7 @@ Bench reproducible: `python3 bench/prefix_cache.py --artifact <art> --tokenizer 
 - El chat de Aquifer reutiliza **system + historial + respuesta previa**: en el turno 3 solo prellena ~16 tokens nuevos.
 - En frío, Aquifer prefill ~43 tok/s vs Ollama 34,3 tok/s; decode ~10 tok/s en ambos.
 - El “10× de prefill” era **prompt cache** de Ollama, no un GEMM mágico. Con prompts fríos, Aquifer no está detrás; con prefijo, ambos cachean.
-- **No necesitamos colgarnos de llama.cpp para el prefill.**
+- El benchmark es de 3 turnos y un modelo; no generaliza a todos los casos.
 
 ### Límites medidos (para no repetir el camino)
 

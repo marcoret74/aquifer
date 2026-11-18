@@ -137,7 +137,7 @@ MODELS_CATALOG = [
         "ram": "~37 MB",
         "speed": "35-50 tok/s",
         "artifact": "qwen05_affine",
-        "desc": "Ultra-fast response, lightweight direct answers"
+        "desc": "El más liviano; respuestas directas y rápidas"
     },
     {
         "key": "qwen",
@@ -146,7 +146,7 @@ MODELS_CATALOG = [
         "ram": "~50 MB",
         "speed": "15-20 tok/s",
         "artifact": "qwen15_affine",
-        "desc": "Golden balance between intelligence, Spanish & speed"
+        "desc": "Equilibrio entre calidad, español y velocidad"
     },
     {
         "key": "qwen3",
@@ -155,7 +155,7 @@ MODELS_CATALOG = [
         "ram": "~75 MB",
         "speed": "6-7 tok/s",
         "artifact": "qwen3b_affine",
-        "desc": "Deep reasoning, eloquent writing & rich vocabulary"
+        "desc": "Razonamiento y redacción más elaborada; el más lento"
     },
     {
         "key": "coder",
@@ -197,7 +197,7 @@ MODELS_CATALOG = [
 
 
 def print_model_catalog(resolve_artifact):
-    print(f"\n{BOLD}{CYAN}Available Models in Aquifer Engine (Zero-Copy HiperRAM Paging):{RESET}")
+    print(f"\n{BOLD}{CYAN}Modelos disponibles en Aquifer (pesos paginados desde disco):{RESET}")
     print(f"  {CYAN}⚡ Powered by Semantic Geometry Chile{RESET}")
     print("=" * 95)
     print(f"{'Key':<8} {'Model Name':<26} {'Params':<8} {'RAM (VmRSS)':<12} {'Speed':<13} {'Status'}")
@@ -229,7 +229,7 @@ def get_model_config(model_name, resolve_artifact):
         cfg["tokenizer"] = "/home/marco/.cache/caudal/qwen05/tokenizer.json"
         cfg["system"] = "You are a helpful assistant."
         cfg["n"] = 256
-        cfg["title"] = "Qwen 2.5-0.5B Instruct (Ultra-Fast ~52 tok/s)"
+        cfg["title"] = "Qwen 2.5-0.5B Instruct (~52 tok/s medidos)"
         cfg["color"] = BLUE
         cfg["label"] = "Qwen-0.5B"
         cfg["eos"] = "151643,151645"
@@ -238,7 +238,7 @@ def get_model_config(model_name, resolve_artifact):
         cfg["tokenizer"] = "/home/marco/.cache/caudal/qwen3b/tokenizer.json"
         cfg["system"] = "You are a helpful assistant."
         cfg["n"] = 512
-        cfg["title"] = "Qwen 2.5-3B Instruct (Aquifer Zero-Copy Paging)"
+        cfg["title"] = "Qwen 2.5-3B Instruct"
         cfg["color"] = CYAN
         cfg["label"] = "Qwen-3B"
         cfg["eos"] = "151643,151645"
@@ -537,7 +537,7 @@ def start_engine(mcfg, args, repo_dir, default_bin, resolve_artifact, restore=Fa
             print(f"Error: Tokenizer no encontrado en {tok_path}.")
             return None, None, ""
 
-    print(f"{BOLD}Iniciando Aquifer Paging Engine ({mcfg['title']} Afín 5.0 bpw · Zero-Copy HiperRAM)...{RESET}")
+    print(f"{BOLD}Iniciando Aquifer ({mcfg['title']} · afín 5.0 bpw · pesos paginados desde disco)...{RESET}")
     tok = Tokenizer(tok_path)
 
     gen_n = args.n if args.n is not None else mcfg["n"]
@@ -635,7 +635,7 @@ def main():
             return caudal_art
         return local_art
 
-    ap = argparse.ArgumentParser(description="Chat interactivo en Aquifer Engine (Zero-Copy Paging, 5.00 bpw)")
+    ap = argparse.ArgumentParser(description="Chat interactivo en Aquifer (artefacto afín 5.00 bpw, pesos paginados)")
     ap.add_argument("--list", "-l", action="store_true", help="Listar todos los modelos disponibles y salir")
     ap.add_argument("--model", choices=["qwen", "qwen05", "qwen3", "coder", "r1", "tiny", "smol2"], default="qwen",
                     help="Modelo: 'qwen' (1.5B), 'qwen05' (0.5B rápido), 'qwen3' (3B Instruct), 'coder' (1.5B Coder), 'r1' (R1 Distill), 'tiny' (1.1B), 'smol2' (1.7B)")
