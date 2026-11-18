@@ -89,7 +89,42 @@ Diseño mínimo:
 - métrica por request + agregada en `/metrics`,
 - límite de streams por RAM disponible (`MemAvailable`).
 
-## 7. Qué NO promete
+## 7. Variante «ventana + batching» (la que paga)
+
+La ventana de **una capa** sola no rinde, porque la capa se reutiliza en cada
+token. La forma de amortizar la lectura es aplicar la capa a **muchos tokens**
+antes de soltarla:
+
+```
+por capa:  traer 67 MB  ->  aplicar a M tokens  ->  soltar
+costo por token  ~  bytes_capa / (M * ancho_de_banda)
+```
+
+| Modelo | Artefacto | 1 token/pasada | M=8 | M=32 |
+|---|---|---|---|---|
+| 3B | 2,4 GB | ~1,2 s/token | ~0,15 s | ~0,04 s |
+| 7B | 4,5 GB | ~2,2 s/token | ~0,28 s | ~0,07 s |
+
+El prefill ya lo hace (`--prefill-batch 8`). Extenderlo al decode significa
+**lote de streams**: varios requests avanzan una capa a la vez, y la lectura se
+divide entre todos.
+
+### Matiz importante
+
+`MADV_DONTNEED` sobre un `MAP_SHARED` de archivo **no borra la page cache**:
+suelta el mapeo. Con RAM libre, el kernel conserva las páginas limpias y el
+próximo *seek* las trae de caché. El costo real aparece solo bajo presión.
+Por eso `auto` gana cuando el modelo entra, y `paged` gana cuando no entra.
+
+### Política propuesta
+
+1. Si el artefacto entra en `MemAvailable` con holgura: `auto` (nada que ganar).
+2. Si no entra: ventana de N capas (N = lo que quepa) + lote de M tokens.
+3. Orden de capas: mantener calientes las primeras y las últimas (donde suele
+   concentrarse la sensibilidad), paginar las intermedias.
+4. Medir siempre `majflt/s`: es la señal de que la ventana se quedó chica.
+
+## 8. Qué NO promete
 
 - No acelera un request individual.
 - No reduce el tráfico de DRAM.
