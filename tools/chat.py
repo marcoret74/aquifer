@@ -149,6 +149,15 @@ MODELS_CATALOG = [
         "desc": "Equilibrio entre calidad, español y velocidad"
     },
     {
+        "key": "qwen7b",
+        "name": "Qwen 2.5-7B Instruct",
+        "params": "7.6B",
+        "ram": "~4,5 GB artefacto (paginado)",
+        "speed": "2-3 tok/s en CPU",
+        "artifact": "qwen7b_affine",
+        "desc": "Más capacidad; lento en CPU"
+    },
+    {
         "key": "qwen3",
         "name": "Qwen 2.5-3B Instruct",
         "params": "3.09B",
@@ -241,6 +250,15 @@ def get_model_config(model_name, resolve_artifact):
         cfg["title"] = "Qwen 2.5-3B Instruct"
         cfg["color"] = CYAN
         cfg["label"] = "Qwen-3B"
+        cfg["eos"] = "151643,151645"
+    elif model_name == "qwen7b":
+        cfg["artifact"] = resolve_artifact("qwen7b_affine")
+        cfg["tokenizer"] = "/mnt/hdd/models/Qwen2.5-7B-Instruct/tokenizer.json"
+        cfg["system"] = "You are a helpful assistant."
+        cfg["n"] = 512
+        cfg["title"] = "Qwen 2.5-7B Instruct"
+        cfg["color"] = CYAN
+        cfg["label"] = "Qwen-7B"
         cfg["eos"] = "151643,151645"
     elif model_name == "coder":
         cfg["artifact"] = resolve_artifact("coder15_affine")
