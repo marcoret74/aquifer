@@ -193,3 +193,35 @@ Por eso `auto` gana cuando el modelo entra, y `paged` gana cuando no entra.
 
 **Criterio**: agregado > 1,3× **y** GB/s efectivos < 80 % del pico. Si ya
 satura, no hay ganancia posible: el cuello es el bus, no el scheduler.
+
+### Segunda ronda (2026-11-18)
+
+**Corrección a la comparación A vs B.** Gemini concluye que A falla (8,8 GB ÷
+2 GB/s = 4,4 s/token) y que B lo logra porque amortiza entre M streams. Eso
+compara **A con M=1** contra **B con M=8**. Con el mismo lote, ambos leen el
+artefacto completo una vez por pasada:
+
+| Esquema | Bytes por pasada | Ventaja real |
+|---|---|---|
+| A (capa por capa, io_uring) | artefacto completo | cero page faults, memoria fija |
+| B (macro-bloques) | artefacto completo | 2–4 switches en vez de 28–48 |
+
+B **no reduce bytes**; reduce *overhead* (cambios de contexto, PTEs, syscalls).
+La ventaja de velocidad viene del lote M, no del tamaño del bloque.
+
+**Speculative decoding**: la idea de usar el 0,5B como draft y verificar K
+tokens por pasada es correcta en el principio (bytes/token = artefacto / K),
+pero «quintuplica» solo con aceptación del 100 %. Medido antes en esta pila:
+aceptación 25–54 % con draft de 0,5B sobre 1,5B/3B, y **más lento** que el
+target solo. Para el 14B el cociente es más favorable, pero la mejora realista
+es 1,5–2,5×, no 5×.
+
+**O_DIRECT (alineación)**: la solución de Gemini es correcta —alinear los
+offsets en el empaquetado (padding de 4 KB, desperdicio ~200 KB) y, si el
+artefacto ya existe, leer desde `offset & ~4095` y computar desde
+`buffer + Δ`. `loadu` en Skylake+ no penaliza de forma apreciable.
+
+**El 14B no corre en esta máquina (dato que faltaba):** el artefacto a 5,0 bpw
+pesa ~11 GB (9,2 GB de pesos + 1,6 GB de embed). El NVMe tiene 5,7 GB libres y
+el HDD (`/mnt/hdd`, mecánico, 93 MB/s) daría ~115 s/token. No es un problema de
+scheduler: no entra. El techo real acá es el 7B (4,4 GB, 2,8 tok/s).
