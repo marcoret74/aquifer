@@ -791,3 +791,56 @@ Esa atribución es una solicitud de crédito, no una restricción adicional a lo
 
 Para consultas de arquitectura, licenciamiento corporativo o auditoría ontológica:  
 **Semantic Geometry Chile** · Rancagua, Región de O'Higgins, Chile.
+
+---
+
+## Early exit y volcado por capa (`--stop-layer`, `--dump-hidden`)
+
+El motor puede cortar el forward después de N capas y volcar el residual del
+último token. Sirve para cascadas de inferencia (L1/L8/L24) y para inspeccionar
+capas sin ejecutar el `lm_head`.
+
+```bash
+./build/generate_aquifer <artefacto> \
+  --prompt 8747,6722,409,33000,1531 \
+  --n 1 --threads 4 \
+  --stop-layer 24 \
+  --dump-hidden /tmp/estado_l24.f32
+```
+
+- `--stop-layer N` (1..`NLY`): corta el forward tras **N capas** en todo el
+  prompt (prefill y decode), sin calcular el `lm_head`. El proceso termina
+  después del volcado.
+- `--dump-hidden ARCHIVO`: escribe el residual del último token como
+  `float32[m * H]` little-endian. Para un prompt simple, `m=1` y `H=1536`
+  (Qwen2.5-1.5B) o `H=896` (0.5B).
+- Requiere `--n >= 1` para procesar el último token del prompt; el motor lo
+  fuerza a 1 si hace falta.
+
+### Validación con `qwen15_affine` (5.0 bpw) vs HF bfloat16
+
+Mismo prompt (`La capital de Chile es`), mismo último token:
+
+| capa | coseno | norma Aquifer | norma HF |
+|---:|---:|---:|---:|
+| L1 | **0,9942** | 17,52 | 17,35 |
+| L8 | **0,9883** | 41,81 | 41,87 |
+| L24 | **0,9925** | 166,93 | 166,24 |
+| L28 | 0,8608 | 312,71 | 192,31 |
+
+L1/L8/L24 coinciden con el modelo de referencia: el corte y el volcado son
+correctos. L28 difiere porque el dump es el residual **antes** de la RMSNorm
+final; el `hidden_states[-1]` de HF es después. Para la cascada L1/L8/L24 no
+afecta.
+
+Tiempos orientativos (i7-10510U, 4 hilos, artefacto en page cache):
+
+| corte | tiempo |
+|---:|---:|
+| L1 | 0,03 s |
+| L8 | 0,09 s |
+| L24 | 0,27 s |
+| full (sin corte) | 0,17 s |
+
+El tiempo depende del page cache y del artefacto; lo relevante es que el corte
+evita las capas restantes y el `lm_head`.

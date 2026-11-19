@@ -853,6 +853,9 @@ static double vnorm(const float* p, std::size_t n) {
 }
 
 static bool g_dump = false;
+static int g_stop_layer = -1;      // 1..NLY: cortar tras N capas
+static bool g_stop_ready = false;  // true en el step del último token del prompt
+static std::string g_dump_hidden;  // ruta del float32[m*H] del residual
 static int g_stepn = 0;
 static int g_spec_min = 2;
 static int g_spec_max = 8;
@@ -868,7 +871,8 @@ static std::size_t g_spec_prop = 0, g_spec_acc = 0, g_spec_rounds = 0;
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::printf("uso: %s <artefacto> --n <N> [--threads T] [--ctx C] "
-                    "--prompt id,id,.. [--prompt id,id,..]\n", argv[0]);
+                    "--prompt id,id,.. [--prompt id,id,..]\n"
+                    "       [--stop-layer N] [--dump-hidden ARCHIVO]\n", argv[0]);
         return 1;
     }
     const std::string A = argv[1];
@@ -893,6 +897,8 @@ int main(int argc, char** argv) {
         else if (a == "--repeat-last-n") g_repeat_last_n = std::atoi(next().c_str());
         else if (a == "--spec-min") g_spec_min = std::atoi(next().c_str());
         else if (a == "--spec-max") g_spec_max = std::atoi(next().c_str());
+        else if (a == "--stop-layer") g_stop_layer = std::atoi(next().c_str());
+        else if (a == "--dump-hidden") g_dump_hidden = next();
         else if (a == "--dump") g_dump = true;
         else if (a == "--time") g_time = true;
         else if (a == "--probe-read") g_probe = true;
@@ -1094,6 +1100,16 @@ int main(int argc, char** argv) {
     (void)NS;
     // Dimensionados para el MAXIMO de filas: el paso especulativo usa M=k
     // aunque haya una sola secuencia (era el segfault).
+    if (g_stop_layer > 0 && g_stop_layer > static_cast<int>(cfg.NLY)) {
+        std::printf("--stop-layer %d fuera de rango (1..%zu)\n", g_stop_layer, cfg.NLY);
+        return 1;
+    }
+    if (!g_dump_hidden.empty() && g_stop_layer <= 0) {
+        std::printf("--dump-hidden requiere --stop-layer N\n");
+        return 1;
+    }
+    if (g_stop_layer > 0 && ngen < 1) ngen = 1;
+
     const unsigned MB = kMaxM;
     std::vector<float> x(MB * cfg.H), h(MB * cfg.H), tmp(MB * cfg.H);
     std::vector<float> q(MB * cfg.NH * cfg.DH), kt(MB * cfg.NKV * cfg.DH), vt(MB * cfg.NKV * cfg.DH);
@@ -1190,6 +1206,7 @@ int main(int argc, char** argv) {
         // El Portero Asíncrono asegura la precarga de la Capa 0
         prefetcher.prefetch(0);
 
+        bool stopped = false;
         for (std::size_t L = 0; L < cfg.NLY; ++L) {
             // El Portero Asíncrono precarga la Capa L+1 en background mientras AVX2 computa L
             if (L + 1 < cfg.NLY) {
@@ -1377,6 +1394,26 @@ int main(int argc, char** argv) {
 
             for (std::size_t j = 0; j < m * cfg.H; ++j) x[j] += tmp[j];
 
+            if (g_stop_layer > 0 && static_cast<int>(L) == g_stop_layer - 1) {
+                if (g_stop_ready) {
+                    if (!g_dump_hidden.empty()) {
+                        std::ofstream f(g_dump_hidden, std::ios::binary | std::ios::trunc);
+                        if (!f) {
+                            std::fprintf(stderr, "no pude escribir %s\n", g_dump_hidden.c_str());
+                            std::exit(1);
+                        }
+                        f.write(reinterpret_cast<const char*>(x.data()),
+                                std::streamsize(m) * cfg.H * sizeof(float));
+                        f.close();
+                    }
+                    std::printf("STOP_LAYER %d m=%u H=%zu\n", g_stop_layer, m, cfg.H);
+                    std::fflush(stdout);
+                    std::exit(0);
+                }
+                stopped = true;
+                break;
+            }
+
             // El Portero desaloja la Capa L si la política es paged (alineado a pagina)
             if (g_evict_layers && L < c.layer_spans.size()) {
                 const auto& cur = c.layer_spans[L];
@@ -1399,6 +1436,8 @@ int main(int argc, char** argv) {
                             L, std::sqrt(s2), x[0], x[1]);
             }
         }
+
+        if (stopped) return std::vector<int>{};
 
         // En prefill solo los logits del último token importan: calcular los
         // demás cuesta M-1 pasadas completas por lm_head (116 MB en Qwen).
@@ -1686,6 +1725,7 @@ int main(int argc, char** argv) {
                     ++generated;
                     for (int e : eos_tokens) if (tok == e) stop = true;
                 };
+                if (g_stop_layer > 0) g_stop_ready = true;
                 while (generated < ngen && !stop) {
                     if (cur_pos >= std::size_t(ctx)) break;
                     if (!have_logits) {
@@ -1789,6 +1829,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::vector<int>> gen(NS);
     const int steps = ngen;
+    if (g_stop_layer > 0) g_stop_ready = true;
     const double td0 = now_ms();
     for (int t = 0; t < steps; ++t) {
         auto out = step(seqids, last, pos);
