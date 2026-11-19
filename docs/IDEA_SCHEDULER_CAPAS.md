@@ -225,3 +225,32 @@ artefacto ya existe, leer desde `offset & ~4095` y computar desde
 pesa ~11 GB (9,2 GB de pesos + 1,6 GB de embed). El NVMe tiene 5,7 GB libres y
 el HDD (`/mnt/hdd`, mecánico, 93 MB/s) daría ~115 s/token. No es un problema de
 scheduler: no entra. El techo real acá es el 7B (4,4 GB, 2,8 tok/s).
+
+## 10. Resultado del experimento (2026-11-18)
+
+Qwen2.5-3B, artefacto 2,4 GB en NVMe, `auto`, ctx 512, misma máquina total
+(4 hilos repartidos). Prompt y longitud idénticos.
+
+| Config | Tokens | Pared | Agregado | Por stream | GB/s efectivos |
+|---|---|---|---|---|---|
+| 1 stream × 4 hilos | 54 | 10,2 s | **5,28 tok/s** | 5,28 | 12,7 |
+| 2 streams × 2 hilos | 64 | 9,6 s | **6,68 tok/s** | 3,34 | **16,0** |
+
+- Factor agregado: **1,26×** (criterio era > 1,3×).
+- Latencia por request: **1,58× peor** (5,28 → 3,34 tok/s).
+- `majfault` durante la corrida: 43 (despreciable).
+- Ancho de banda efectivo: 16,0 GB/s contra un pico de ~20–25 GB/s ⇒ **~70 %**.
+
+### Lectura
+
+1. El entrelazado **sí existe**, pero es modesto: el segundo stream ocupa el
+   hueco que deja el primero esperando DRAM.
+2. Estamos cerca de saturar el bus: al 70 % del pico, el techo de ganancia es
+   ~1,4×. Con 4 streams la latencia individual se derrumbaría.
+3. El criterio acordado **no se cumple** (1,26 < 1,3). Por nuestra propia regla,
+   no se justifica un scheduler de streams para el PoC interactivo.
+4. Para *serving* batch (varios clientes, latencia no crítica) el 1,26× sí
+   sirve; pero es una mejora de throughput, no de velocidad percibida.
+
+**Conclusión**: la idea es correcta en el mecanismo y limitada por la física.
+El cuello es el ancho de banda de DRAM, no la política de turnos.
